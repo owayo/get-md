@@ -1,6 +1,6 @@
 [package]
 name = "get-md"
-version = "0.1.0"
+version = "26.2.100"
 edition = "2024"
 description = "Fetch a URL (with JS rendering via system Chrome) and convert selected elements to Markdown"
 license = "MIT"

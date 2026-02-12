@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "get-md"
-version = "0.1.0"
+version = "26.2.100"
 dependencies = [
  "anyhow",
  "clap",
