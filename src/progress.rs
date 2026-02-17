@@ -45,6 +45,21 @@ impl Progress {
         self.bar = None;
     }
 
+    /// Show a completion message with a green checkmark
+    pub fn complete(&self, message: &str) {
+        if !self.enabled {
+            return;
+        }
+        let bar = ProgressBar::new_spinner();
+        bar.set_style(
+            ProgressStyle::default_spinner()
+                .tick_chars("✔✔")
+                .template("{spinner:.green} {msg}")
+                .expect("Invalid template"),
+        );
+        bar.finish_with_message(message.to_string());
+    }
+
     /// Finish and clear the current progress bar
     pub fn finish_and_clear(&mut self) {
         if let Some(ref bar) = self.bar {

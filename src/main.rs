@@ -151,6 +151,9 @@ fn main() -> Result<()> {
     let markdown = resolve_markdown_urls(&markdown, &cli.url);
     progress.finish("Converted to Markdown");
 
+    // Show completion with URL
+    progress.complete(&cli.url);
+
     // Output
     let mut writer: Box<dyn Write> = match &cli.output {
         Some(path) => {
