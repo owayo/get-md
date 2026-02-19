@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use headless_chrome::{Browser, LaunchOptions};
 use url::Url;
@@ -581,5 +581,112 @@ mod tests {
             resolve_markdown_urls("[wiki](/wiki/Rust_(language))", BASE),
             "[wiki](https://example.com/wiki/Rust_(language))",
         );
+    }
+
+    // find_link_close_paren direct tests
+
+    #[test]
+    fn find_close_paren_simple() {
+        assert_eq!(find_link_close_paren("url)"), Some(3));
+    }
+
+    #[test]
+    fn find_close_paren_nested() {
+        assert_eq!(find_link_close_paren("wiki/Rust_(lang))"), Some(16));
+    }
+
+    #[test]
+    fn find_close_paren_no_close() {
+        assert_eq!(find_link_close_paren("no close paren"), None);
+    }
+
+    #[test]
+    fn find_close_paren_empty() {
+        assert_eq!(find_link_close_paren(")"), Some(0));
+    }
+
+    #[test]
+    fn find_close_paren_deeply_nested() {
+        assert_eq!(find_link_close_paren("a(b(c))d)"), Some(8));
+    }
+
+    // compact_table_row edge cases
+
+    #[test]
+    fn compact_table_single_cell() {
+        assert_eq!(compact_markdown("| only |"), "| only |");
+    }
+
+    #[test]
+    fn compact_table_empty_cells() {
+        assert_eq!(compact_markdown("|  |  |"), "|  |  |");
+    }
+
+    #[test]
+    fn compact_markdown_empty_input() {
+        assert_eq!(compact_markdown(""), "");
+    }
+
+    #[test]
+    fn compact_markdown_only_newlines() {
+        // lines() drops trailing empty strings, so "\n\n\n" (4 lines, last empty) -> "\n\n"
+        assert_eq!(compact_markdown("\n\n\n"), "\n\n");
+    }
+
+    // resolve_markdown_urls additional edge cases
+
+    #[test]
+    fn resolve_url_with_query_string() {
+        assert_eq!(
+            resolve_markdown_urls("[link](./page?q=test&a=1)", BASE),
+            "[link](https://example.com/docs/en/page?q=test&a=1)",
+        );
+    }
+
+    #[test]
+    fn resolve_url_with_fragment_and_query() {
+        assert_eq!(
+            resolve_markdown_urls("[link](./page?q=1#sec)", BASE),
+            "[link](https://example.com/docs/en/page?q=1#sec)",
+        );
+    }
+
+    #[test]
+    fn resolve_protocol_relative_url() {
+        assert_eq!(
+            resolve_markdown_urls("[link](//cdn.example.com/img.png)", BASE),
+            "[link](https://cdn.example.com/img.png)",
+        );
+    }
+
+    #[test]
+    fn resolve_data_url_unchanged() {
+        let input = "[img](data:image/png;base64,ABC)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_mailto_link_unchanged() {
+        let input = "[email](mailto:test@example.com)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_adjacent_links() {
+        let input = "[a](./x)[b](./y)";
+        let expected = "[a](https://example.com/docs/en/x)[b](https://example.com/docs/en/y)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    // escape_js_string additional edge cases
+
+    #[test]
+    fn escape_mixed_special_chars() {
+        assert_eq!(escape_js_string("a\"b\\c\nd\re"), r#""a\"b\\c\nd\re""#,);
+    }
+
+    #[test]
+    fn escape_only_special_chars() {
+        assert_eq!(escape_js_string("\"\\"), r#""\"\\""#);
     }
 }

@@ -9,7 +9,7 @@ URL をブラウザで取得し、指定要素を Markdown に変換する CLI �
 - htmd (HTML -> Markdown 変換、skip_tags/spacing オプション使用)
 - clap (CLI 引数解析、derive feature)
 - indicatif (プログレス表示)
-- url (相対URL → 絶対URL 変換)
+- url (相対URL -> 絶対URL 変換)
 - anyhow (エラーハンドリング)
 
 ## Architecture
@@ -17,7 +17,7 @@ URL をブラウザで取得し、指定要素を Markdown に変換する CLI �
 - WebDriver を使用せず、システムの Chrome/Chromium を CDP で直接制御
 - JS レンダリング対応（SPA、動的コンテンツ）
 - CSS セレクタでブラウザ内 JS 実行により要素の outerHTML を取得
-- htmd で HTML → Markdown 変換（script, style, noscript, svg は skip_tags で除去）
+- htmd で HTML -> Markdown 変換（script, style, noscript, svg は skip_tags で除去）
 - Rust 側で相対 URL を絶対パスに変換（Markdown リンク・画像の `[text](url)` パターン）
 - テーブルのセルパディングとセパレータダッシュを圧縮
 - 対応 OS: macOS, Windows
@@ -28,6 +28,11 @@ URL をブラウザで取得し、指定要素を Markdown に変換する CLI �
 src/
   main.rs       # CLI 定義、ブラウザ起動、HTML 取得、Markdown 変換
   progress.rs   # indicatif ベースのプログレス表示
+Makefile        # build, release, test, fmt, check, install ターゲット
+.github/
+  workflows/
+    ci.yml      # CI (test, clippy, fmt, build)
+    release.yml # リリース (バージョンバンプ、ビルド、GitHub Release、Homebrew更新)
 ```
 
 ## Development
@@ -43,7 +48,7 @@ make install  # /usr/local/bin にインストール
 
 ## Testing
 
-- ユニットテストは Chrome 不要（CLI パース、JS エスケープ、プログレス表示のテスト）
+- ユニットテストは Chrome 不要（CLI パース、JS エスケープ、Markdown変換、プログレス表示のテスト）
 - E2E テストは実際の Chrome/Chromium が必要
 - `make test` または `cargo test` で実行
 
@@ -53,3 +58,4 @@ make install  # /usr/local/bin にインストール
 - セレクタ未指定時は body 全体を対象とする
 - 複数セレクタ指定時は `---` で区切って結合
 - ファイル出力時は末尾改行を保証
+- バージョニングは CalVer (YY.M.counter) 形式

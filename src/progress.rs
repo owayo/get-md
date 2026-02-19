@@ -123,4 +123,35 @@ mod tests {
         p.finish_and_clear();
         assert!(p.bar.is_none());
     }
+
+    #[test]
+    fn complete_on_disabled_does_not_panic() {
+        let p = Progress::new(false);
+        p.complete("done");
+    }
+
+    #[test]
+    fn complete_on_enabled_does_not_panic() {
+        let p = Progress::new(true);
+        p.complete("https://example.com");
+    }
+
+    #[test]
+    fn set_message_with_active_spinner() {
+        let mut p = Progress::new(true);
+        p.spinner("loading");
+        p.set_message("updated message");
+        p.finish_and_clear();
+    }
+
+    #[test]
+    fn multiple_spinner_cycles() {
+        let mut p = Progress::new(true);
+        p.spinner("first");
+        p.finish("first done");
+        assert!(p.bar.is_none());
+        p.spinner("second");
+        p.finish("second done");
+        assert!(p.bar.is_none());
+    }
 }
