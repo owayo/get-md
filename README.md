@@ -27,8 +27,13 @@
 - **Configurable Wait** — adjustable wait time for JS rendering completion
 - **Clean Output** — strips scripts, styles, SVGs automatically
 - **URL Resolution** — converts relative URLs to absolute paths in output
-- **Table Compaction** — removes unnecessary padding in Markdown tables
-- **Progress Display** — shows operation progress with quiet mode option
+- **Markdown Link Robustness** — supports resolving `<...>` style link destinations (including spaces)
+- **Escaped Parentheses Support** — correctly parses link destinations containing `\(` and `\)`
+- **Quote-safe URL Parsing** — preserves quotes/apostrophes in standard Markdown link destinations
+- **Escaped Whitespace Handling** — keeps `\ ` in standard link destinations from being split as title separators
+- **Table Compaction** — removes unnecessary padding in Markdown tables while preserving fenced code blocks
+- **Progress Display** — shows operation progress with quiet mode option, and reports completion only after output succeeds
+- **Timeout Safety** — internal browser idle-timeout buffer uses saturating arithmetic to avoid overflow at extreme `--timeout` values
 
 ## Requirements
 
@@ -90,6 +95,7 @@ get-md [OPTIONS] <URL>
 | `--wait <SECS>` | `-w` | Wait time after page load in seconds (default: 2) |
 | `--timeout <SECS>` | `-t` | Page load timeout in seconds (default: 60) |
 | `--no-headless` | | Run browser visibly (for debugging) |
+| `--no-cache` | | Disable browser cache (always fetch latest content) |
 | `--quiet` | `-q` | Suppress progress display |
 | `--help` | `-h` | Show help |
 | `--version` | `-V` | Show version |

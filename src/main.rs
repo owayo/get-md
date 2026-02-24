@@ -5,8 +5,9 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
+use headless_chrome::protocol::cdp::Network;
 use headless_chrome::{Browser, LaunchOptions};
 use url::Url;
 
@@ -46,6 +47,10 @@ struct Cli {
     #[arg(long)]
     no_headless: bool,
 
+    /// Disable browser cache (always fetch latest content)
+    #[arg(long)]
+    no_cache: bool,
+
     /// Suppress progress output
     #[arg(short, long)]
     quiet: bool,
@@ -66,7 +71,7 @@ fn main() -> Result<()> {
     let launch_options = LaunchOptions {
         headless: !cli.no_headless,
         path: cli.chrome_path,
-        idle_browser_timeout: Duration::from_secs(cli.timeout + 30),
+        idle_browser_timeout: idle_browser_timeout(cli.timeout),
         ..LaunchOptions::default()
     };
 
@@ -75,6 +80,12 @@ fn main() -> Result<()> {
 
     let tab = browser.new_tab().context("Failed to open new tab")?;
     tab.set_default_timeout(Duration::from_secs(cli.timeout));
+    if cli.no_cache {
+        tab.call_method(Network::SetCacheDisabled {
+            cache_disabled: true,
+        })
+        .context("Failed to disable browser cache")?;
+    }
     progress.finish("Chrome launched");
 
     // Navigate to page
@@ -151,9 +162,6 @@ fn main() -> Result<()> {
     let markdown = resolve_markdown_urls(&markdown, &cli.url);
     progress.finish("Converted to Markdown");
 
-    // Show completion with URL
-    progress.complete(&cli.url);
-
     // Output
     let mut writer: Box<dyn Write> = match &cli.output {
         Some(path) => {
@@ -175,10 +183,19 @@ fn main() -> Result<()> {
 
     // Ensure trailing newline for file output
     if cli.output.is_some() && !markdown.ends_with('\n') {
-        writer.write_all(b"\n").ok();
+        writer
+            .write_all(b"\n")
+            .context("Failed to write trailing newline")?;
     }
 
+    // Show completion with URL only after output succeeds.
+    progress.complete(&cli.url);
+
     Ok(())
+}
+
+fn idle_browser_timeout(timeout_secs: u64) -> Duration {
+    Duration::from_secs(timeout_secs.saturating_add(30))
 }
 
 /// Escape a CSS selector string as a JavaScript string literal
@@ -191,6 +208,8 @@ fn escape_js_string(s: &str) -> String {
             '\\' => out.push_str(r"\\"),
             '\n' => out.push_str(r"\n"),
             '\r' => out.push_str(r"\r"),
+            '\u{2028}' => out.push_str(r"\u2028"),
+            '\u{2029}' => out.push_str(r"\u2029"),
             _ => out.push(c),
         }
     }
@@ -203,8 +222,31 @@ fn escape_js_string(s: &str) -> String {
 /// - Trim padding in table cells
 /// - Minimize separator dashes in table rows (preserving alignment `:`)
 fn compact_markdown(md: &str) -> String {
+    let mut in_fenced_code_block = false;
+    let mut fence_char = '\0';
+    let mut fence_len = 0usize;
+
     md.lines()
         .map(|line| {
+            let trimmed_start = line.trim_start();
+            if let Some((marker, marker_len)) = fence_marker(trimmed_start) {
+                if !in_fenced_code_block {
+                    in_fenced_code_block = true;
+                    fence_char = marker;
+                    fence_len = marker_len;
+                    return line.to_string();
+                }
+                if marker == fence_char && marker_len >= fence_len {
+                    in_fenced_code_block = false;
+                    fence_char = '\0';
+                    fence_len = 0;
+                    return line.to_string();
+                }
+            }
+            if in_fenced_code_block {
+                return line.to_string();
+            }
+
             let trimmed = line.trim();
             if trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 1 {
                 compact_table_row(trimmed)
@@ -214,6 +256,16 @@ fn compact_markdown(md: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn fence_marker(line: &str) -> Option<(char, usize)> {
+    let marker = line.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+
+    let len = line.chars().take_while(|c| *c == marker).count();
+    if len >= 3 { Some((marker, len)) } else { None }
 }
 
 fn compact_table_row(row: &str) -> String {
@@ -243,48 +295,131 @@ fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
         Err(_) => return md.to_string(),
     };
 
-    let mut parts = md.split("](");
-    let mut result = String::new();
+    let mut result = String::with_capacity(md.len());
+    let mut cursor = 0usize;
 
-    if let Some(first) = parts.next() {
-        result.push_str(first);
-    }
+    while let Some(rel) = md[cursor..].find("](") {
+        let open = cursor + rel;
+        let inside_start = open + 2;
 
-    for part in parts {
-        result.push_str("](");
+        result.push_str(&md[cursor..inside_start]);
 
+        let part = &md[inside_start..];
         if let Some(close) = find_link_close_paren(part) {
             let inside = &part[..close];
-            let after = &part[close..]; // includes )
-
-            // URL is before any space or quote (title delimiter)
-            let url_end = inside.find([' ', '"', '\'']).unwrap_or(inside.len());
-            let url = &inside[..url_end];
-            let title = &inside[url_end..];
+            let (url, title, use_angle_brackets) = split_link_destination(inside);
 
             if !url.is_empty() {
                 match base.join(url) {
-                    Ok(resolved) => result.push_str(resolved.as_str()),
-                    Err(_) => result.push_str(url),
+                    Ok(resolved) => {
+                        if use_angle_brackets {
+                            result.push('<');
+                            result.push_str(resolved.as_str());
+                            result.push('>');
+                        } else {
+                            result.push_str(resolved.as_str());
+                        }
+                    }
+                    Err(_) => {
+                        if use_angle_brackets {
+                            result.push('<');
+                            result.push_str(url);
+                            result.push('>');
+                        } else {
+                            result.push_str(url);
+                        }
+                    }
                 }
+            } else if use_angle_brackets {
+                result.push_str("<>");
             }
             result.push_str(title);
-            result.push_str(after);
+            result.push(')');
+            cursor = inside_start + close + 1;
         } else {
             result.push_str(part);
+            return result;
         }
     }
 
+    result.push_str(&md[cursor..]);
     result
+}
+
+/// Split a Markdown link destination into URL and title.
+///
+/// Supports:
+/// - standard form: `./path "title"`
+/// - angle bracket form: `<./path with space> "title"`
+fn split_link_destination(inside: &str) -> (&str, &str, bool) {
+    if let Some(after_open) = inside.strip_prefix('<')
+        && let Some(close) = after_open.find('>')
+    {
+        let end = close + 1;
+        let url = &inside[1..end];
+        let title = &inside[(end + 1)..];
+        return (url, title, true);
+    }
+
+    // In the standard form, the title (if any) starts after the first
+    // *unescaped* whitespace.
+    let mut backslash_run = 0usize;
+    for (i, c) in inside.char_indices() {
+        if c == '\\' {
+            backslash_run += 1;
+            continue;
+        }
+        let escaped = backslash_run % 2 == 1;
+        if c.is_ascii_whitespace() && !escaped {
+            return (&inside[..i], &inside[i..], false);
+        }
+        backslash_run = 0;
+    }
+    (inside, "", false)
 }
 
 /// Find the closing `)` that matches the implicit opening `(` from `](`.
 fn find_link_close_paren(s: &str) -> Option<usize> {
     let mut depth = 1;
+    let mut backslash_run = 0usize;
+    let mut title_quote: Option<char> = None;
+    let mut saw_dest_non_ws = false;
+    let mut saw_sep_ws = false;
+
     for (i, c) in s.char_indices() {
+        let escaped = c != '\\' && backslash_run % 2 == 1;
+
+        if c == '\\' {
+            backslash_run += 1;
+            continue;
+        }
+
+        if let Some(quote) = title_quote {
+            if c == quote && !escaped {
+                title_quote = None;
+            }
+            backslash_run = 0;
+            continue;
+        }
+
+        if depth == 1 {
+            if c.is_ascii_whitespace() {
+                if saw_dest_non_ws {
+                    saw_sep_ws = true;
+                }
+            } else if saw_sep_ws && (c == '"' || c == '\'') {
+                title_quote = Some(c);
+                backslash_run = 0;
+                continue;
+            } else {
+                saw_dest_non_ws = true;
+                saw_sep_ws = false;
+            }
+        }
+
         match c {
-            '(' => depth += 1,
-            ')' => {
+            '(' if !escaped => depth += 1,
+            ')' if !escaped => {
                 depth -= 1;
                 if depth == 0 {
                     return Some(i);
@@ -292,7 +427,10 @@ fn find_link_close_paren(s: &str) -> Option<usize> {
             }
             _ => {}
         }
+
+        backslash_run = 0;
     }
+
     None
 }
 
@@ -367,6 +505,7 @@ mod tests {
             "-t",
             "60",
             "--no-headless",
+            "--no-cache",
             "-q",
         ])
         .unwrap();
@@ -376,6 +515,7 @@ mod tests {
         assert_eq!(cli.wait, 5);
         assert_eq!(cli.timeout, 60);
         assert!(cli.no_headless);
+        assert!(cli.no_cache);
         assert!(cli.quiet);
     }
 
@@ -402,6 +542,19 @@ mod tests {
         assert_eq!(
             cli.chrome_path.unwrap().to_str().unwrap(),
             "/usr/bin/chromium"
+        );
+    }
+
+    #[test]
+    fn idle_browser_timeout_adds_buffer() {
+        assert_eq!(idle_browser_timeout(60), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn idle_browser_timeout_saturates_on_overflow() {
+        assert_eq!(
+            idle_browser_timeout(u64::MAX),
+            Duration::from_secs(u64::MAX),
         );
     }
 
@@ -483,6 +636,26 @@ mod tests {
     }
 
     #[test]
+    fn compact_preserves_fenced_code_block() {
+        let input = "\
+```md
+| Name           | Value          |
+| -------------- | -------------- |
+| foo            | bar            |
+```";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    #[test]
+    fn compact_preserves_tilde_fenced_code_block() {
+        let input = "\
+~~~text
+| keep           | spacing        |
+~~~";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    #[test]
     fn compact_preserves_non_table_lines() {
         assert_eq!(compact_markdown("---"), "---");
         assert_eq!(compact_markdown("- single space"), "- single space");
@@ -551,6 +724,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_link_with_tab_before_title() {
+        assert_eq!(
+            resolve_markdown_urls("[link](./page\t\"Title\")", BASE),
+            "[link](https://example.com/docs/en/page\t\"Title\")",
+        );
+    }
+
+    #[test]
+    fn resolve_url_with_apostrophe_in_path() {
+        assert_eq!(
+            resolve_markdown_urls("[link](./it's.md)", BASE),
+            "[link](https://example.com/docs/en/it's.md)",
+        );
+    }
+
+    #[test]
     fn resolve_multiple_links() {
         let input = "[a](./one) and [b](../two) and [c](https://abs.com/page)";
         let expected = "[a](https://example.com/docs/en/one) and [b](https://example.com/docs/two) and [c](https://abs.com/page)";
@@ -608,6 +797,16 @@ mod tests {
     #[test]
     fn find_close_paren_deeply_nested() {
         assert_eq!(find_link_close_paren("a(b(c))d)"), Some(8));
+    }
+
+    #[test]
+    fn find_close_paren_ignores_escaped_close() {
+        assert_eq!(find_link_close_paren(r"foo\)bar)"), Some(8));
+    }
+
+    #[test]
+    fn find_close_paren_ignores_escaped_open() {
+        assert_eq!(find_link_close_paren(r"foo\(bar)"), Some(8));
     }
 
     // compact_table_row edge cases
@@ -672,10 +871,89 @@ mod tests {
     }
 
     #[test]
+    fn resolve_angle_bracket_url_with_space() {
+        assert_eq!(
+            resolve_markdown_urls("[doc](<./my file.md>)", BASE),
+            "[doc](<https://example.com/docs/en/my%20file.md>)",
+        );
+    }
+
+    #[test]
+    fn resolve_angle_bracket_url_with_title() {
+        assert_eq!(
+            resolve_markdown_urls(r#"[doc](<./my file.md> "Title")"#, BASE),
+            r#"[doc](<https://example.com/docs/en/my%20file.md> "Title")"#,
+        );
+    }
+
+    #[test]
+    fn resolve_angle_bracket_absolute_url_unchanged_except_wrapper() {
+        assert_eq!(
+            resolve_markdown_urls("[doc](<https://other.com/path with space>)", BASE),
+            "[doc](<https://other.com/path%20with%20space>)",
+        );
+    }
+
+    #[test]
     fn resolve_adjacent_links() {
         let input = "[a](./x)[b](./y)";
         let expected = "[a](https://example.com/docs/en/x)[b](https://example.com/docs/en/y)";
         assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_title_containing_link_marker() {
+        let input = r#"[a](./one "literal ]( marker")[b](./two)"#;
+        let expected = r#"[a](https://example.com/docs/en/one "literal ]( marker")[b](https://example.com/docs/en/two)"#;
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn find_close_paren_ignores_paren_in_quoted_title() {
+        assert_eq!(
+            find_link_close_paren(r#"./one "title ) marker")"#),
+            Some(22),
+        );
+    }
+
+    #[test]
+    fn split_link_destination_standard_with_title() {
+        assert_eq!(
+            split_link_destination(r#"./page "Title""#),
+            ("./page", r#" "Title""#, false),
+        );
+    }
+
+    #[test]
+    fn split_link_destination_standard_with_escaped_space() {
+        assert_eq!(
+            split_link_destination(r#"./my\ file.md "Title""#),
+            (r#"./my\ file.md"#, r#" "Title""#, false),
+        );
+    }
+
+    #[test]
+    fn split_link_destination_standard_with_escaped_space_without_title() {
+        assert_eq!(
+            split_link_destination(r#"./my\ file.md"#),
+            (r#"./my\ file.md"#, "", false),
+        );
+    }
+
+    #[test]
+    fn split_link_destination_standard_with_even_backslashes_before_space() {
+        assert_eq!(
+            split_link_destination(r#"./path\\ "Title""#),
+            (r#"./path\\"#, r#" "Title""#, false),
+        );
+    }
+
+    #[test]
+    fn split_link_destination_angle_bracket_with_title() {
+        assert_eq!(
+            split_link_destination(r#"<./my file.md> "Title""#),
+            ("./my file.md", r#" "Title""#, true),
+        );
     }
 
     // escape_js_string additional edge cases
@@ -688,5 +966,13 @@ mod tests {
     #[test]
     fn escape_only_special_chars() {
         assert_eq!(escape_js_string("\"\\"), r#""\"\\""#);
+    }
+
+    #[test]
+    fn escape_js_line_separator_chars() {
+        assert_eq!(
+            escape_js_string("a\u{2028}b\u{2029}c"),
+            r#""a\u2028b\u2029c""#
+        );
     }
 }
