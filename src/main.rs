@@ -975,4 +975,148 @@ mod tests {
             r#""a\u2028b\u2029c""#
         );
     }
+
+    // fence_marker direct tests
+
+    #[test]
+    fn fence_marker_backtick_three() {
+        assert_eq!(fence_marker("```"), Some(('`', 3)));
+    }
+
+    #[test]
+    fn fence_marker_backtick_five() {
+        assert_eq!(fence_marker("`````"), Some(('`', 5)));
+    }
+
+    #[test]
+    fn fence_marker_tilde_three() {
+        assert_eq!(fence_marker("~~~"), Some(('~', 3)));
+    }
+
+    #[test]
+    fn fence_marker_backtick_two_not_enough() {
+        assert_eq!(fence_marker("``"), None);
+    }
+
+    #[test]
+    fn fence_marker_backtick_with_info_string() {
+        assert_eq!(fence_marker("```rust"), Some(('`', 3)));
+    }
+
+    #[test]
+    fn fence_marker_non_fence_char() {
+        assert_eq!(fence_marker("---"), None);
+    }
+
+    #[test]
+    fn fence_marker_empty_string() {
+        assert_eq!(fence_marker(""), None);
+    }
+
+    // compact_markdown additional edge cases
+
+    #[test]
+    fn compact_unclosed_fence_block() {
+        let input = "\
+```
+| padded           | table           |
+no closing fence";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    #[test]
+    fn compact_fence_longer_close() {
+        let input = "\
+```
+| padded           | table           |
+`````";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    #[test]
+    fn compact_table_between_fenced_blocks() {
+        let input = "\
+```
+code
+```
+| padded         | table         |
+| -------------- | -------------- |
+```
+more code
+```";
+        let expected = "\
+```
+code
+```
+| padded | table |
+| - | - |
+```
+more code
+```";
+        assert_eq!(compact_markdown(input), expected);
+    }
+
+    // find_link_close_paren additional tests
+
+    #[test]
+    fn find_close_paren_title_single_quote() {
+        assert_eq!(
+            find_link_close_paren("./page 'title with ) paren')"),
+            Some(27),
+        );
+    }
+
+    #[test]
+    fn find_close_paren_escaped_backslash_before_paren() {
+        // \\) means a literal backslash followed by unescaped )
+        assert_eq!(find_link_close_paren("url\\\\)"), Some(5));
+    }
+
+    // split_link_destination additional tests
+
+    #[test]
+    fn split_link_destination_empty_angle_brackets() {
+        assert_eq!(split_link_destination("<>"), ("", "", true));
+    }
+
+    #[test]
+    fn split_link_destination_no_closing_angle_bracket() {
+        // Falls through to standard form parsing
+        assert_eq!(split_link_destination("<no-close"), ("<no-close", "", false));
+    }
+
+    #[test]
+    fn split_link_destination_no_title() {
+        assert_eq!(split_link_destination("./page"), ("./page", "", false));
+    }
+
+    // resolve_markdown_urls additional edge cases
+
+    #[test]
+    fn resolve_tel_link_unchanged() {
+        let input = "[call](tel:+1234567890)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_javascript_link_unchanged() {
+        let input = "[click](javascript:void(0))";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_link_in_middle_of_text() {
+        assert_eq!(
+            resolve_markdown_urls("prefix [link](./page) suffix", BASE),
+            "prefix [link](https://example.com/docs/en/page) suffix",
+        );
+    }
+
+    #[test]
+    fn resolve_image_with_title() {
+        assert_eq!(
+            resolve_markdown_urls(r#"![alt](./img.png "photo")"#, BASE),
+            r#"![alt](https://example.com/docs/en/img.png "photo")"#,
+        );
+    }
 }

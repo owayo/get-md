@@ -49,8 +49,8 @@ make install  # /usr/local/bin にインストール
 
 ## Testing
 
-- ユニットテストは Chrome 不要（CLI パース、JS エスケープ、Markdown変換、プログレス表示のテスト）
-- E2E テストは実際の Chrome/Chromium が必要
+- ユニットテストは Chrome 不要（CLI パース、JS エスケープ、Markdown変換、URL解決、リンクパーサー、フェンスマーカー検出、プログレス表示のテスト）
+- E2E テストは実際の Chrome/Chromium が必要（`#[ignore]` 付き）
 - `make test` または `cargo test` で実行
 
 ## Key Design Decisions
