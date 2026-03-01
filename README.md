@@ -32,6 +32,7 @@
 - **Quote-safe URL Parsing** — preserves quotes/apostrophes in standard Markdown link destinations
 - **Escaped Whitespace Handling** — keeps `\ ` in standard link destinations from being split as title separators
 - **Table Compaction** — removes unnecessary padding in Markdown tables while preserving fenced code blocks
+- **Escaped Pipe-safe Tables** — keeps escaped cell pipes (`\|`) intact during table compaction
 - **Progress Display** — shows operation progress with quiet mode option, and reports completion only after output succeeds
 - **Timeout Safety** — internal browser idle-timeout buffer uses saturating arithmetic to avoid overflow at extreme `--timeout` values
 

@@ -270,8 +270,8 @@ fn fence_marker(line: &str) -> Option<(char, usize)> {
 
 fn compact_table_row(row: &str) -> String {
     let inner = &row[1..row.len() - 1];
-    let cells: Vec<String> = inner
-        .split('|')
+    let cells: Vec<String> = split_unescaped_table_cells(inner)
+        .into_iter()
         .map(|cell| {
             let t = cell.trim();
             if !t.is_empty() && t.chars().all(|c| c == '-' || c == ':') {
@@ -285,6 +285,30 @@ fn compact_table_row(row: &str) -> String {
         })
         .collect();
     format!("| {} |", cells.join(" | "))
+}
+
+fn split_unescaped_table_cells(inner: &str) -> Vec<&str> {
+    let mut cells = Vec::new();
+    let mut start = 0usize;
+    let mut backslash_run = 0usize;
+
+    for (i, c) in inner.char_indices() {
+        if c == '\\' {
+            backslash_run += 1;
+            continue;
+        }
+
+        let escaped = backslash_run % 2 == 1;
+        if c == '|' && !escaped {
+            cells.push(&inner[start..i]);
+            start = i + 1;
+        }
+
+        backslash_run = 0;
+    }
+
+    cells.push(&inner[start..]);
+    cells
 }
 
 /// Resolve relative URLs in Markdown link/image syntax `[text](url)` to absolute
@@ -608,6 +632,16 @@ mod tests {
     fn compact_table_already_compact() {
         assert_eq!(compact_markdown("| a | b |"), "| a | b |");
         assert_eq!(compact_markdown("| - | - |"), "| - | - |");
+    }
+
+    #[test]
+    fn compact_table_preserves_escaped_pipe_in_cell() {
+        assert_eq!(compact_markdown(r"| a\|b      | c |"), r"| a\|b | c |");
+    }
+
+    #[test]
+    fn compact_table_splits_on_even_backslashes_before_pipe() {
+        assert_eq!(compact_markdown(r"| a\\| b | c |"), r"| a\\ | b | c |");
     }
 
     #[test]

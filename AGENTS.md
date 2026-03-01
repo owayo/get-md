@@ -20,7 +20,7 @@ URL をブラウザで取得し、指定要素を Markdown に変換する CLI �
 - CSS セレクタでブラウザ内 JS 実行により要素の outerHTML を取得
 - htmd で HTML -> Markdown 変換（script, style, noscript, svg は skip_tags で除去）
 - Rust 側で相対 URL を絶対パスに変換（Markdown リンク・画像の `[text](url)` パターン、`[text](<url>)` 形式、`\(` `\)` を含むリンク先の解析、通常リンク先URL内のクォート保持、`\ ` を含む通常リンク先の解析に対応）
-- テーブルのセルパディングとセパレータダッシュを圧縮（コードフェンス内は変更しない）
+- テーブルのセルパディングとセパレータダッシュを圧縮（コードフェンス内は変更しない）。セル内のエスケープ済みパイプ（`\|`）は区切りとして扱わない
 - 対応 OS: macOS, Windows
 
 ## Project Structure
