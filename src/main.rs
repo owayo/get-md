@@ -1116,7 +1116,10 @@ more code
     #[test]
     fn split_link_destination_no_closing_angle_bracket() {
         // Falls through to standard form parsing
-        assert_eq!(split_link_destination("<no-close"), ("<no-close", "", false));
+        assert_eq!(
+            split_link_destination("<no-close"),
+            ("<no-close", "", false)
+        );
     }
 
     #[test]
