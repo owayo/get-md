@@ -162,8 +162,15 @@ fn main() -> Result<()> {
     let markdown = resolve_markdown_urls(&markdown, &cli.url);
     progress.finish("Converted to Markdown");
 
+    // 出力内容を確定する（末尾改行を保証）
+    let output_bytes = if cli.output.is_some() && !markdown.ends_with('\n') {
+        format!("{markdown}\n")
+    } else {
+        markdown
+    };
+
     // 出力
-    let file_existed = cli.output.as_ref().is_some_and(|p| p.exists());
+    let old_content = cli.output.as_ref().and_then(|p| std::fs::read(p).ok());
     let mut writer: Box<dyn Write> = match &cli.output {
         Some(path) => {
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -179,20 +186,17 @@ fn main() -> Result<()> {
     };
 
     writer
-        .write_all(markdown.as_bytes())
+        .write_all(output_bytes.as_bytes())
         .context("Failed to write output")?;
-
-    // ファイル出力時は末尾改行を保証する
-    if cli.output.is_some() && !markdown.ends_with('\n') {
-        writer
-            .write_all(b"\n")
-            .context("Failed to write trailing newline")?;
-    }
 
     // 出力成功後にのみ URL 付きの完了表示を行う
     match &cli.output {
         Some(path) => {
-            let status = if file_existed { "updated" } else { "created" };
+            let status = match &old_content {
+                None => "created",
+                Some(old) if old != output_bytes.as_bytes() => "updated",
+                _ => "unchanged",
+            };
             progress.complete(&format!("{} → {} ({})", cli.url, path.display(), status));
         }
         None => progress.complete(&cli.url),
