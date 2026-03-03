@@ -1,7 +1,7 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
 
-/// Progress reporter for the fetch-and-convert workflow
+/// 取得・変換処理の進捗表示を管理する
 pub struct Progress {
     enabled: bool,
     bar: Option<ProgressBar>,
@@ -12,7 +12,7 @@ impl Progress {
         Self { enabled, bar: None }
     }
 
-    /// Show a spinner with a message
+    /// メッセージ付きスピナーを表示する
     pub fn spinner(&mut self, message: &str) {
         if !self.enabled {
             return;
@@ -30,14 +30,14 @@ impl Progress {
         self.bar = Some(spinner);
     }
 
-    /// Update the message on the current spinner/bar
+    /// 現在のスピナー/バーのメッセージを更新する
     pub fn set_message(&self, message: &str) {
         if let Some(ref bar) = self.bar {
             bar.set_message(message.to_string());
         }
     }
 
-    /// Finish the current progress bar with a message
+    /// 現在の進捗バーをメッセージ付きで完了させる
     pub fn finish(&mut self, message: &str) {
         if let Some(ref bar) = self.bar {
             bar.finish_with_message(message.to_string());
@@ -45,7 +45,7 @@ impl Progress {
         self.bar = None;
     }
 
-    /// Show a completion message with a green checkmark
+    /// 緑色チェック付きの完了メッセージを表示する
     pub fn complete(&self, message: &str) {
         if !self.enabled {
             return;
@@ -60,7 +60,7 @@ impl Progress {
         bar.finish_with_message(message.to_string());
     }
 
-    /// Finish and clear the current progress bar
+    /// 現在の進捗バーを完了して消去する
     pub fn finish_and_clear(&mut self) {
         if let Some(ref bar) = self.bar {
             bar.finish_and_clear();

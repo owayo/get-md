@@ -28,6 +28,7 @@
 - **Clean Output** — strips scripts, styles, SVGs automatically
 - **URL Resolution** — converts relative URLs to absolute paths in output
 - **Markdown Link Robustness** — supports resolving `<...>` style link destinations (including spaces)
+- **Angle Destination Parentheses Support** — does not treat `)` inside `<...>` link destinations as the closing delimiter
 - **Escaped Parentheses Support** — correctly parses link destinations containing `\(` and `\)`
 - **Quote-safe URL Parsing** — preserves quotes/apostrophes in standard Markdown link destinations
 - **Escaped Whitespace Handling** — keeps `\ ` in standard link destinations from being split as title separators

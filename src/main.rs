@@ -13,45 +13,45 @@ use url::Url;
 
 use crate::progress::Progress;
 
-/// Fetch a URL in a browser and convert selected elements to Markdown.
-/// Uses Chrome/Chromium installed on the system and supports
-/// JavaScript-rendered pages.
+/// ブラウザで URL を取得し、指定要素を Markdown に変換する。
+/// システムにインストールされた Chrome/Chromium を利用し、
+/// JavaScript で描画されるページにも対応する。
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Target URL to fetch
+    /// 取得対象の URL
     url: String,
 
-    /// CSS selectors for elements to convert to Markdown (can be specified multiple times).
-    /// If omitted, the entire page (body) is used.
+    /// Markdown 変換対象の CSS セレクタ（複数指定可）。
+    /// 省略時はページ全体（body）を対象にする。
     #[arg(short, long)]
     selector: Vec<String>,
 
-    /// Output file path. If omitted, writes to stdout.
+    /// 出力ファイルパス。省略時は標準出力へ書き込む。
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Path to Chrome binary. If omitted, auto-detected from the system.
+    /// Chrome バイナリのパス。省略時はシステムから自動検出する。
     #[arg(long)]
     chrome_path: Option<PathBuf>,
 
-    /// Additional wait time in seconds after page load (for JS rendering to complete)
+    /// ページ読み込み後の追加待機時間（秒、JS 描画完了待ち）
     #[arg(short, long, default_value_t = 2)]
     wait: u64,
 
-    /// Page load timeout in seconds
+    /// ページ読み込みタイムアウト（秒）
     #[arg(short, long, default_value_t = 60)]
     timeout: u64,
 
-    /// Show the browser window (for debugging)
+    /// ブラウザウィンドウを表示する（デバッグ用）
     #[arg(long)]
     no_headless: bool,
 
-    /// Disable browser cache (always fetch latest content)
+    /// ブラウザキャッシュを無効化する（常に最新コンテンツを取得）
     #[arg(long)]
     no_cache: bool,
 
-    /// Suppress progress output
+    /// 進捗表示を抑制する
     #[arg(short, long)]
     quiet: bool,
 }
@@ -66,7 +66,7 @@ fn main() -> Result<()> {
         cli.selector
     };
 
-    // Launch browser
+    // ブラウザを起動する
     progress.spinner("Launching Chrome...");
     let launch_options = LaunchOptions {
         headless: !cli.no_headless,
@@ -88,27 +88,27 @@ fn main() -> Result<()> {
     }
     progress.finish("Chrome launched");
 
-    // Navigate to page
+    // ページへ遷移する
     progress.spinner(&format!("Loading page: {}", cli.url));
     tab.navigate_to(&cli.url)
         .with_context(|| format!("Failed to navigate to URL: {}", cli.url))?;
 
     tab.wait_until_navigated().context("Page load timed out")?;
 
-    // Additional wait for JS rendering to complete
+    // JS 描画完了を待つための追加待機
     if cli.wait > 0 {
         progress.set_message(&format!("Waiting for JS rendering ({}s)...", cli.wait));
         std::thread::sleep(Duration::from_secs(cli.wait));
     }
     progress.finish("Page loaded");
 
-    // Extract HTML for elements matching the selectors
+    // セレクタに一致した要素の HTML を抽出する
     progress.spinner("Extracting HTML elements...");
     let mut html_fragments = Vec::new();
     for selector in &selectors {
         progress.set_message(&format!("Extracting selector '{}'...", selector));
 
-        // Get outerHTML of all matching elements
+        // 一致した全要素の outerHTML を取得する
         let js = format!(
             r#"(() => {{
                 const els = document.querySelectorAll({selector});
@@ -140,7 +140,7 @@ fn main() -> Result<()> {
         bail!("No elements matched the specified selectors");
     }
 
-    // Convert HTML to Markdown
+    // HTML を Markdown に変換する
     progress.spinner("Converting to Markdown...");
     let converter = htmd::HtmlToMarkdown::builder()
         .skip_tags(vec!["script", "style", "noscript", "svg"])
@@ -162,7 +162,8 @@ fn main() -> Result<()> {
     let markdown = resolve_markdown_urls(&markdown, &cli.url);
     progress.finish("Converted to Markdown");
 
-    // Output
+    // 出力
+    let file_existed = cli.output.as_ref().is_some_and(|p| p.exists());
     let mut writer: Box<dyn Write> = match &cli.output {
         Some(path) => {
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -181,15 +182,21 @@ fn main() -> Result<()> {
         .write_all(markdown.as_bytes())
         .context("Failed to write output")?;
 
-    // Ensure trailing newline for file output
+    // ファイル出力時は末尾改行を保証する
     if cli.output.is_some() && !markdown.ends_with('\n') {
         writer
             .write_all(b"\n")
             .context("Failed to write trailing newline")?;
     }
 
-    // Show completion with URL only after output succeeds.
-    progress.complete(&cli.url);
+    // 出力成功後にのみ URL 付きの完了表示を行う
+    match &cli.output {
+        Some(path) => {
+            let status = if file_existed { "updated" } else { "created" };
+            progress.complete(&format!("{} → {} ({})", cli.url, path.display(), status));
+        }
+        None => progress.complete(&cli.url),
+    }
 
     Ok(())
 }
@@ -198,7 +205,7 @@ fn idle_browser_timeout(timeout_secs: u64) -> Duration {
     Duration::from_secs(timeout_secs.saturating_add(30))
 }
 
-/// Escape a CSS selector string as a JavaScript string literal
+/// CSS セレクタ文字列を JavaScript 文字列リテラルとしてエスケープする
 fn escape_js_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -217,10 +224,10 @@ fn escape_js_string(s: &str) -> String {
     out
 }
 
-/// Compact redundant whitespace in Markdown table rows.
+/// Markdown テーブル行の余分な空白を圧縮する。
 ///
-/// - Trim padding in table cells
-/// - Minimize separator dashes in table rows (preserving alignment `:`)
+/// - セルの前後余白を削る
+/// - セパレータ行のダッシュを最小化する（配置指定 `:` は保持）
 fn compact_markdown(md: &str) -> String {
     let mut in_fenced_code_block = false;
     let mut fence_char = '\0';
@@ -275,7 +282,7 @@ fn compact_table_row(row: &str) -> String {
         .map(|cell| {
             let t = cell.trim();
             if !t.is_empty() && t.chars().all(|c| c == '-' || c == ':') {
-                // Separator cell: keep only alignment markers
+                // セパレータセルは配置指定だけ残す
                 let start = if t.starts_with(':') { ":" } else { "" };
                 let end = if t.ends_with(':') { ":" } else { "" };
                 format!("{start}-{end}")
@@ -311,8 +318,8 @@ fn split_unescaped_table_cells(inner: &str) -> Vec<&str> {
     cells
 }
 
-/// Resolve relative URLs in Markdown link/image syntax `[text](url)` to absolute
-/// using the page URL as the base.
+/// Markdown のリンク/画像構文 `[text](url)` に含まれる相対 URL を
+/// ページ URL を基準に絶対 URL へ解決する。
 fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
     let base = match Url::parse(base_url) {
         Ok(u) => u,
@@ -370,11 +377,11 @@ fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
     result
 }
 
-/// Split a Markdown link destination into URL and title.
+/// Markdown のリンク先を URL とタイトルに分割する。
 ///
-/// Supports:
-/// - standard form: `./path "title"`
-/// - angle bracket form: `<./path with space> "title"`
+/// 対応形式:
+/// - 標準形式: `./path "title"`
+/// - 山括弧形式: `<./path with space> "title"`
 fn split_link_destination(inside: &str) -> (&str, &str, bool) {
     if let Some(after_open) = inside.strip_prefix('<')
         && let Some(close) = after_open.find('>')
@@ -385,8 +392,8 @@ fn split_link_destination(inside: &str) -> (&str, &str, bool) {
         return (url, title, true);
     }
 
-    // In the standard form, the title (if any) starts after the first
-    // *unescaped* whitespace.
+    // 標準形式では、タイトル（あれば）は最初の
+    // 「エスケープされていない空白」以降に始まる
     let mut backslash_run = 0usize;
     for (i, c) in inside.char_indices() {
         if c == '\\' {
@@ -402,19 +409,28 @@ fn split_link_destination(inside: &str) -> (&str, &str, bool) {
     (inside, "", false)
 }
 
-/// Find the closing `)` that matches the implicit opening `(` from `](`.
+/// `](` の暗黙の開き `(` に対応する閉じ `)` を探す。
 fn find_link_close_paren(s: &str) -> Option<usize> {
     let mut depth = 1;
     let mut backslash_run = 0usize;
     let mut title_quote: Option<char> = None;
     let mut saw_dest_non_ws = false;
     let mut saw_sep_ws = false;
+    let mut in_angle_destination = false;
 
     for (i, c) in s.char_indices() {
         let escaped = c != '\\' && backslash_run % 2 == 1;
 
         if c == '\\' {
             backslash_run += 1;
+            continue;
+        }
+
+        if in_angle_destination {
+            if c == '>' && !escaped {
+                in_angle_destination = false;
+            }
+            backslash_run = 0;
             continue;
         }
 
@@ -427,6 +443,13 @@ fn find_link_close_paren(s: &str) -> Option<usize> {
         }
 
         if depth == 1 {
+            if !saw_dest_non_ws && c == '<' {
+                in_angle_destination = true;
+                saw_dest_non_ws = true;
+                backslash_run = 0;
+                continue;
+            }
+
             if c.is_ascii_whitespace() {
                 if saw_dest_non_ws {
                     saw_sep_ws = true;
@@ -597,7 +620,7 @@ mod tests {
         assert_eq!(escape_js_string("div[data-x='y']"), r#""div[data-x='y']""#);
     }
 
-    // compact_markdown tests
+    // compact_markdown のテスト
 
     #[test]
     fn compact_table_cell_padding() {
@@ -697,7 +720,7 @@ mod tests {
         assert_eq!(compact_markdown(""), "");
     }
 
-    // resolve_markdown_urls tests
+    // resolve_markdown_urls のテスト
 
     const BASE: &str = "https://example.com/docs/en/page.md";
 
@@ -806,7 +829,7 @@ mod tests {
         );
     }
 
-    // find_link_close_paren direct tests
+    // find_link_close_paren の直接テスト
 
     #[test]
     fn find_close_paren_simple() {
@@ -843,7 +866,7 @@ mod tests {
         assert_eq!(find_link_close_paren(r"foo\(bar)"), Some(8));
     }
 
-    // compact_table_row edge cases
+    // compact_table_row の境界ケース
 
     #[test]
     fn compact_table_single_cell() {
@@ -862,11 +885,11 @@ mod tests {
 
     #[test]
     fn compact_markdown_only_newlines() {
-        // lines() drops trailing empty strings, so "\n\n\n" (4 lines, last empty) -> "\n\n"
+        // lines() は末尾の空行を落とすため "\n\n\n"（4行目が空） は "\n\n" になる
         assert_eq!(compact_markdown("\n\n\n"), "\n\n");
     }
 
-    // resolve_markdown_urls additional edge cases
+    // resolve_markdown_urls の追加境界ケース
 
     #[test]
     fn resolve_url_with_query_string() {
@@ -990,7 +1013,7 @@ mod tests {
         );
     }
 
-    // escape_js_string additional edge cases
+    // escape_js_string の追加境界ケース
 
     #[test]
     fn escape_mixed_special_chars() {
@@ -1010,7 +1033,7 @@ mod tests {
         );
     }
 
-    // fence_marker direct tests
+    // fence_marker の直接テスト
 
     #[test]
     fn fence_marker_backtick_three() {
@@ -1047,7 +1070,7 @@ mod tests {
         assert_eq!(fence_marker(""), None);
     }
 
-    // compact_markdown additional edge cases
+    // compact_markdown の追加境界ケース
 
     #[test]
     fn compact_unclosed_fence_block() {
@@ -1090,7 +1113,7 @@ more code
         assert_eq!(compact_markdown(input), expected);
     }
 
-    // find_link_close_paren additional tests
+    // find_link_close_paren の追加テスト
 
     #[test]
     fn find_close_paren_title_single_quote() {
@@ -1102,11 +1125,16 @@ more code
 
     #[test]
     fn find_close_paren_escaped_backslash_before_paren() {
-        // \\) means a literal backslash followed by unescaped )
+        // \\) は「バックスラッシュ文字 + エスケープされていない )」を意味する
         assert_eq!(find_link_close_paren("url\\\\)"), Some(5));
     }
 
-    // split_link_destination additional tests
+    #[test]
+    fn find_close_paren_ignores_paren_in_angle_destination() {
+        assert_eq!(find_link_close_paren("<./file).md>)"), Some(12));
+    }
+
+    // split_link_destination の追加テスト
 
     #[test]
     fn split_link_destination_empty_angle_brackets() {
@@ -1115,7 +1143,7 @@ more code
 
     #[test]
     fn split_link_destination_no_closing_angle_bracket() {
-        // Falls through to standard form parsing
+        // 標準形式のパースへフォールバックする
         assert_eq!(
             split_link_destination("<no-close"),
             ("<no-close", "", false)
@@ -1127,7 +1155,7 @@ more code
         assert_eq!(split_link_destination("./page"), ("./page", "", false));
     }
 
-    // resolve_markdown_urls additional edge cases
+    // resolve_markdown_urls の追加境界ケース
 
     #[test]
     fn resolve_tel_link_unchanged() {
@@ -1154,6 +1182,14 @@ more code
         assert_eq!(
             resolve_markdown_urls(r#"![alt](./img.png "photo")"#, BASE),
             r#"![alt](https://example.com/docs/en/img.png "photo")"#,
+        );
+    }
+
+    #[test]
+    fn resolve_angle_bracket_url_with_paren() {
+        assert_eq!(
+            resolve_markdown_urls("[doc](<./file).md>)", BASE),
+            "[doc](<https://example.com/docs/en/file).md>)",
         );
     }
 }
