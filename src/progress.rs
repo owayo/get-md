@@ -45,19 +45,18 @@ impl Progress {
         self.bar = None;
     }
 
-    /// 緑色チェック付きの完了メッセージを表示する
-    pub fn complete(&self, message: &str) {
+    /// アイコン付きの完了メッセージを表示する
+    pub fn complete(&self, icon: &str, message: &str) {
         if !self.enabled {
             return;
         }
         let bar = ProgressBar::new_spinner();
         bar.set_style(
             ProgressStyle::default_spinner()
-                .tick_chars("✔✔")
-                .template("{spinner:.green} {msg}")
+                .template("{msg}")
                 .expect("Invalid template"),
         );
-        bar.finish_with_message(message.to_string());
+        bar.finish_with_message(format!("{icon} {message}"));
     }
 
     /// 現在の進捗バーを完了して消去する
@@ -127,13 +126,13 @@ mod tests {
     #[test]
     fn complete_on_disabled_does_not_panic() {
         let p = Progress::new(false);
-        p.complete("done");
+        p.complete("✔", "done");
     }
 
     #[test]
     fn complete_on_enabled_does_not_panic() {
         let p = Progress::new(true);
-        p.complete("https://example.com");
+        p.complete("✔", "https://example.com");
     }
 
     #[test]

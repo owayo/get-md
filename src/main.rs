@@ -2,7 +2,8 @@ mod progress;
 
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -192,17 +193,48 @@ fn main() -> Result<()> {
     // 出力成功後にのみ URL 付きの完了表示を行う
     match &cli.output {
         Some(path) => {
-            let status = match &old_content {
-                None => "created",
-                Some(old) if old != output_bytes.as_bytes() => "updated",
-                _ => "unchanged",
-            };
-            progress.complete(&format!("{} → {} ({})", cli.url, path.display(), status));
+            let (icon, status) = file_status(path, &old_content, output_bytes.as_bytes());
+            progress.complete(
+                icon,
+                &format!("{} → {} ({})", cli.url, path.display(), status),
+            );
         }
-        None => progress.complete(&cli.url),
+        None => progress.complete("✔", &cli.url),
     }
 
     Ok(())
+}
+
+/// ファイル出力のステータスを判定する。
+///
+/// git 管理下のファイルで未ステージの変更があれば常に updated 扱い。
+/// それ以外は書き込み前後の内容比較で判定する。
+fn file_status<'a>(path: &Path, old_content: &Option<Vec<u8>>, new: &[u8]) -> (&'a str, &'a str) {
+    match old_content {
+        None => ("✨", "created"),
+        Some(old) => {
+            let changed = if old != new {
+                true
+            } else {
+                has_unstaged_changes(path)
+            };
+            if changed {
+                ("📝", "updated")
+            } else {
+                ("✔", "unchanged")
+            }
+        }
+    }
+}
+
+/// git diff でファイルに未ステージの変更があるかを調べる
+fn has_unstaged_changes(path: &Path) -> bool {
+    Command::new("git")
+        .args(["diff", "--name-only", "--"])
+        .arg(path)
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 fn idle_browser_timeout(timeout_secs: u64) -> Duration {
