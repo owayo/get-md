@@ -59,6 +59,7 @@ make install  # /usr/local/bin にインストール
 - セレクタ未指定時は body 全体を対象とする
 - 複数セレクタ指定時は `---` で区切って結合
 - ファイル出力時は末尾改行を保証
-- 完了表示は出力書き込み成功後にのみ表示する
+- 完了表示は出力書き込み成功後にのみ表示する（✨ created / 📝 updated / ✔ unchanged）
+- ファイルステータス判定: 新規→created、内容変更→updated、同一内容→unchanged。git管理下で未ステージ変更がある場合は常にupdated
 - `idle_browser_timeout` は `timeout + 30s` のバッファを saturating 加算で設定する
 - バージョニングは CalVer (YY.M.counter) 形式
