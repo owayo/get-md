@@ -211,6 +211,8 @@ fn main() -> Result<()> {
 /// それ以外は書き込み前後の内容比較で判定する。
 fn file_status<'a>(path: &Path, old_content: &Option<Vec<u8>>, new: &[u8]) -> (&'a str, &'a str) {
     match old_content {
+        // 既存ファイルの読み取りに失敗した場合は新規作成ではないため updated 扱いにする。
+        None if path.exists() => ("📝", "updated"),
         None => ("✨", "created"),
         Some(old) => {
             let changed = if old != new {
@@ -1227,5 +1229,413 @@ more code
             resolve_markdown_urls("[doc](<./file).md>)", BASE),
             "[doc](<https://example.com/docs/en/file).md>)",
         );
+    }
+
+    // file_status のテスト
+
+    #[test]
+    fn file_status_new_file() {
+        let (icon, status) = file_status(Path::new("dummy"), &None, b"content");
+        assert_eq!(icon, "✨");
+        assert_eq!(status, "created");
+    }
+
+    #[test]
+    fn file_status_content_changed() {
+        let old = Some(b"old content".to_vec());
+        let (icon, status) = file_status(Path::new("dummy"), &old, b"new content");
+        assert_eq!(icon, "📝");
+        assert_eq!(status, "updated");
+    }
+
+    #[test]
+    fn file_status_content_unchanged_no_git() {
+        // 存在しないパスなので git diff は空を返す → unchanged
+        let content = b"same content";
+        let old = Some(content.to_vec());
+        let (icon, status) = file_status(Path::new("/nonexistent/path"), &old, content);
+        assert_eq!(icon, "✔");
+        assert_eq!(status, "unchanged");
+    }
+
+    #[test]
+    fn file_status_existing_file_without_old_content_is_updated() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("failed to get current time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "get-md-status-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("existing.md");
+        std::fs::write(&path, b"old").expect("failed to write fixture file");
+
+        let (icon, status) = file_status(path.as_path(), &None, b"new");
+        assert_eq!(icon, "📝");
+        assert_eq!(status, "updated");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // compact_markdown の追加エッジケース
+
+    #[test]
+    fn compact_table_row_minimal_pipe_pair() {
+        // "||" は starts_with('|') && ends_with('|') && len > 1 だが
+        // 内部が空のため空セルとして処理される
+        assert_eq!(compact_markdown("||"), "|  |");
+    }
+
+    // resolve_markdown_urls の追加エッジケース
+
+    #[test]
+    fn resolve_unclosed_link_paren() {
+        // 閉じ括弧がない場合、残りの文字列をそのまま出力する
+        let input = "[link](./path";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_consecutive_link_markers_without_url() {
+        let input = "text](not-a-link) more";
+        assert_eq!(
+            resolve_markdown_urls(input, BASE),
+            "text](https://example.com/docs/en/not-a-link) more",
+        );
+    }
+
+    // find_link_close_paren の追加エッジケース
+
+    #[test]
+    fn find_close_paren_only_backslashes() {
+        // バックスラッシュだけの入力は閉じ括弧なし
+        assert_eq!(find_link_close_paren("\\\\\\"), None);
+    }
+
+    // split_unescaped_table_cells の追加テスト
+
+    #[test]
+    fn split_unescaped_table_cells_no_pipe() {
+        assert_eq!(split_unescaped_table_cells("abc"), vec!["abc"]);
+    }
+
+    #[test]
+    fn split_unescaped_table_cells_trailing_backslashes() {
+        // 末尾のバックスラッシュはセル分割に影響しない
+        assert_eq!(split_unescaped_table_cells("a\\\\|b"), vec!["a\\\\", "b"],);
+    }
+
+    // find_link_close_paren の追加エッジケース
+
+    #[test]
+    fn find_close_paren_empty_string() {
+        // 空文字列には閉じ括弧がない
+        assert_eq!(find_link_close_paren(""), None);
+    }
+
+    #[test]
+    fn find_close_paren_consecutive_open_parens() {
+        // (())) → depth=3→2→1→0 で最後の ) で閉じる
+        assert_eq!(find_link_close_paren("(()))"), Some(4));
+    }
+
+    // split_unescaped_table_cells の追加テスト
+
+    #[test]
+    fn split_unescaped_table_cells_escaped_pipe() {
+        // エスケープされたパイプはセル区切りとして扱わない
+        assert_eq!(split_unescaped_table_cells(r"a\|b|c"), vec![r"a\|b", "c"],);
+    }
+
+    #[test]
+    fn split_unescaped_table_cells_multiple() {
+        assert_eq!(
+            split_unescaped_table_cells("a|b|c|d"),
+            vec!["a", "b", "c", "d"],
+        );
+    }
+
+    #[test]
+    fn split_unescaped_table_cells_empty_inner() {
+        // パイプ間が空のケース
+        assert_eq!(split_unescaped_table_cells("||"), vec!["", "", ""],);
+    }
+
+    // compact_markdown の追加テスト
+
+    #[test]
+    fn compact_table_many_columns() {
+        assert_eq!(
+            compact_markdown("| a   | b   | c   | d   | e   |"),
+            "| a | b | c | d | e |",
+        );
+    }
+
+    #[test]
+    fn compact_table_separator_only_colons() {
+        // コロンのみのセパレータセルは配置指定として保持
+        assert_eq!(compact_markdown("| :-: |"), "| :-: |");
+    }
+
+    // escape_js_string の追加テスト
+
+    #[test]
+    fn escape_null_byte() {
+        // NULバイトはそのまま通過する（CSS セレクタには通常含まれない）
+        assert_eq!(escape_js_string("a\0b"), "\"a\0b\"");
+    }
+
+    // resolve_markdown_urls の追加テスト
+
+    #[test]
+    fn resolve_multiple_links_on_separate_lines() {
+        let input = "[a](./one)\n[b](./two)";
+        let expected = "[a](https://example.com/docs/en/one)\n[b](https://example.com/docs/en/two)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_empty_input() {
+        assert_eq!(resolve_markdown_urls("", BASE), "");
+    }
+
+    #[test]
+    fn resolve_only_link_marker_no_url() {
+        // ]( だけで終わる入力
+        assert_eq!(resolve_markdown_urls("[text](", BASE), "[text](");
+    }
+
+    // compact_markdown: フェンス文字の不一致テスト
+
+    #[test]
+    fn compact_mismatched_fence_does_not_close() {
+        // バックティックで開いたブロックはチルダでは閉じない
+        let input = "\
+```
+| padded           | table           |
+~~~
+| also padded      | table           |
+```";
+        let expected = "\
+```
+| padded           | table           |
+~~~
+| also padded      | table           |
+```";
+        assert_eq!(compact_markdown(input), expected);
+    }
+
+    #[test]
+    fn compact_table_line_not_ending_with_pipe() {
+        // パイプで始まるがパイプで終わらない行はテーブルとして扱わない
+        assert_eq!(compact_markdown("| not a table"), "| not a table");
+    }
+
+    #[test]
+    fn compact_shorter_close_fence_ignored() {
+        // 開始フェンスより短い閉じフェンスはブロックを閉じない
+        let input = "\
+`````
+| padded           | table           |
+```
+| still inside     | fence           |
+`````";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    // resolve_markdown_urls: 追加エッジケース
+
+    #[test]
+    fn resolve_dot_url() {
+        // カレントディレクトリ参照
+        assert_eq!(
+            resolve_markdown_urls("[link](.)", BASE),
+            "[link](https://example.com/docs/en/)",
+        );
+    }
+
+    #[test]
+    fn resolve_double_dot_url() {
+        // 親ディレクトリ参照
+        assert_eq!(
+            resolve_markdown_urls("[link](..)", BASE),
+            "[link](https://example.com/docs/)",
+        );
+    }
+
+    // find_link_close_paren: 追加エッジケース
+
+    #[test]
+    fn find_close_paren_angle_dest_then_title_with_paren() {
+        // 山括弧リンク先の後にタイトル内の括弧がある場合
+        assert_eq!(
+            find_link_close_paren(r#"<url> "title (with parens)")"#),
+            Some(27),
+        );
+    }
+
+    // split_unescaped_table_cells: 追加エッジケース
+
+    #[test]
+    fn split_unescaped_table_cells_odd_backslashes_before_pipe() {
+        // 奇数個のバックスラッシュ + パイプ → エスケープ（分割しない）
+        assert_eq!(split_unescaped_table_cells(r"a\\\|b"), vec![r"a\\\|b"],);
+    }
+
+    // compact_markdown: インデント付きフェンスのテスト
+
+    #[test]
+    fn compact_indented_fence_preserves_table() {
+        // インデント付きのフェンス行もフェンスとして認識される
+        let input = "\
+  ```
+| padded           | table           |
+  ```";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    // find_link_close_paren: タイトル引用符の認識条件テスト
+
+    #[test]
+    fn find_close_paren_quote_without_space_not_title() {
+        // URL直後の引用符（空白なし）はタイトル開始として扱わない
+        // → `"` の中の `)` も通常の閉じ括弧として深度を減少させる
+        assert_eq!(find_link_close_paren(r#"url"title)"#), Some(9));
+    }
+
+    #[test]
+    fn find_close_paren_quote_with_space_is_title() {
+        // 空白の後の引用符はタイトル開始として扱う
+        // → タイトル内の `)` は無視される
+        assert_eq!(
+            find_link_close_paren(r#"url "title with ) paren")"#),
+            Some(24),
+        );
+    }
+
+    // compact_table_row: 空白のみのセルのテスト
+
+    #[test]
+    fn compact_table_whitespace_only_cells() {
+        // 空白のみのセルはトリム後に空文字列になる
+        assert_eq!(compact_markdown("|   |   |"), "|  |  |");
+    }
+
+    // resolve_markdown_urls: 連続する `](` パターンのテスト
+
+    #[test]
+    fn resolve_link_with_empty_angle_brackets() {
+        // 空の山括弧リンク先
+        assert_eq!(resolve_markdown_urls("[link](<>)", BASE), "[link](<>)");
+    }
+
+    // split_link_destination: 山括弧内に山括弧がないケース
+
+    #[test]
+    fn split_link_destination_angle_bracket_url_only() {
+        assert_eq!(split_link_destination("<./page>"), ("./page", "", true),);
+    }
+
+    // escape_js_string: 複数のエスケープ対象が連続するケース
+
+    #[test]
+    fn escape_consecutive_backslashes_and_quotes() {
+        assert_eq!(escape_js_string(r#"\""#), r#""\\\"""#);
+    }
+
+    // compact_markdown: フェンスブロック直後のテーブル行
+
+    #[test]
+    fn compact_table_immediately_after_fence_close() {
+        let input = "\
+```
+code
+```
+| a         | b         |";
+        let expected = "\
+```
+code
+```
+| a | b |";
+        assert_eq!(compact_markdown(input), expected);
+    }
+
+    // file_status: 同一内容で git 管理外のパスの場合
+
+    #[test]
+    fn file_status_same_content_nonexistent_dir() {
+        let content = b"hello";
+        let old = Some(content.to_vec());
+        let (icon, status) = file_status(
+            Path::new("/tmp/nonexistent_dir_12345/file.txt"),
+            &old,
+            content,
+        );
+        assert_eq!(icon, "✔");
+        assert_eq!(status, "unchanged");
+    }
+
+    // compact_markdown: 完全なテーブル（ヘッダ + セパレータ + データ行）
+
+    #[test]
+    fn compact_full_table_header_separator_data() {
+        let input = "\
+| Name         | Age    |
+| ------------ | ------ |
+| Alice        | 30     |";
+        let expected = "\
+| Name | Age |
+| - | - |
+| Alice | 30 |";
+        assert_eq!(compact_markdown(input), expected);
+    }
+
+    // resolve_markdown_urls: パーセントエンコードされた URL
+
+    #[test]
+    fn resolve_percent_encoded_url() {
+        assert_eq!(
+            resolve_markdown_urls("[link](./path%20with%20spaces)", BASE),
+            "[link](https://example.com/docs/en/path%20with%20spaces)",
+        );
+    }
+
+    // fence_marker: チルダ + info string
+
+    #[test]
+    fn fence_marker_tilde_with_info_string() {
+        assert_eq!(fence_marker("~~~python"), Some(('~', 3)));
+    }
+
+    // idle_browser_timeout: ゼロ秒のタイムアウト
+
+    #[test]
+    fn idle_browser_timeout_zero() {
+        assert_eq!(idle_browser_timeout(0), Duration::from_secs(30));
+    }
+
+    // resolve_markdown_urls: リファレンスリンクスタイルは変換しない
+
+    #[test]
+    fn resolve_reference_style_link_unchanged() {
+        // [text][ref] はリンク先を含まないため変換対象外
+        let input = "[text][ref]\n\n[ref]: ./page";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    // escape_js_string: 長い入力文字列
+
+    #[test]
+    fn escape_long_selector() {
+        let selector = "div.container > ul.list > li:nth-child(3) > a.link";
+        let escaped = escape_js_string(selector);
+        assert!(escaped.starts_with('"'));
+        assert!(escaped.ends_with('"'));
+        // 特殊文字がないのでそのまま
+        assert_eq!(escaped, format!("\"{selector}\""));
     }
 }

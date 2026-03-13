@@ -49,7 +49,7 @@ make install  # /usr/local/bin にインストール
 
 ## Testing
 
-- ユニットテストは Chrome 不要（CLI パース、JS エスケープ、Markdown変換、URL解決、リンクパーサー、フェンスマーカー検出、プログレス表示のテスト）
+- ユニットテストは Chrome 不要（CLI パース、JS エスケープ、Markdown変換、URL解決、リンクパーサー、フェンスマーカー検出、テーブルセル分割、ファイルステータス判定、プログレス表示のテスト）
 - E2E テストは実際の Chrome/Chromium が必要（`#[ignore]` 付き）
 - `make test` または `cargo test` で実行
 
@@ -60,6 +60,6 @@ make install  # /usr/local/bin にインストール
 - 複数セレクタ指定時は `---` で区切って結合
 - ファイル出力時は末尾改行を保証
 - 完了表示は出力書き込み成功後にのみ表示する（✨ created / 📝 updated / ✔ unchanged）
-- ファイルステータス判定: 新規→created、内容変更→updated、同一内容→unchanged。git管理下で未ステージ変更がある場合は常にupdated
+- ファイルステータス判定: 新規→created、内容変更→updated、同一内容→unchanged。git管理下で未ステージ変更がある場合は常にupdated。既存ファイルの読み取りに失敗した場合はupdated
 - `idle_browser_timeout` は `timeout + 30s` のバッファを saturating 加算で設定する
 - バージョニングは CalVer (YY.M.counter) 形式

@@ -5,7 +5,7 @@ fn get_md_bin() -> Command {
 }
 
 #[test]
-#[ignore] // Requires Chrome installed on the system
+#[ignore] // システムに Chrome/Chromium が必要
 fn fetch_github_raw_readme() {
     let output = get_md_bin()
         .args([
