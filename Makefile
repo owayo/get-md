@@ -1,13 +1,13 @@
 .PHONY: build release install clean test fmt check help
 
-# Default target
+# デフォルトターゲット
 .DEFAULT_GOAL := help
 
-# Variables
+# 変数
 BINARY_NAME := get-md
 INSTALL_PATH := /usr/local/bin
 
-## Build Commands
+## ビルドコマンド
 
 build: ## Build debug version
 	cargo build
@@ -15,12 +15,12 @@ build: ## Build debug version
 release: ## Build release version
 	cargo build --release
 
-## Installation
+## インストール
 
 install: release ## Build release and install to /usr/local/bin
 	cp target/release/$(BINARY_NAME) $(INSTALL_PATH)/
 
-## Development
+## 開発
 
 test: ## Run tests
 	cargo test
@@ -35,7 +35,7 @@ check: ## Run clippy and check
 clean: ## Clean build artifacts
 	cargo clean
 
-## Help
+## ヘルプ
 
 help: ## Show this help message
 	@echo "$(BINARY_NAME) Build Commands"

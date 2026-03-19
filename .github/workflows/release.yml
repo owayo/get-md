@@ -39,7 +39,7 @@ jobs:
       - name: Bump version
         id: bump
         run: |
-          # Use 2-digit year (YY) for Windows MSI compatibility (major version must be <= 255)
+          # Windows MSI の制約に合わせ、年は 2 桁（YY）を使う（major は 255 以下が必要）
           YEAR=$(date +%y)
           MONTH=$(date +%-m)
 
@@ -50,7 +50,7 @@ jobs:
             OLD_YEAR=$(echo "${CURRENT}" | cut -d. -f1)
             OLD_MONTH=$(echo "${CURRENT}" | cut -d. -f2)
             OLD_COUNTER=$(echo "${CURRENT}" | cut -d. -f3)
-            # Handle both 2-digit and 4-digit year formats
+            # 2 桁年と 4 桁年の両方を扱う
             OLD_YEAR_2DIGIT=$(echo "${OLD_YEAR}" | sed 's/^20//')
             if [ "${OLD_YEAR_2DIGIT}" = "${YEAR}" ] && [ "${OLD_MONTH}" = "${MONTH}" ]; then
               NEW_COUNTER=$((OLD_COUNTER + 1))
@@ -64,7 +64,7 @@ jobs:
           NEW_VERSION="${YEAR}.${MONTH}.${NEW_COUNTER}"
           echo "New version: ${NEW_VERSION}"
 
-          # Only replace the first occurrence (package version, not dependency versions)
+          # 最初の一致だけ置換する（依存ではなくパッケージ本体の version）
           sed -i "0,/^version = \"[^\"]*\"/s//version = \"${NEW_VERSION}\"/" Cargo.toml
 
           if [ -f "Cargo.lock" ]; then
@@ -228,7 +228,7 @@ jobs:
           VERSION="${{ needs.prepare-release.outputs.version }}"
           TAG="${{ needs.prepare-release.outputs.tag }}"
 
-          # Download tarballs and calculate SHA256
+          # tarball を取得して SHA256 を計算する
           curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/get-md-aarch64-apple-darwin.tar.gz" -o arm64.tar.gz
           curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/get-md-x86_64-apple-darwin.tar.gz" -o x86_64.tar.gz
 
@@ -247,14 +247,14 @@ jobs:
           SHA256_ARM64="${{ steps.sha256.outputs.sha256_arm64 }}"
           SHA256_X86_64="${{ steps.sha256.outputs.sha256_x86_64 }}"
 
-          # Clone homebrew tap
+          # Homebrew tap を取得する
           git clone "https://x-access-token:${GH_TOKEN}@github.com/owayo/homebrew-get-md.git"
           cd homebrew-get-md
 
-          # Create Formula directory if not exists
+          # Formula ディレクトリがなければ作成する
           mkdir -p Formula
 
-          # Create/update formula
+          # Formula を作成または更新する
           cat > Formula/get-md.rb << 'FORMULA'
           class GetMd < Formula
             desc "Fetch web pages with JS rendering and convert to Markdown"
@@ -282,17 +282,17 @@ jobs:
           end
           FORMULA
 
-          # Replace placeholders with actual values
+          # プレースホルダを実値に置き換える
           sed -i "s|VERSION_PLACEHOLDER|${VERSION}|g" Formula/get-md.rb
           sed -i "s|URL_ARM64_PLACEHOLDER|https://github.com/owayo/get-md/releases/download/${TAG}/get-md-aarch64-apple-darwin.tar.gz|g" Formula/get-md.rb
           sed -i "s|SHA256_ARM64_PLACEHOLDER|${SHA256_ARM64}|g" Formula/get-md.rb
           sed -i "s|URL_X86_64_PLACEHOLDER|https://github.com/owayo/get-md/releases/download/${TAG}/get-md-x86_64-apple-darwin.tar.gz|g" Formula/get-md.rb
           sed -i "s|SHA256_X86_64_PLACEHOLDER|${SHA256_X86_64}|g" Formula/get-md.rb
 
-          # Remove leading spaces from heredoc
+          # heredoc 由来の先頭空白を除去する
           sed -i 's/^          //' Formula/get-md.rb
 
-          # Commit and push
+          # コミットして push する
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/get-md.rb
