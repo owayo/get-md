@@ -462,7 +462,9 @@ fn find_next_link_candidate(md: &str, start: usize) -> Option<usize> {
         if !in_fenced_code_block && rest.starts_with('`') {
             let tick_len = rest.chars().take_while(|c| *c == '`').count();
             if inline_code_len == 0 {
-                inline_code_len = tick_len;
+                if has_matching_inline_code_closer(md, cursor + tick_len, tick_len) {
+                    inline_code_len = tick_len;
+                }
             } else if tick_len == inline_code_len {
                 inline_code_len = 0;
             }
@@ -478,6 +480,31 @@ fn find_next_link_candidate(md: &str, start: usize) -> Option<usize> {
     }
 
     None
+}
+
+/// 開始位置より後ろに、同じ長さのバッククォート列が存在するかを調べる。
+///
+/// CommonMark では未閉鎖のバッククォート列はリテラルとして扱われるため、
+/// 対応する閉じ列が見つかる場合だけインラインコードとして扱う。
+fn has_matching_inline_code_closer(md: &str, start: usize, tick_len: usize) -> bool {
+    let mut cursor = start;
+
+    while cursor < md.len() {
+        let rest = &md[cursor..];
+        if rest.starts_with('`') {
+            let run_len = rest.chars().take_while(|c| *c == '`').count();
+            if run_len == tick_len {
+                return true;
+            }
+            cursor += run_len;
+            continue;
+        }
+
+        let ch = rest.chars().next().expect("cursor は文字境界上にある");
+        cursor += ch.len_utf8();
+    }
+
+    false
 }
 
 /// `](` の直前に、対応する未エスケープの `[` があるかを調べる。
@@ -1333,6 +1360,13 @@ more code
     }
 
     #[test]
+    fn resolve_unclosed_inline_code_backticks_are_literal() {
+        let input = "`literal [link](./page)";
+        let expected = "`literal [link](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
     fn resolve_non_link_bracket_paren_sequence_unchanged() {
         let input = "text ](./not-a-link) and [link](./page)";
         let expected = "text ](./not-a-link) and [link](https://example.com/docs/en/page)";
@@ -1898,6 +1932,12 @@ code
         // ダブルバッククォートのインラインコード内は無視される
         let md = "``[code](skip)`` [link](url)";
         assert_eq!(find_next_link_candidate(md, 0), Some(22));
+    }
+
+    #[test]
+    fn link_candidate_unclosed_inline_code_is_literal() {
+        let md = "`foo [link](url)";
+        assert_eq!(find_next_link_candidate(md, 0), Some(10));
     }
 
     #[test]
