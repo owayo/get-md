@@ -1946,4 +1946,144 @@ code
         let md = "```\n[link](url)";
         assert_eq!(find_next_link_candidate(md, 0), None);
     }
+
+    // --- has_matching_inline_code_closer テスト ---
+
+    #[test]
+    fn inline_code_closer_found() {
+        // 同じ長さのバッククォート列が見つかる
+        let md = "hello` world";
+        assert!(has_matching_inline_code_closer(md, 0, 1));
+    }
+
+    #[test]
+    fn inline_code_closer_not_found() {
+        // 閉じるバッククォート列がない
+        let md = "hello world";
+        assert!(!has_matching_inline_code_closer(md, 0, 1));
+    }
+
+    #[test]
+    fn inline_code_closer_length_mismatch() {
+        // 長さが異なるバッククォート列は閉じ列として認識しない
+        let md = "hello`` world";
+        assert!(!has_matching_inline_code_closer(md, 0, 1));
+    }
+
+    #[test]
+    fn inline_code_closer_double_backtick() {
+        // ダブルバッククォートの閉じ列
+        let md = "code`` end";
+        assert!(has_matching_inline_code_closer(md, 0, 2));
+    }
+
+    #[test]
+    fn inline_code_closer_empty_input() {
+        assert!(!has_matching_inline_code_closer("", 0, 1));
+    }
+
+    // --- マルチバイト文字を含むテーブル圧縮テスト ---
+
+    #[test]
+    fn compact_table_multibyte_cells() {
+        // マルチバイト文字（日本語）を含むテーブルセルの圧縮
+        let input = "|  名前  |  説明  |";
+        assert_eq!(compact_markdown(input), "| 名前 | 説明 |");
+    }
+
+    #[test]
+    fn compact_table_emoji_cells() {
+        // 絵文字を含むテーブルセルの圧縮
+        let input = "|  🚀 ロケット  |  ⭐ スター  |";
+        assert_eq!(compact_markdown(input), "| 🚀 ロケット | ⭐ スター |");
+    }
+
+    // --- resolve_markdown_urls マルチバイトテスト ---
+
+    #[test]
+    fn resolve_link_with_multibyte_text() {
+        // リンクテキストがマルチバイト文字
+        let md = "[日本語テキスト](page.html)";
+        let result = resolve_markdown_urls(md, "https://example.com/dir/");
+        assert_eq!(
+            result,
+            "[日本語テキスト](https://example.com/dir/page.html)"
+        );
+    }
+
+    #[test]
+    fn resolve_image_with_multibyte_alt() {
+        // 画像の alt テキストがマルチバイト文字
+        let md = "![画像の説明](img.png)";
+        let result = resolve_markdown_urls(md, "https://example.com/dir/");
+        assert_eq!(result, "![画像の説明](https://example.com/dir/img.png)");
+    }
+
+    // --- find_link_close_paren 追加テスト ---
+
+    #[test]
+    fn find_close_paren_mixed_quotes_in_title() {
+        // タイトル内にシングルクォートとダブルクォートが混在
+        let s = r#"url "title with 'quotes'")"#;
+        assert_eq!(find_link_close_paren(s), Some(s.len() - 1));
+    }
+
+    #[test]
+    fn find_close_paren_unmatched_title_quote() {
+        // 閉じられていないタイトルクォート内の ) は無視される
+        let s = r#"url "title with ) inside")"#;
+        assert_eq!(find_link_close_paren(s), Some(s.len() - 1));
+    }
+
+    // --- split_link_destination 追加テスト ---
+
+    #[test]
+    fn split_link_destination_angle_bracket_no_close() {
+        // 閉じ `>` がない場合は標準形式として扱われる
+        let (url, title, angle) = split_link_destination("<no-close");
+        assert!(!angle);
+        assert_eq!(url, "<no-close");
+        assert_eq!(title, "");
+    }
+
+    #[test]
+    fn split_link_destination_url_with_multibyte() {
+        // マルチバイト文字を含む URL パス
+        let (url, title, angle) = split_link_destination("/パス/ページ");
+        assert_eq!(url, "/パス/ページ");
+        assert_eq!(title, "");
+        assert!(!angle);
+    }
+
+    // --- compact_markdown 境界テスト ---
+
+    #[test]
+    fn compact_table_pipe_only() {
+        // パイプのみの行（長さ1）はテーブル行として扱わない
+        let input = "|";
+        assert_eq!(compact_markdown(input), "|");
+    }
+
+    #[test]
+    fn compact_table_minimal_two_pipes() {
+        // 2文字のパイプ列（最小テーブル行）
+        let input = "||";
+        assert_eq!(compact_markdown(input), "|  |");
+    }
+
+    // --- escape_js_string 境界テスト ---
+
+    #[test]
+    fn escape_js_string_multibyte() {
+        // マルチバイト文字はそのまま出力される
+        assert_eq!(escape_js_string("日本語"), r#""日本語""#);
+    }
+
+    #[test]
+    fn escape_js_string_all_special_combined() {
+        // すべての特殊文字を1つの文字列で組み合わせる
+        let input = "\"\\\n\r\u{2028}\u{2029}";
+        let expected = r#""\"\\\n\r\u2028\u2029""#;
+        assert_eq!(escape_js_string(input), expected);
+    }
 }
