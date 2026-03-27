@@ -9,6 +9,7 @@ URL をブラウザで取得し、指定要素を Markdown に変換する CLI �
 - htmd (HTML -> Markdown 変換、skip_tags/spacing オプション使用)
 - clap (CLI 引数解析、derive feature)
 - indicatif (プログレス表示)
+- regex (日時パターンマッチング)
 - url (相対URL -> 絶対URL 変換)
 - anyhow (エラーハンドリング)
 
@@ -49,7 +50,7 @@ make install  # /usr/local/bin にインストール
 
 ## Testing
 
-- ユニットテストは Chrome 不要（CLI パース、JS エスケープ、Markdown変換、URL解決、リンクパーサー、コード領域を除外する URL 解決、未閉鎖バッククォートを含むリンク解決、フェンスマーカー検出、テーブルセル分割、ファイルステータス判定、エスケープ判定、開き括弧検出、リンク候補検出、インラインコード閉じ検出、マルチバイト文字対応、プログレス表示のテスト）
+- ユニットテストは Chrome 不要（CLI パース、JS エスケープ、Markdown変換、URL解決、リンクパーサー、コード領域を除外する URL 解決、未閉鎖バッククォートを含むリンク解決、フェンスマーカー検出、テーブルセル分割、ファイルステータス判定、日時無視比較、エスケープ判定、開き括弧検出、リンク候補検出、インラインコード閉じ検出、マルチバイト文字対応、プログレス表示のテスト）
 - E2E テストは実際の Chrome/Chromium が必要（`#[ignore]` 付き）
 - `make test` または `cargo test` で実行
 
@@ -61,5 +62,6 @@ make install  # /usr/local/bin にインストール
 - ファイル出力時は末尾改行を保証
 - 完了表示は出力書き込み成功後にのみ表示する（✨ created / 📝 updated / ✔ unchanged）
 - ファイルステータス判定: 新規→created、内容変更→updated、同一内容→unchanged。git管理下で未ステージ変更がある場合は常にupdated。既存ファイルの読み取りに失敗した場合はupdated
+- `--ignore-date`: 日時パターン（`YYYY-MM-DD HH:MM(:SS)?`、ISO 8601、スラッシュ区切り）を無視してファイル比較し、日時だけの差分なら上書きせず unchanged 扱いにする
 - `idle_browser_timeout` は `timeout + 30s` のバッファを saturating 加算で設定する
 - バージョニングは CalVer (YY.M.counter) 形式

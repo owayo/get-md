@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use headless_chrome::protocol::cdp::Network;
 use headless_chrome::{Browser, LaunchOptions};
+use regex::Regex;
 use url::Url;
 
 use crate::progress::Progress;
@@ -55,6 +56,11 @@ struct Cli {
     /// 進捗表示を抑制する
     #[arg(short, long)]
     quiet: bool,
+
+    /// ファイル比較時に日時の差分を無視する。
+    /// 日時だけが変わった場合は上書きせず unchanged 扱いにする。
+    #[arg(long)]
+    ignore_date: bool,
 }
 
 fn main() -> Result<()> {
@@ -172,34 +178,50 @@ fn main() -> Result<()> {
 
     // 出力
     let old_content = cli.output.as_ref().and_then(|p| std::fs::read(p).ok());
-    let mut writer: Box<dyn Write> = match &cli.output {
-        Some(path) => {
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("Failed to create output directory: {}", parent.display())
-                })?;
+
+    // --ignore-date: 日時だけの差分なら書き込みをスキップ
+    let date_only_change = cli.ignore_date
+        && cli.output.is_some()
+        && old_content
+            .as_ref()
+            .is_some_and(|old| is_date_only_change(old, output_bytes.as_bytes()));
+
+    if date_only_change {
+        let path = cli.output.as_ref().unwrap();
+        progress.complete(
+            "✔",
+            &format!("{} → {} (unchanged)", cli.url, path.display()),
+        );
+    } else {
+        let mut writer: Box<dyn Write> = match &cli.output {
+            Some(path) => {
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("Failed to create output directory: {}", parent.display())
+                    })?;
+                }
+                let file = File::create(path)
+                    .with_context(|| format!("Failed to create output file: {}", path.display()))?;
+                Box::new(file)
             }
-            let file = File::create(path)
-                .with_context(|| format!("Failed to create output file: {}", path.display()))?;
-            Box::new(file)
-        }
-        None => Box::new(io::stdout().lock()),
-    };
+            None => Box::new(io::stdout().lock()),
+        };
 
-    writer
-        .write_all(output_bytes.as_bytes())
-        .context("Failed to write output")?;
+        writer
+            .write_all(output_bytes.as_bytes())
+            .context("Failed to write output")?;
 
-    // 出力成功後にのみ URL 付きの完了表示を行う
-    match &cli.output {
-        Some(path) => {
-            let (icon, status) = file_status(path, &old_content, output_bytes.as_bytes());
-            progress.complete(
-                icon,
-                &format!("{} → {} ({})", cli.url, path.display(), status),
-            );
+        // 出力成功後にのみ URL 付きの完了表示を行う
+        match &cli.output {
+            Some(path) => {
+                let (icon, status) = file_status(path, &old_content, output_bytes.as_bytes());
+                progress.complete(
+                    icon,
+                    &format!("{} → {} ({})", cli.url, path.display(), status),
+                );
+            }
+            None => progress.complete("✔", &cli.url),
         }
-        None => progress.complete("✔", &cli.url),
     }
 
     Ok(())
@@ -237,6 +259,27 @@ fn has_unstaged_changes(path: &Path) -> bool {
         .output()
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false)
+}
+
+/// 日時パターンを除去した文字列同士を比較し、日時だけの差分かどうかを判定する。
+fn is_date_only_change(old: &[u8], new: &[u8]) -> bool {
+    if old == new {
+        return false; // そもそも同一なら date-only change ではない
+    }
+    let old_str = std::str::from_utf8(old).unwrap_or("");
+    let new_str = std::str::from_utf8(new).unwrap_or("");
+    strip_dates(old_str) == strip_dates(new_str)
+}
+
+/// 日時パターンを空文字に置換する。
+///
+/// 対応パターン:
+/// - `YYYY-MM-DD HH:MM(:SS)?` / `YYYY/MM/DD HH:MM(:SS)?`
+/// - `YYYY-MM-DDT HH:MM(:SS)?` (ISO 8601)
+/// - `YYYY-MM-DD` / `YYYY/MM/DD` (日付のみ)
+fn strip_dates(s: &str) -> String {
+    let re = Regex::new(r"\d{4}[-/]\d{2}[-/]\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?").unwrap();
+    re.replace_all(s, "").to_string()
 }
 
 fn idle_browser_timeout(timeout_secs: u64) -> Duration {
@@ -1754,6 +1797,67 @@ code
         );
         assert_eq!(icon, "✔");
         assert_eq!(status, "unchanged");
+    }
+
+    // is_date_only_change / strip_dates のテスト
+
+    #[test]
+    fn date_only_change_detected() {
+        let old = b"*Generated: 2026-03-25 16:01 - auto-generated*\ncontent here";
+        let new = b"*Generated: 2026-03-25 17:02 - auto-generated*\ncontent here";
+        assert!(is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn date_only_change_with_date_only_format() {
+        let old = b"Last updated: 2026-03-25\nHello";
+        let new = b"Last updated: 2026-03-26\nHello";
+        assert!(is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn date_only_change_with_iso8601() {
+        let old = b"timestamp: 2026-03-25T16:01:30\ndata";
+        let new = b"timestamp: 2026-03-26T09:00:00\ndata";
+        assert!(is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn date_only_change_with_slash_date() {
+        let old = b"date: 2026/03/25 16:01\ndata";
+        let new = b"date: 2026/03/26 09:00\ndata";
+        assert!(is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn not_date_only_change_content_differs() {
+        let old = b"*Generated: 2026-03-25 16:01*\nold content";
+        let new = b"*Generated: 2026-03-25 17:02*\nnew content";
+        assert!(!is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn not_date_only_change_identical() {
+        let content = b"*Generated: 2026-03-25 16:01*\ncontent";
+        assert!(!is_date_only_change(content, content));
+    }
+
+    #[test]
+    fn strip_dates_removes_datetime() {
+        assert_eq!(
+            strip_dates("Generated: 2026-03-25 16:01 - auto"),
+            "Generated:  - auto"
+        );
+    }
+
+    #[test]
+    fn strip_dates_removes_datetime_with_seconds() {
+        assert_eq!(strip_dates("at 2026-03-25 16:01:30 done"), "at  done");
+    }
+
+    #[test]
+    fn strip_dates_removes_date_only() {
+        assert_eq!(strip_dates("on 2026-03-25 ok"), "on  ok");
     }
 
     // compact_markdown: 完全なテーブル（ヘッダ + セパレータ + データ行）
