@@ -38,6 +38,7 @@
 - **Escaped Pipe-safe Tables** — keeps escaped cell pipes (`\|`) intact during table compaction
 - **Progress Display** — shows operation progress with quiet mode option, and reports completion only after output succeeds
 - **File Status Icons** — shows ✨ (created), 📝 (updated), or ✔ (unchanged) for file output; git-aware change detection and fallback to `updated` when an existing file cannot be read
+- **Date-only Diff Ignore** — `--ignore-date` skips rewrites when only timestamp strings changed, including common ISO 8601 forms with fractional seconds and timezone suffixes
 - **Timeout Safety** — internal browser idle-timeout buffer uses saturating arithmetic to avoid overflow at extreme `--timeout` values
 
 ## Requirements
@@ -101,6 +102,7 @@ get-md [OPTIONS] <URL>
 | `--timeout <SECS>` | `-t` | Page load timeout in seconds (default: 60) |
 | `--no-headless` | | Run browser visibly (for debugging) |
 | `--no-cache` | | Disable browser cache (always fetch latest content) |
+| `--ignore-date` | | Treat timestamp-only output diffs as unchanged when writing files |
 | `--quiet` | `-q` | Suppress progress display |
 | `--help` | `-h` | Show help |
 | `--version` | `-V` | Show version |
@@ -125,6 +127,9 @@ get-md https://spa-example.com -s "#app" -w 5 -t 60
 
 # Use a specific Chrome binary
 get-md https://example.com --chrome-path /usr/bin/google-chrome
+
+# Skip rewriting when only timestamps changed
+get-md https://example.com -o output.md --ignore-date
 
 # Quiet mode (no progress output)
 get-md https://example.com -s "article" -q -o output.md

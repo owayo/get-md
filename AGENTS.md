@@ -62,6 +62,6 @@ make install  # /usr/local/bin にインストール
 - ファイル出力時は末尾改行を保証
 - 完了表示は出力書き込み成功後にのみ表示する（✨ created / 📝 updated / ✔ unchanged）
 - ファイルステータス判定: 新規→created、内容変更→updated、同一内容→unchanged。git管理下で未ステージ変更がある場合は常にupdated。既存ファイルの読み取りに失敗した場合はupdated
-- `--ignore-date`: 日時パターン（`YYYY-MM-DD HH:MM(:SS)?`、ISO 8601、スラッシュ区切り）を無視してファイル比較し、日時だけの差分なら上書きせず unchanged 扱いにする
+- `--ignore-date`: 日時パターン（`YYYY-MM-DD HH:MM(:SS)?`、スラッシュ区切り、`Z`・小数秒・タイムゾーン付き ISO 8601）を無視してファイル比較し、日時だけの差分なら上書きせず unchanged 扱いにする
 - `idle_browser_timeout` は `timeout + 30s` のバッファを saturating 加算で設定する
 - バージョニングは CalVer (YY.M.counter) 形式

@@ -275,10 +275,13 @@ fn is_date_only_change(old: &[u8], new: &[u8]) -> bool {
 ///
 /// 対応パターン:
 /// - `YYYY-MM-DD HH:MM(:SS)?` / `YYYY/MM/DD HH:MM(:SS)?`
-/// - `YYYY-MM-DDT HH:MM(:SS)?` (ISO 8601)
+/// - `YYYY-MM-DDTHH:MM(:SS)?(.sss)?(Z|+09:00)?` などの ISO 8601
 /// - `YYYY-MM-DD` / `YYYY/MM/DD` (日付のみ)
 fn strip_dates(s: &str) -> String {
-    let re = Regex::new(r"\d{4}[-/]\d{2}[-/]\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?").unwrap();
+    let re = Regex::new(
+        r"\d{4}[-/]\d{2}[-/]\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:[.,]\d+)?(?:Z|[+-]\d{2}:\d{2}|[+-]\d{4})?)?",
+    )
+    .unwrap();
     re.replace_all(s, "").to_string()
 }
 
@@ -1823,6 +1826,20 @@ code
     }
 
     #[test]
+    fn date_only_change_with_iso8601_z_suffix() {
+        let old = b"timestamp: 2026-03-25T16:01:30Z\ndata";
+        let new = b"timestamp: 2026-03-26T09:00:00Z\ndata";
+        assert!(is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn date_only_change_with_iso8601_fractional_and_offset() {
+        let old = b"timestamp: 2026-03-25T16:01:30.123+09:00\ndata";
+        let new = b"timestamp: 2026-03-26T09:00:00.456+09:00\ndata";
+        assert!(is_date_only_change(old, new));
+    }
+
+    #[test]
     fn date_only_change_with_slash_date() {
         let old = b"date: 2026/03/25 16:01\ndata";
         let new = b"date: 2026/03/26 09:00\ndata";
@@ -1853,6 +1870,14 @@ code
     #[test]
     fn strip_dates_removes_datetime_with_seconds() {
         assert_eq!(strip_dates("at 2026-03-25 16:01:30 done"), "at  done");
+    }
+
+    #[test]
+    fn strip_dates_removes_iso8601_with_timezone() {
+        assert_eq!(
+            strip_dates("at 2026-03-25T16:01:30.123+09:00 done"),
+            "at  done"
+        );
     }
 
     #[test]
