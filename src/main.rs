@@ -2391,4 +2391,161 @@ code
         // バッククォートとチルダの混在はフェンスにならない
         assert_eq!(fence_marker("``~"), None);
     }
+
+    // --- compact_markdown フェンス等号長テスト ---
+
+    #[test]
+    fn compact_fence_close_equal_length() {
+        // 閉じフェンスが開きフェンスと同じ長さの場合にブロックが閉じること
+        let input = "```\n| a | b |\n```\n| x | y |";
+        let result = compact_markdown(input);
+        // フェンス内のテーブル行はそのまま、フェンス外は圧縮される
+        assert!(result.contains("| a | b |"));
+        assert!(result.contains("| x | y |"));
+    }
+
+    // --- resolve_markdown_urls 空URL テスト ---
+
+    #[test]
+    fn resolve_empty_url_in_standard_link() {
+        // [link]() の場合、URL が空なので変換せずそのまま
+        let result = resolve_markdown_urls("[link]()", BASE);
+        assert_eq!(result, "[link]()");
+    }
+
+    #[test]
+    fn resolve_link_with_only_fragment_hash() {
+        // [link](#) はフラグメントのみ — ベースURLにフラグメント付与
+        let result = resolve_markdown_urls("[link](#)", BASE);
+        assert!(result.contains("#"));
+    }
+
+    // --- has_opening_link_bracket 位置ゼロ テスト ---
+
+    #[test]
+    fn opening_bracket_position_zero_not_found() {
+        // close_bracket が 0 の場合、while cursor > 0 に入らず false
+        assert!(!has_opening_link_bracket("](url)", 0));
+    }
+
+    // --- find_link_close_paren タイトル内特殊文字 ---
+
+    #[test]
+    fn find_close_paren_title_with_angle_bracket() {
+        // タイトルクォート内の < は特殊処理されない
+        let result = find_link_close_paren(r#"url "title with <tag>")"#);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn find_close_paren_title_with_paren_inside() {
+        // タイトルクォート内の ) は閉じ括弧として扱わない
+        let result = find_link_close_paren(r#"url "title (with) paren")"#);
+        assert_eq!(result, Some(24));
+    }
+
+    // --- has_matching_inline_code_closer マルチバイトテスト ---
+
+    #[test]
+    fn inline_code_closer_with_multibyte_content() {
+        // マルチバイト文字を含むインラインコード内でも閉じバッククォートを正しく検出
+        let md = "`日本語テスト`";
+        assert!(has_matching_inline_code_closer(md, 1, 1));
+    }
+
+    #[test]
+    fn inline_code_closer_with_emoji_content() {
+        // 絵文字を含むインラインコード内でも正しく検出
+        let md = "`🎉🚀`rest";
+        assert!(has_matching_inline_code_closer(md, 1, 1));
+    }
+
+    // --- resolve_markdown_urls 追加エッジケース ---
+
+    #[test]
+    fn resolve_link_immediately_after_fenced_code() {
+        // フェンスコードブロック直後のリンクが正しく解決されること
+        let input = "```\ncode\n```\n[link](./path)";
+        let result = resolve_markdown_urls(input, BASE);
+        assert!(result.contains("https://example.com/docs/en/path"));
+    }
+
+    #[test]
+    fn resolve_multiple_inline_code_and_links() {
+        // インラインコードとリンクが混在する場合
+        let input = "`code` [link](./a) `more` [link2](./b)";
+        let result = resolve_markdown_urls(input, BASE);
+        assert!(result.contains("https://example.com/docs/en/a"));
+        assert!(result.contains("https://example.com/docs/en/b"));
+    }
+
+    // --- compact_markdown 追加エッジケース ---
+
+    #[test]
+    fn compact_table_with_backtick_in_cell() {
+        // セル内にバッククォートがあってもテーブルとして処理される
+        let input = "| `code` | value |";
+        let result = compact_markdown(input);
+        assert_eq!(result, "| `code` | value |");
+    }
+
+    #[test]
+    fn compact_markdown_trailing_newline_stripped_by_lines() {
+        // str::lines() は末尾改行を含めないため、末尾改行は除去される
+        let input = "| a | b |\n";
+        let result = compact_markdown(input);
+        assert_eq!(result, "| a | b |");
+    }
+
+    // --- find_next_link_candidate 追加テスト ---
+
+    #[test]
+    fn link_candidate_after_inline_code_with_bracket() {
+        // インラインコード内の ]( は無視され、その後のリンクが見つかること
+        let input = "`](` [real](url)";
+        let result = find_next_link_candidate(input, 0);
+        assert!(result.is_some());
+        // ]( の位置はインラインコード外のもの
+        let pos = result.unwrap();
+        assert!(pos > 4); // インラインコード「`](`」の後
+    }
+
+    #[test]
+    fn link_candidate_start_mid_line() {
+        // 行の途中から検索開始した場合でもリンク候補を見つけること
+        let input = "text [link](url) more";
+        let result = find_next_link_candidate(input, 5);
+        assert_eq!(result, Some(10));
+    }
+
+    // --- split_link_destination 追加テスト ---
+
+    #[test]
+    fn split_link_destination_angle_bracket_empty_title() {
+        // 山括弧URL + 空タイトル
+        let (url, title, angle) = split_link_destination("<https://example.com> ");
+        assert_eq!(url, "https://example.com");
+        assert_eq!(title, " ");
+        assert!(angle);
+    }
+
+    // --- is_date_only_change 追加テスト ---
+
+    #[test]
+    fn date_only_change_empty_old_with_date_new() {
+        // 空ファイル vs 日付のみの新コンテンツ — 日付以外の差分（空文字列の差）があるので false
+        let old = b"";
+        let new = b"2024-01-15";
+        // strip_dates("") = "", strip_dates("2024-01-15") = ""
+        // old == new は false (空 vs 非空)、strip 後は等しい → true
+        assert!(is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn date_only_change_with_surrounding_text() {
+        // 日付以外のテキストが異なれば false
+        let old = b"created: 2024-01-15 by Alice";
+        let new = b"created: 2024-06-20 by Bob";
+        assert!(!is_date_only_change(old, new));
+    }
 }
