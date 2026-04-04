@@ -3015,4 +3015,240 @@ code
         // 一般的な 60 秒タイムアウトのバッファ確認
         assert_eq!(idle_browser_timeout(60), Duration::from_secs(90));
     }
+
+    // --- split_link_destination の追加テスト ---
+
+    #[test]
+    fn split_link_destination_empty_input() {
+        // 空文字列は URL なし・タイトルなし
+        let (url, title, angle) = split_link_destination("");
+        assert_eq!(url, "");
+        assert_eq!(title, "");
+        assert!(!angle);
+    }
+
+    #[test]
+    fn split_link_destination_angle_bracket_unclosed_falls_to_standard() {
+        // 閉じ `>` がない山括弧は標準形式としてパースされる
+        let (url, title, angle) = split_link_destination("<no-close");
+        assert_eq!(url, "<no-close");
+        assert_eq!(title, "");
+        assert!(!angle);
+    }
+
+    #[test]
+    fn split_link_destination_standard_only_whitespace() {
+        // 空白のみの入力は URL が空
+        let (url, title, angle) = split_link_destination("   ");
+        assert_eq!(url, "");
+        assert_eq!(title, "   ");
+        assert!(!angle);
+    }
+
+    // --- find_link_close_paren の追加テスト ---
+
+    #[test]
+    fn find_close_paren_only_whitespace() {
+        // 空白だけで閉じ括弧がない場合は None
+        assert_eq!(find_link_close_paren("   "), None);
+    }
+
+    #[test]
+    fn find_close_paren_immediate_close() {
+        // 開き括弧直後に閉じ括弧
+        assert_eq!(find_link_close_paren(")"), Some(0));
+    }
+
+    #[test]
+    fn find_close_paren_backslash_at_end_without_close() {
+        // 末尾にバックスラッシュがあり閉じ括弧がない
+        assert_eq!(find_link_close_paren("url\\"), None);
+    }
+
+    // --- compact_markdown の追加テスト ---
+
+    #[test]
+    fn compact_tilde_fence_inside_backtick_fence() {
+        // バッククォートフェンス内のチルダ行はフェンスとして扱わない
+        let md = "```\n~~~\n| a | b |\n~~~\n```\n|  c  |  d  |";
+        let result = compact_markdown(md);
+        // フェンス内のテーブル行はそのまま保持
+        assert!(result.contains("| a | b |"));
+        // フェンス外のテーブル行は圧縮される
+        assert!(result.contains("| c | d |"));
+    }
+
+    #[test]
+    fn compact_markdown_only_pipes() {
+        // パイプだけの行（長さ 1）はテーブルとして扱わない
+        assert_eq!(compact_markdown("|"), "|");
+    }
+
+    #[test]
+    fn compact_markdown_consecutive_tables() {
+        // 連続するテーブルが両方とも圧縮される
+        let md = "|  a  |  b  |\n|  c  |  d  |";
+        let result = compact_markdown(md);
+        assert_eq!(result, "| a | b |\n| c | d |");
+    }
+
+    // --- escape_js_string の追加テスト ---
+
+    #[test]
+    fn escape_js_string_template_literal_backtick() {
+        // テンプレートリテラルのバッククォートはそのまま通過
+        assert_eq!(escape_js_string("`template`"), "\"`template`\"");
+    }
+
+    #[test]
+    fn escape_js_string_surrogate_boundary() {
+        // U+FFFF の非BMP境界付近の文字がそのまま通過する
+        let s = "\u{FEFF}"; // BOM
+        let result = escape_js_string(s);
+        assert_eq!(result, format!("\"{}\"", s));
+    }
+
+    // --- resolve_markdown_urls の追加テスト ---
+
+    #[test]
+    fn resolve_url_with_path_base() {
+        // ベースURLにパスがある場合の相対URL解決
+        let md = "[link](other.html)";
+        let result = resolve_markdown_urls(md, "https://example.com/dir/page.html");
+        assert_eq!(result, "[link](https://example.com/dir/other.html)");
+    }
+
+    #[test]
+    fn resolve_url_preserves_non_link_brackets() {
+        // `]` と `(` が離れている場合はリンクとして扱わない
+        let md = "array[0] = (value)";
+        let result = resolve_markdown_urls(md, "https://example.com/");
+        assert_eq!(result, md);
+    }
+
+    #[test]
+    fn resolve_consecutive_angle_bracket_links() {
+        // 連続する山括弧リンクが両方とも解決される
+        let md = "[a](<./x>) [b](<./y>)";
+        let result = resolve_markdown_urls(md, "https://example.com/");
+        assert_eq!(
+            result,
+            "[a](<https://example.com/x>) [b](<https://example.com/y>)"
+        );
+    }
+
+    // --- find_next_link_candidate の追加テスト ---
+
+    #[test]
+    fn link_candidate_at_end_of_string() {
+        // 文字列末尾の `](` は見つかる
+        let md = "[a](";
+        let candidate = find_next_link_candidate(md, 0);
+        assert_eq!(candidate, Some(2));
+    }
+
+    #[test]
+    fn link_candidate_start_at_last_char() {
+        // 開始位置が最後の文字の場合は None
+        let md = "abc";
+        assert_eq!(find_next_link_candidate(md, 2), None);
+    }
+
+    #[test]
+    fn link_candidate_start_at_newline() {
+        // 開始位置が改行文字の場合、次の行がフェンスかどうか正しく判定
+        let md = "text\n```\n[a](b)\n```\n[c](d)";
+        let pos = find_next_link_candidate(md, 4);
+        assert!(pos.is_some());
+        let after = &md[pos.unwrap()..];
+        assert!(after.starts_with("](d)"));
+    }
+
+    // --- has_opening_link_bracket の追加テスト ---
+
+    #[test]
+    fn opening_bracket_all_escaped() {
+        // 全ての `[` がエスケープ済みの場合は false
+        let md = r"text \[not a link](url)";
+        // `]` は index 17
+        assert!(!has_opening_link_bracket(md, 17));
+    }
+
+    // --- is_escaped_markdown_char の追加テスト ---
+
+    #[test]
+    fn escaped_char_at_string_boundary() {
+        // idx が 0 の場合はバックスラッシュ無し → false
+        assert!(!is_escaped_markdown_char("[text", 0));
+    }
+
+    #[test]
+    fn escaped_char_four_backslashes() {
+        // 4 つのバックスラッシュ → 偶数 → エスケープされていない
+        assert!(!is_escaped_markdown_char("\\\\\\\\[", 4));
+    }
+
+    // --- compact_table_row の追加テスト ---
+
+    #[test]
+    fn compact_table_row_all_separator() {
+        // 全セルがセパレータの場合
+        let result = compact_table_row("| --- | --- | --- |");
+        assert_eq!(result, "| - | - | - |");
+    }
+
+    #[test]
+    fn compact_table_row_mixed_content_and_separator() {
+        // セパレータと通常セルの混在（通常のテーブルヘッダ+セパレータ）
+        let result = compact_table_row("|  Header  |  Value  |");
+        assert_eq!(result, "| Header | Value |");
+    }
+
+    // --- is_date_only_change の追加テスト ---
+
+    #[test]
+    fn date_only_change_multiline_with_dates() {
+        // 複数行で各行に日付がある場合
+        let old = b"line1 2024-01-01\nline2 2024-01-01 10:00";
+        let new = b"line1 2025-12-31\nline2 2025-12-31 23:59";
+        assert!(is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn date_only_change_date_in_url_path() {
+        // URL パス内の日付パターンも日付として扱われる
+        let old = b"/blog/2024-01-01/post";
+        let new = b"/blog/2025-06-15/post";
+        assert!(is_date_only_change(old, new));
+    }
+
+    // --- strip_dates の追加テスト ---
+
+    #[test]
+    fn strip_dates_iso8601_with_negative_offset() {
+        // 負のタイムゾーンオフセット
+        assert_eq!(strip_dates("2024-01-01T10:00:00-05:00"), "");
+    }
+
+    #[test]
+    fn strip_dates_date_at_start_and_end() {
+        // 文字列の先頭と末尾に日付
+        assert_eq!(strip_dates("2024-01-01 text 2024-12-31"), " text ");
+    }
+
+    // --- has_matching_inline_code_closer の追加テスト ---
+
+    #[test]
+    fn inline_code_closer_from_end_of_string() {
+        // 開始位置が文字列末尾 → 閉じが見つからない
+        let md = "`code`";
+        assert!(!has_matching_inline_code_closer(md, md.len(), 1));
+    }
+
+    #[test]
+    fn inline_code_closer_multibyte_between_backticks() {
+        // マルチバイト文字を含むインラインコード
+        let md = "``日本語のコード``";
+        assert!(has_matching_inline_code_closer(md, 2, 2));
+    }
 }
