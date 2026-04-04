@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -188,9 +189,15 @@ fn main() -> Result<()> {
 
     if date_only_change {
         let path = cli.output.as_ref().unwrap();
+        // 未ステージ変更があれば updated 扱い（file_status と同じ契約）
+        let (icon, status) = if has_unstaged_changes(path) {
+            ("📝", "updated")
+        } else {
+            ("✔", "unchanged")
+        };
         progress.complete(
-            "✔",
-            &format!("{} → {} (unchanged)", cli.url, path.display()),
+            icon,
+            &format!("{} → {} ({})", cli.url, path.display(), status),
         );
     } else {
         let mut writer: Box<dyn Write> = match &cli.output {
@@ -261,14 +268,29 @@ fn has_unstaged_changes(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 日時パターンにマッチする正規表現（コンパイルは一度だけ）
+static DATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\d{4}[-/]\d{2}[-/]\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:[.,]\d+)?(?:Z|[+-]\d{2}:\d{2}|[+-]\d{4})?)?",
+    )
+    .unwrap()
+});
+
 /// 日時パターンを除去した文字列同士を比較し、日時だけの差分かどうかを判定する。
+///
+/// 両方が有効な UTF-8 であり、かつ双方に日時パターンを含む場合のみ比較する。
+/// 非 UTF-8 や日時パターンを含まない側がある場合は false を返す。
 fn is_date_only_change(old: &[u8], new: &[u8]) -> bool {
     if old == new {
         return false; // そもそも同一なら date-only change ではない
     }
-    let old_str = std::str::from_utf8(old).unwrap_or("");
-    let new_str = std::str::from_utf8(new).unwrap_or("");
-    strip_dates(old_str) == strip_dates(new_str)
+    let (Ok(old_str), Ok(new_str)) = (std::str::from_utf8(old), std::str::from_utf8(new)) else {
+        return false; // 非 UTF-8 は安全のため false
+    };
+    // 双方に日時パターンが含まれていなければ date-only change ではない
+    DATE_RE.is_match(old_str)
+        && DATE_RE.is_match(new_str)
+        && strip_dates(old_str) == strip_dates(new_str)
 }
 
 /// 日時パターンを空文字に置換する。
@@ -278,11 +300,7 @@ fn is_date_only_change(old: &[u8], new: &[u8]) -> bool {
 /// - `YYYY-MM-DDTHH:MM(:SS)?(.sss)?(Z|+09:00)?` などの ISO 8601
 /// - `YYYY-MM-DD` / `YYYY/MM/DD` (日付のみ)
 fn strip_dates(s: &str) -> String {
-    let re = Regex::new(
-        r"\d{4}[-/]\d{2}[-/]\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:[.,]\d+)?(?:Z|[+-]\d{2}:\d{2}|[+-]\d{4})?)?",
-    )
-    .unwrap();
-    re.replace_all(s, "").to_string()
+    DATE_RE.replace_all(s, "").into_owned()
 }
 
 fn idle_browser_timeout(timeout_secs: u64) -> Duration {
@@ -604,13 +622,23 @@ fn is_escaped_markdown_char(md: &str, idx: usize) -> bool {
 /// - 標準形式: `./path "title"`
 /// - 山括弧形式: `<./path with space> "title"`
 fn split_link_destination(inside: &str) -> (&str, &str, bool) {
-    if let Some(after_open) = inside.strip_prefix('<')
-        && let Some(close) = after_open.find('>')
-    {
-        let end = close + 1;
-        let url = &inside[1..end];
-        let title = &inside[(end + 1)..];
-        return (url, title, true);
+    if let Some(after_open) = inside.strip_prefix('<') {
+        // エスケープされていない `>` を探す（`\>` はスキップ）
+        let mut backslash_run = 0usize;
+        for (off, ch) in after_open.char_indices() {
+            if ch == '\\' {
+                backslash_run += 1;
+                continue;
+            }
+            let escaped = backslash_run % 2 == 1;
+            if ch == '>' && !escaped {
+                let end = 1 + off; // inside 上の '>' の位置
+                let url = &inside[1..end];
+                let title = &inside[(end + 1)..];
+                return (url, title, true);
+            }
+            backslash_run = 0;
+        }
     }
 
     // 標準形式では、タイトル（あれば）は最初の
@@ -2267,12 +2295,11 @@ code
     // --- is_date_only_change 追加エッジケース ---
 
     #[test]
-    fn date_only_change_non_utf8_returns_true() {
-        // 非UTF-8バイト列で内容が異なる場合、from_utf8失敗で空文字同士の比較になる
+    fn date_only_change_non_utf8_returns_false() {
+        // 非 UTF-8 バイト列は安全のため false を返す
         let old = &[0xFF, 0xFE];
         let new = &[0xFD, 0xFC];
-        // old != new かつ strip_dates("") == strip_dates("") なので true
-        assert!(is_date_only_change(old, new));
+        assert!(!is_date_only_change(old, new));
     }
 
     #[test]
@@ -2533,12 +2560,11 @@ code
 
     #[test]
     fn date_only_change_empty_old_with_date_new() {
-        // 空ファイル vs 日付のみの新コンテンツ — 日付以外の差分（空文字列の差）があるので false
+        // 空ファイル vs 日付のみの新コンテンツ
+        // old に日時パターンが含まれないため false
         let old = b"";
         let new = b"2024-01-15";
-        // strip_dates("") = "", strip_dates("2024-01-15") = ""
-        // old == new は false (空 vs 非空)、strip 後は等しい → true
-        assert!(is_date_only_change(old, new));
+        assert!(!is_date_only_change(old, new));
     }
 
     #[test]
@@ -2553,12 +2579,12 @@ code
 
     #[test]
     fn split_link_destination_angle_bracket_escaped_gt() {
-        // 山括弧内のエスケープされていない最初の `>` で分割される。
-        // find('>') はバイト検索なのでバックスラッシュ直後の `>` も分割点になる。
+        // `\>` はエスケープされた `>` なので分割点にならない。
+        // 次のエスケープされていない `>` で分割される。
         let (url, title, angle) = split_link_destination(r#"<path\>with> "title""#);
         assert!(angle);
-        assert_eq!(url, r"path\");
-        assert_eq!(title, r#"with> "title""#);
+        assert_eq!(url, r"path\>with");
+        assert_eq!(title, r#" "title""#);
     }
 
     #[test]
@@ -2747,5 +2773,87 @@ code
     fn compact_table_row_separator_center_align() {
         // 中央寄せセパレータ
         assert_eq!(compact_table_row("| :---: | :--: |"), "| :-: | :-: |");
+    }
+
+    // --- is_date_only_change 修正に伴う追加テスト ---
+
+    #[test]
+    fn date_only_change_old_has_no_date_returns_false() {
+        // old に日時パターンがない場合は date-only change ではない
+        let old = b"hello world";
+        let new = b"hello 2024-01-15 world";
+        assert!(!is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn date_only_change_new_has_no_date_returns_false() {
+        // new に日時パターンがない場合は date-only change ではない
+        let old = b"hello 2024-01-15 world";
+        let new = b"hello world";
+        assert!(!is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn date_only_change_one_side_non_utf8_returns_false() {
+        // 片方が非 UTF-8 の場合は false
+        let old = b"data 2024-01-15";
+        let new: &[u8] = &[0xFF, 0xFE, 0xFD];
+        assert!(!is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn date_only_change_both_have_dates_and_differ_only_in_dates() {
+        // 双方に日時パターンがあり、日時以外が同一なら true
+        let old = b"report 2024-01-15 10:00 final";
+        let new = b"report 2025-03-20 14:30 final";
+        assert!(is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn date_only_change_dates_with_extra_text_diff_returns_false() {
+        // 日時以外のテキストも異なる場合は false
+        let old = b"report 2024-01-15 draft";
+        let new = b"report 2025-03-20 final";
+        assert!(!is_date_only_change(old, new));
+    }
+
+    // --- split_link_destination 修正に伴う追加テスト ---
+
+    #[test]
+    fn split_link_destination_angle_bracket_double_escaped_backslash_before_gt() {
+        // `\\>` は偶数バックスラッシュ後の `>` なので分割点になる
+        let (url, title, angle) = split_link_destination(r#"<path\\> "title""#);
+        assert!(angle);
+        assert_eq!(url, r"path\\");
+        assert_eq!(title, r#" "title""#);
+    }
+
+    #[test]
+    fn split_link_destination_angle_bracket_no_unescaped_gt() {
+        // エスケープされた `>` のみで閉じ `>` がない場合は山括弧形式として扱わない
+        let (url, title, angle) = split_link_destination(r"<path\>");
+        assert!(!angle);
+        assert_eq!(url, r"<path\>");
+        assert_eq!(title, "");
+    }
+
+    #[test]
+    fn split_link_destination_angle_bracket_multiple_escaped_gt() {
+        // 複数の `\>` をスキップし、最初のエスケープされていない `>` で分割
+        let (url, title, angle) = split_link_destination(r#"<a\>b\>c> "t""#);
+        assert!(angle);
+        assert_eq!(url, r"a\>b\>c");
+        assert_eq!(title, r#" "t""#);
+    }
+
+    // --- resolve_markdown_urls 修正（山括弧エスケープ）に伴うテスト ---
+
+    #[test]
+    fn resolve_angle_bracket_url_with_escaped_gt() {
+        // 山括弧内のエスケープされた `>` を含む URL が正しく解決される
+        let base = "https://example.com/docs/";
+        let md = r"[link](<path\>file>)";
+        let result = resolve_markdown_urls(md, base);
+        assert!(result.contains("example.com"));
     }
 }

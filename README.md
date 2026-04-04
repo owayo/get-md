@@ -31,6 +31,7 @@
 - **Markdown Link Robustness** — supports resolving `<...>` style link destinations (including spaces) and ignores bare `](` text that is not real Markdown link syntax
 - **Literal Backtick Safety** — treats unmatched inline backticks as literal text, so later Markdown links are still resolved
 - **Angle Destination Parentheses Support** — does not treat `)` inside `<...>` link destinations as the closing delimiter
+- **Angle Bracket Escape Support** — correctly handles `\>` inside `<...>` link destinations instead of treating it as the closing `>`
 - **Escaped Parentheses Support** — correctly parses link destinations containing `\(` and `\)`
 - **Quote-safe URL Parsing** — preserves quotes/apostrophes in standard Markdown link destinations
 - **Escaped Whitespace Handling** — keeps `\ ` in standard link destinations from being split as title separators
@@ -38,7 +39,7 @@
 - **Escaped Pipe-safe Tables** — keeps escaped cell pipes (`\|`) intact during table compaction
 - **Progress Display** — shows operation progress with quiet mode option, and reports completion only after output succeeds
 - **File Status Icons** — shows ✨ (created), 📝 (updated), or ✔ (unchanged) for file output; git-aware change detection and fallback to `updated` when an existing file cannot be read
-- **Date-only Diff Ignore** — `--ignore-date` skips rewrites when only timestamp strings changed, including common ISO 8601 forms with fractional seconds and timezone suffixes
+- **Date-only Diff Ignore** — `--ignore-date` skips rewrites when only timestamp strings changed, including common ISO 8601 forms with fractional seconds and timezone suffixes; requires both old and new content to contain date patterns, and safely falls back for non-UTF-8 files
 - **Timeout Safety** — internal browser idle-timeout buffer uses saturating arithmetic to avoid overflow at extreme `--timeout` values
 
 ## Requirements
