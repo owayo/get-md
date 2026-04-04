@@ -2856,4 +2856,163 @@ code
         let result = resolve_markdown_urls(md, base);
         assert!(result.contains("example.com"));
     }
+
+    // --- テストカバレッジ補強 ---
+
+    #[test]
+    fn compact_markdown_crlf_normalized_to_lf() {
+        // CRLF 入力は LF に正規化される
+        let input = "| a  | b  |\r\n|---|---|\r\n| 1  | 2  |";
+        let result = compact_markdown(input);
+        assert!(!result.contains('\r'));
+        assert_eq!(result, "| a | b |\n| - | - |\n| 1 | 2 |");
+    }
+
+    #[test]
+    fn resolve_empty_link_text() {
+        // 空のリンクテキスト `[](url)` でも URL が解決される
+        let result = resolve_markdown_urls("[](./page)", BASE);
+        assert_eq!(result, "[](https://example.com/docs/en/page)");
+    }
+
+    #[test]
+    fn resolve_link_with_newline_between_links() {
+        // 改行を挟んだ複数リンクが両方とも解決される
+        let input = "[a](./x)\n\n[b](./y)";
+        let result = resolve_markdown_urls(input, BASE);
+        assert!(result.contains("example.com/docs/en/x"));
+        assert!(result.contains("example.com/docs/en/y"));
+    }
+
+    #[test]
+    fn is_date_only_change_identical_dates_different_text() {
+        // 日時は同じだが他のテキストが異なる場合は date-only change ではない
+        let old = b"Updated: 2025-01-01 12:00 - version A";
+        let new = b"Updated: 2025-01-01 12:00 - version B";
+        assert!(!is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn compact_markdown_only_table_rows() {
+        // テーブル行のみの入力でも正常に処理される
+        let input = "| a  | b  |\n| c  | d  |";
+        assert_eq!(compact_markdown(input), "| a | b |\n| c | d |");
+    }
+
+    #[test]
+    fn compact_markdown_empty_fenced_code_block() {
+        // 空のフェンスブロックの直後にテーブルがある場合
+        let input = "```\n```\n| a  | b  |";
+        assert_eq!(compact_markdown(input), "```\n```\n| a | b |");
+    }
+
+    #[test]
+    fn find_close_paren_deeply_nested_three_levels() {
+        // 3 段階ネストの括弧を正しく処理する（暗黙の開き括弧を含むため +1 レベル）
+        let s = "a(b(c)))";
+        assert_eq!(find_link_close_paren(s), Some(7));
+    }
+
+    #[test]
+    fn split_unescaped_table_cells_empty_input() {
+        // 空文字列の入力では空の 1 セルが返る
+        let cells = split_unescaped_table_cells("");
+        assert_eq!(cells, vec![""]);
+    }
+
+    #[test]
+    fn escape_js_string_with_form_feed_and_backspace() {
+        // フォームフィードとバックスペースはそのまま通過する
+        let result = escape_js_string("a\x08b\x0cc");
+        assert_eq!(result, "\"a\x08b\x0cc\"");
+    }
+
+    #[test]
+    fn resolve_link_with_only_whitespace_text() {
+        // 空白のみのリンクテキストでも URL が解決される
+        let result = resolve_markdown_urls("[ ](./page)", BASE);
+        assert_eq!(result, "[ ](https://example.com/docs/en/page)");
+    }
+
+    #[test]
+    fn compact_table_separator_right_align() {
+        // 右寄せセパレータの配置が保持される
+        let result = compact_table_row("|-------:|");
+        assert_eq!(result, "| -: |");
+    }
+
+    #[test]
+    fn fence_marker_four_backticks_with_lang() {
+        // 4 個以上のバッククォート + 言語指定
+        let (marker, len) = fence_marker("````rust").unwrap();
+        assert_eq!(marker, '`');
+        assert_eq!(len, 4);
+    }
+
+    #[test]
+    fn compact_adjacent_fenced_blocks_different_markers() {
+        // バッククォートとチルダの異なるフェンスブロックが隣接する場合
+        let input = "```\ncode1\n```\n~~~\ncode2\n~~~\n| a  | b  |";
+        let result = compact_markdown(input);
+        assert!(result.contains("code1"));
+        assert!(result.contains("code2"));
+        assert!(result.ends_with("| a | b |"));
+    }
+
+    #[test]
+    fn resolve_link_base_url_with_fragment() {
+        // ベース URL にフラグメントがある場合でも正しく解決される
+        let result = resolve_markdown_urls("[a](./page)", "https://example.com/docs/#section");
+        assert_eq!(result, "[a](https://example.com/docs/page)");
+    }
+
+    #[test]
+    fn split_link_destination_standard_url_with_paren() {
+        // 標準形式で URL に括弧を含まない場合のタイトル分割
+        let (url, title, angle) = split_link_destination("url \"title\"");
+        assert!(!angle);
+        assert_eq!(url, "url");
+        assert_eq!(title, " \"title\"");
+    }
+
+    #[test]
+    fn is_date_only_change_single_date_in_large_text() {
+        // 大きなテキスト中の一箇所だけ日時が変わった場合
+        let old = b"Header\nContent line 1\nDate: 2025-01-01 10:00\nContent line 2\nFooter";
+        let new = b"Header\nContent line 1\nDate: 2025-06-15 14:30\nContent line 2\nFooter";
+        assert!(is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn compact_table_row_unicode_alignment_markers() {
+        // Unicode を含むセパレータ行は通常のセパレータとして処理される
+        let result = compact_table_row("|:---:|:---:|");
+        assert_eq!(result, "| :-: | :-: |");
+    }
+
+    #[test]
+    fn find_next_link_candidate_skips_nested_fenced_code() {
+        // 4 つのバッククォートで開いたフェンスは 3 つでは閉じない
+        let md = "````\n[a](./b)\n```\n[c](./d)\n````\n[e](./f)";
+        let candidate = find_next_link_candidate(md, 0);
+        // フェンス内の `](` は無視され、フェンス外の `](` が見つかる
+        assert!(candidate.is_some());
+        let pos = candidate.unwrap();
+        let after = &md[pos..];
+        assert!(after.starts_with("](./f)"));
+    }
+
+    #[test]
+    fn has_opening_link_bracket_with_image_prefix() {
+        // `![` も正しく検出される（`[` を見つければ十分）
+        let md = "![alt](url)";
+        // `]` は index 5
+        assert!(has_opening_link_bracket(md, 5));
+    }
+
+    #[test]
+    fn idle_browser_timeout_typical_value() {
+        // 一般的な 60 秒タイムアウトのバッファ確認
+        assert_eq!(idle_browser_timeout(60), Duration::from_secs(90));
+    }
 }
