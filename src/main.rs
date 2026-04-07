@@ -3251,4 +3251,167 @@ code
         let md = "``日本語のコード``";
         assert!(has_matching_inline_code_closer(md, 2, 2));
     }
+
+    // --- resolve_markdown_urls: base.join() Err 分岐 ---
+
+    #[test]
+    fn resolve_angle_bracket_url_join_resolves_colon_path() {
+        // コロンを含むパスは base.join() が成功し、絶対 URL に解決される
+        let md = "[link](<:invalid:url>)";
+        let result = resolve_markdown_urls(md, BASE);
+        assert_eq!(result, "[link](<https://example.com/docs/en/:invalid:url>)");
+    }
+
+    #[test]
+    fn resolve_standard_url_join_resolves_colon_path() {
+        // コロンを含むパスは base.join() が成功し、絶対 URL に解決される
+        let md = "[link](:invalid:url)";
+        let result = resolve_markdown_urls(md, BASE);
+        assert_eq!(result, "[link](https://example.com/docs/en/:invalid:url)");
+    }
+
+    // --- find_link_close_paren: タイトル内のエスケープ済み引用符 ---
+
+    #[test]
+    fn find_close_paren_escaped_quote_in_title() {
+        // タイトル内のエスケープされた引用符はタイトル終端とみなさない
+        let input = r#"url "title with \" inside")"#;
+        let result = find_link_close_paren(input);
+        assert_eq!(result, Some(input.len() - 1));
+    }
+
+    #[test]
+    fn find_close_paren_escaped_single_quote_in_title() {
+        // シングルクォートのタイトル内でもエスケープが有効
+        let input = r"url 'title with \' inside')";
+        let result = find_link_close_paren(input);
+        assert_eq!(result, Some(input.len() - 1));
+    }
+
+    // --- find_link_close_paren: 未閉鎖のタイトル引用符 ---
+
+    #[test]
+    fn find_close_paren_unclosed_title_quote_returns_none() {
+        // タイトルの引用符が閉じられない → 閉じ括弧が見つからず None
+        let result = find_link_close_paren(r#"url "unclosed title)"#);
+        assert_eq!(result, None);
+    }
+
+    // --- find_link_close_paren: depth > 1 では引用符をタイトルとして扱わない ---
+
+    #[test]
+    fn find_close_paren_quote_at_depth_two_not_title() {
+        // ネストした括弧内の引用符はタイトル開始として扱わない
+        let input = r#"(a "b") "title")"#;
+        let result = find_link_close_paren(input);
+        // (a "b") で depth が 1 に戻り、その後 "title" がタイトルとして扱われ、
+        // 最後の ) で depth 0 → Some
+        assert_eq!(result, Some(input.len() - 1));
+    }
+
+    // --- compact_markdown: CRLF を含むフェンスブロック ---
+
+    #[test]
+    fn compact_fenced_code_block_with_crlf() {
+        // フェンスブロック内の CRLF 行は変換せず保持
+        let input = "```\r\n| a | b |\r\n```\r\n| c  | d  |";
+        let result = compact_markdown(input);
+        assert!(result.contains("| a | b |")); // フェンス内は圧縮しない
+        assert!(result.contains("|c|d|") || result.contains("| c | d |"));
+    }
+
+    // --- compact_table_row: コロンのみのセパレータセル ---
+
+    #[test]
+    fn compact_table_separator_colon_only() {
+        // コロンのみのセル（ダッシュなし）もセパレータとして扱われる
+        // `:` → starts_with(':') かつ ends_with(':') なので `:-:`
+        assert_eq!(compact_table_row("| : | :: |"), "| :-: | :-: |");
+    }
+
+    // --- split_link_destination: 山括弧内の末尾バックスラッシュ ---
+
+    #[test]
+    fn split_link_destination_angle_bracket_trailing_backslash() {
+        // 山括弧が閉じず末尾がバックスラッシュ → 標準形式にフォールバック
+        let (url, title, angle) = split_link_destination(r"<path\\");
+        assert!(!angle);
+        assert_eq!(url, r"<path\\");
+        assert_eq!(title, "");
+    }
+
+    // --- find_next_link_candidate: 行途中からの開始でフェンスマーカーをスキップ ---
+
+    #[test]
+    fn link_candidate_mid_line_start_treats_backticks_as_inline_code() {
+        // 行の途中から開始した場合、``` はフェンスではなくインラインコードとして扱われる。
+        // インラインコードが [link](url) を包含するため、リンクは検出されない。
+        let md = "text ```\n[link](url)\n```";
+        let result = find_next_link_candidate(md, 5);
+        assert!(result.is_none());
+    }
+
+    // --- find_next_link_candidate: 未閉鎖の長いバッククォート列 ---
+
+    #[test]
+    fn link_candidate_unclosed_double_backtick_is_literal() {
+        // 閉じられないダブルバッククォートはリテラルとして扱い、リンクを検出
+        let md = "``unclosed [link](url)";
+        let result = find_next_link_candidate(md, 0);
+        assert!(result.is_some());
+    }
+
+    // --- resolve_markdown_urls: 山括弧内が空白のみの URL ---
+
+    #[test]
+    fn resolve_angle_bracket_whitespace_only_url() {
+        // 山括弧内が空白のみの URL
+        let md = "[link](<  >)";
+        let result = resolve_markdown_urls(md, BASE);
+        // 空白のみの URL は base.join が処理し、ベース URL 自体に解決される
+        assert!(result.starts_with("[link](<"));
+        assert!(result.ends_with(">)"));
+    }
+
+    // --- find_link_close_paren: エスケープ済み `(` と通常の `()` の混在 ---
+
+    #[test]
+    fn find_close_paren_escaped_open_with_nested_parens() {
+        // エスケープされた `\(` は depth を増やさず、通常の `()` は正しくネスト
+        let input = r"a\((b))";
+        let result = find_link_close_paren(input);
+        // \( はスキップ、(b) で depth 2→1、最後の ) で depth 1→0
+        assert_eq!(result, Some(input.len() - 1));
+    }
+
+    // --- compact_markdown: 先頭に空白があるテーブル行 ---
+
+    #[test]
+    fn compact_table_row_with_leading_whitespace() {
+        // 先頭に空白があるテーブル行は trim 後にパイプ判定される
+        let input = "  | col1  | col2  |";
+        let result = compact_markdown(input);
+        // trim() で先頭空白が除去され、テーブル行として圧縮される
+        assert_eq!(result, "| col1 | col2 |");
+    }
+
+    // --- is_date_only_change: 日時除去後に空白パターンが異なる ---
+
+    #[test]
+    fn date_only_change_whitespace_diff_after_strip_returns_false() {
+        // 日時を除去した後の空白パターンが異なる → date-only ではない
+        let old = b"A 2024-01-01 B";
+        let new = b"A  2024-02-02 B";
+        assert!(!is_date_only_change(old, new));
+    }
+
+    // --- find_link_close_paren: 山括弧内のエスケープ済み `>` ---
+
+    #[test]
+    fn find_close_paren_escaped_gt_then_real_gt_in_angle_dest() {
+        // 山括弧内で \> はスキップし、次の > で山括弧を閉じる
+        let input = r"<path\>file> rest)";
+        let result = find_link_close_paren(input);
+        assert_eq!(result, Some(input.len() - 1));
+    }
 }
