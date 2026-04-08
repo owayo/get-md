@@ -3414,4 +3414,302 @@ code
         let result = find_link_close_paren(input);
         assert_eq!(result, Some(input.len() - 1));
     }
+
+    // --- compact_table_row: 追加エッジケース ---
+
+    #[test]
+    fn compact_table_row_separator_no_dashes_only_colons() {
+        // コロンのみ（::）は先頭・末尾ともにコロン → 中央揃え扱い
+        assert_eq!(compact_table_row("|::|"), "| :-: |");
+    }
+
+    #[test]
+    fn compact_table_row_wide_padding_cells() {
+        // 大量の余白がある行を圧縮
+        assert_eq!(compact_table_row("|   foo   |   bar   |"), "| foo | bar |");
+    }
+
+    #[test]
+    fn compact_table_row_escaped_pipe_in_content() {
+        // エスケープ済みパイプはセル区切りとして扱わない
+        assert_eq!(compact_table_row(r"| a\|b | c |"), r"| a\|b | c |");
+    }
+
+    // --- idle_browser_timeout: 追加エッジケース ---
+
+    #[test]
+    fn idle_browser_timeout_large_value() {
+        // 大きいが溢れない値
+        let d = idle_browser_timeout(1000);
+        assert_eq!(d, Duration::from_secs(1030));
+    }
+
+    #[test]
+    fn idle_browser_timeout_max_minus_30() {
+        // u64::MAX - 30 は加算後にちょうど u64::MAX
+        let d = idle_browser_timeout(u64::MAX - 30);
+        assert_eq!(d, Duration::from_secs(u64::MAX));
+    }
+
+    // --- file_status: 追加エッジケース ---
+
+    #[test]
+    fn file_status_old_equals_new_no_git() {
+        // 既存内容と新内容が同一で git 管理外の場合は unchanged
+        let dir = std::env::temp_dir().join("get_md_test_fs_eq");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("same.txt");
+        let content = b"identical content";
+        std::fs::write(&path, content).unwrap();
+        let old = Some(content.to_vec());
+        let (icon, status) = file_status(&path, &old, content);
+        // git 管理外なので has_unstaged_changes は false → unchanged
+        assert_eq!(icon, "✔");
+        assert_eq!(status, "unchanged");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_status_old_differs_from_new() {
+        // 既存内容と新内容が異なれば updated
+        let path = Path::new("/tmp/get_md_test_diff.txt");
+        let old = Some(b"old".to_vec());
+        let (icon, status) = file_status(path, &old, b"new");
+        assert_eq!(icon, "📝");
+        assert_eq!(status, "updated");
+    }
+
+    // --- escape_js_string: 追加エッジケース ---
+
+    #[test]
+    fn escape_js_string_tab_preserved() {
+        // タブ文字はそのまま通過する（CSS セレクタには通常含まれないが安全）
+        assert_eq!(escape_js_string("\t"), "\"\t\"");
+    }
+
+    #[test]
+    fn escape_js_string_mixed_newlines() {
+        // \r\n の各文字が個別にエスケープされる
+        assert_eq!(escape_js_string("a\r\nb"), r#""a\r\nb""#);
+    }
+
+    #[test]
+    fn escape_js_string_backslash_before_quote() {
+        // バックスラッシュとクォートの連続が正しくエスケープされる
+        assert_eq!(escape_js_string(r#"a\"b"#), r#""a\\\"b""#);
+    }
+
+    // --- compact_markdown: 追加エッジケース ---
+
+    #[test]
+    fn compact_markdown_indented_table_between_text() {
+        // テキストの間にあるインデントなしテーブルが圧縮される
+        let input = "text\n|  a  |  b  |\n| --- | --- |\n|  1  |  2  |\nmore text";
+        let expected = "text\n| a | b |\n| - | - |\n| 1 | 2 |\nmore text";
+        assert_eq!(compact_markdown(input), expected);
+    }
+
+    #[test]
+    fn compact_markdown_empty_fence_tilde() {
+        // チルダの空フェンスブロック内のテーブル行は変更しない
+        let input = "~~~\n|  padded  |\n~~~";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    #[test]
+    fn compact_markdown_nested_fence_same_char() {
+        // 外側のフェンスが長い場合、短いフェンスマーカーは閉じとして扱わない
+        let input = "````\n```\n|  x  |\n```\n````";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    // --- resolve_markdown_urls: 追加エッジケース ---
+
+    #[test]
+    fn resolve_url_with_double_encoded_space() {
+        // %20 を含むURLがそのまま解決される
+        let md = "[link](path%20with%20space)";
+        let result = resolve_markdown_urls(md, "https://example.com/");
+        assert_eq!(result, "[link](https://example.com/path%20with%20space)");
+    }
+
+    #[test]
+    fn resolve_url_with_consecutive_dots() {
+        // ../../ のような多段の相対パス
+        let md = "[link](../../page)";
+        let result = resolve_markdown_urls(md, "https://example.com/a/b/c/");
+        assert_eq!(result, "[link](https://example.com/a/page)");
+    }
+
+    #[test]
+    fn resolve_url_preserves_trailing_slash() {
+        // 末尾スラッシュが保持される
+        let md = "[link](dir/)";
+        let result = resolve_markdown_urls(md, "https://example.com/");
+        assert_eq!(result, "[link](https://example.com/dir/)");
+    }
+
+    #[test]
+    fn resolve_angle_bracket_url_with_multiple_escaped_gt() {
+        // 山括弧内に複数のエスケープ済み > がある場合、URL 解決後も山括弧で囲まれる
+        let md = r"[link](<a\>b\>c>)";
+        let result = resolve_markdown_urls(md, "https://example.com/");
+        assert!(result.contains("example.com/a/%3Eb/%3Ec"));
+    }
+
+    #[test]
+    fn resolve_empty_base_url_returns_unchanged() {
+        // 空のベースURLではパースエラーとなり変換なし
+        let md = "[link](./page)";
+        assert_eq!(resolve_markdown_urls(md, ""), md);
+    }
+
+    // --- find_next_link_candidate: 追加エッジケース ---
+
+    #[test]
+    fn link_candidate_multiple_links_finds_first() {
+        // 複数リンクがある場合、最初のものを返す
+        let md = "[a](url1) [b](url2)";
+        let pos = find_next_link_candidate(md, 0);
+        assert_eq!(pos, Some(2)); // 最初の ](
+    }
+
+    #[test]
+    fn link_candidate_after_first_link() {
+        // 最初のリンクを飛ばして2番目のリンクを検出
+        let md = "[a](url1) [b](url2)";
+        let pos = find_next_link_candidate(md, 3);
+        assert_eq!(pos, Some(12)); // 2番目の ](
+    }
+
+    #[test]
+    fn link_candidate_fence_at_end_of_input() {
+        // 入力末尾のフェンスブロック（改行なし）
+        let md = "text\n```\ncode";
+        let pos = find_next_link_candidate(md, 0);
+        assert_eq!(pos, None);
+    }
+
+    // --- has_matching_inline_code_closer: 追加エッジケース ---
+
+    #[test]
+    fn inline_code_closer_adjacent_different_lengths() {
+        // 異なる長さのバッククォート列が隣接している場合
+        let md = "``x```"; // `` の閉じは見つからない（``` は長さ3で不一致）
+        assert!(!has_matching_inline_code_closer(md, 2, 2));
+    }
+
+    #[test]
+    fn inline_code_closer_separated_by_multibyte() {
+        // マルチバイト文字を挟んだバッククォート閉じ
+        let md = "あ`";
+        assert!(has_matching_inline_code_closer(md, 0, 1));
+    }
+
+    // --- split_link_destination: 追加エッジケース ---
+
+    #[test]
+    fn split_link_destination_standard_with_multiple_spaces() {
+        // 最初のエスケープされていない空白でタイトルと分離
+        let (url, title, angle) = split_link_destination("url first second");
+        assert_eq!(url, "url");
+        assert_eq!(title, " first second");
+        assert!(!angle);
+    }
+
+    #[test]
+    fn split_link_destination_angle_bracket_with_backslash_at_end() {
+        // `\>` はエスケープ済み → 閉じ山括弧が見つからず標準形式にフォールバック
+        let (url, title, angle) = split_link_destination(r"<url\>");
+        assert_eq!(url, r"<url\>");
+        assert_eq!(title, "");
+        assert!(!angle);
+    }
+
+    // --- is_escaped_markdown_char: 追加エッジケース ---
+
+    #[test]
+    fn escaped_char_idx_zero() {
+        // 先頭位置はエスケープされない
+        assert!(!is_escaped_markdown_char("[link", 0));
+    }
+
+    #[test]
+    fn escaped_char_five_backslashes() {
+        // 奇数個（5個）のバックスラッシュ → エスケープ
+        assert!(is_escaped_markdown_char(r"\\\\\[", 5));
+    }
+
+    // --- has_opening_link_bracket: 追加エッジケース ---
+
+    #[test]
+    fn opening_bracket_with_single_char_text() {
+        // 1文字のリンクテキスト
+        assert!(has_opening_link_bracket("[a](url)", 2));
+    }
+
+    #[test]
+    fn opening_bracket_multiple_nested_closing() {
+        // 複数のネストした閉じ括弧（] の位置は 9）
+        assert!(has_opening_link_bracket("[a[b]c[d]](url)", 9));
+    }
+
+    // --- find_link_close_paren: 追加エッジケース ---
+
+    #[test]
+    fn find_close_paren_title_with_escaped_quote_then_close() {
+        // タイトル内にエスケープされた引用符があり、その後に閉じ括弧
+        let input = r#"url "title with \" inside")"#;
+        assert_eq!(find_link_close_paren(input), Some(input.len() - 1));
+    }
+
+    #[test]
+    fn find_close_paren_deeply_nested_four_levels() {
+        // 暗黙の開き括弧 + 3段ネスト → 閉じ4個で depth=0
+        let input = "a(b(c(d))))";
+        assert_eq!(find_link_close_paren(input), Some(input.len() - 1));
+    }
+
+    #[test]
+    fn find_close_paren_angle_dest_with_paren_inside() {
+        // 山括弧内の括弧は無視される
+        let input = "<url(with)paren> \"title\")";
+        assert_eq!(find_link_close_paren(input), Some(input.len() - 1));
+    }
+
+    // --- strip_dates: 追加エッジケース ---
+
+    #[test]
+    fn strip_dates_only_date_becomes_empty() {
+        // 日付だけの文字列は空になる
+        assert_eq!(strip_dates("2024-01-01"), "");
+    }
+
+    #[test]
+    fn strip_dates_iso8601_with_comma_and_offset() {
+        // カンマ区切りの小数秒とオフセット
+        assert_eq!(
+            strip_dates("prefix 2024-01-01T12:00:00,123+09:00 suffix"),
+            "prefix  suffix"
+        );
+    }
+
+    // --- fence_marker: 追加エッジケース ---
+
+    #[test]
+    fn fence_marker_exactly_three_tildes() {
+        assert_eq!(fence_marker("~~~"), Some(('~', 3)));
+    }
+
+    #[test]
+    fn fence_marker_backtick_with_spaces_after_info() {
+        // 情報文字列の後にスペースがある場合
+        assert_eq!(fence_marker("``` rust "), Some(('`', 3)));
+    }
+
+    #[test]
+    fn fence_marker_leading_non_marker_char() {
+        // 先頭がマーカー文字でない場合
+        assert_eq!(fence_marker("a```"), None);
+    }
 }
