@@ -110,6 +110,22 @@ fn main() -> Result<()> {
     }
     progress.finish("Page loaded");
 
+    // HTTP ステータスコードを確認する（200 番台以外はエラー）
+    let status_code: u16 = tab
+        .evaluate(
+            "performance.getEntriesByType('navigation')[0]?.responseStatus ?? 0",
+            false,
+        )
+        .ok()
+        .and_then(|r| r.value)
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u16)
+        .unwrap_or(0);
+
+    if status_code >= 400 {
+        bail!("HTTP {} — page not saved: {}", status_code, cli.url);
+    }
+
     // セレクタに一致した要素の HTML を抽出する
     progress.spinner("Extracting HTML elements...");
     let mut html_fragments = Vec::new();
