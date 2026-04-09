@@ -3743,4 +3743,99 @@ code
         // 先頭がマーカー文字でない場合
         assert_eq!(fence_marker("a```"), None);
     }
+
+    // --- file_status: 実フロー再現テスト ---
+
+    #[test]
+    fn file_status_new_file_after_creation() {
+        // バグ再現: File::create でファイルを作成した後でも
+        // file_existed_before=false なら "created" を返すこと
+        let dir = std::env::temp_dir().join(format!(
+            "get-md-fs-new-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("brand_new.md");
+
+        // ファイルは存在しない → file_existed_before=false
+        assert!(!path.exists());
+        let content = b"new content";
+
+        // File::create でファイルを作成する（実プログラムと同じ流れ）
+        std::fs::write(&path, content).unwrap();
+        assert!(path.exists()); // 作成後はファイルが存在する
+
+        // file_existed_before=false で呼べば "created" になること
+        let (icon, status) = file_status(&path, false, &None, content);
+        assert_eq!(icon, "✨");
+        assert_eq!(status, "created");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_status_overwrite_existing_file() {
+        // 既存ファイルを上書きした場合は "updated" を返すこと
+        let dir = std::env::temp_dir().join(format!(
+            "get-md-fs-overwrite-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("existing.md");
+
+        let old = b"old content";
+        std::fs::write(&path, old).unwrap();
+
+        let new = b"new content";
+        std::fs::write(&path, new).unwrap();
+
+        let (icon, status) = file_status(&path, true, &Some(old.to_vec()), new);
+        assert_eq!(icon, "📝");
+        assert_eq!(status, "updated");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- strip_dates: 境界パターンテスト ---
+
+    #[test]
+    fn strip_dates_invalid_month_day_still_matches() {
+        // 正規表現は値の妥当性を検証しない（意図的な仕様）
+        assert_eq!(strip_dates("2024-99-99"), "");
+    }
+
+    #[test]
+    fn strip_dates_adjacent_digits_boundary() {
+        // 日付パターンの前後に数字がある場合、正規表現のバウンダリ動作を確認
+        let result = strip_dates("id12024-01-01234");
+        // \d{4} が "2024" にマッチし、残りは "id1" + "234"
+        assert_eq!(result, "id1234");
+    }
+
+    // --- find_link_close_paren: 深いネスト + 引用符 ---
+
+    #[test]
+    fn find_close_paren_depth_three_with_quotes() {
+        // depth=3 で引用符が出現してもタイトルとして扱わない
+        // ]( → depth=1, '(' → 2, '(' → 3, '"..."' はタイトルではない, ')' → 2, ')' → 1, ')' → 0
+        let input = r#"a(b("not-title")c))"#;
+        assert_eq!(find_link_close_paren(input), Some(input.len() - 1));
+    }
+
+    #[test]
+    fn find_close_paren_depth_two_quote_with_close_paren_inside() {
+        // depth=2 では引用符はタイトルにならないため、中の ')' は通常のネスト閉じ
+        let input = r#"a("b)c)"#;
+        // depth=1: 'a', '(' → depth=2, '"' は depth>1 でタイトルにならない,
+        // 'b', ')' → depth=1, 'c', ')' → depth=0
+        assert_eq!(find_link_close_paren(input), Some(input.len() - 1));
+    }
 }
