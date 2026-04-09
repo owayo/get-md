@@ -195,6 +195,9 @@ fn main() -> Result<()> {
 
     // 出力
     let old_content = cli.output.as_ref().and_then(|p| std::fs::read(p).ok());
+    // File::create 前にファイルの存在を記録する（作成後は常に exists() が true になるため）
+    let file_existed_before =
+        old_content.is_some() || cli.output.as_ref().is_some_and(|p| p.exists());
 
     // --ignore-date: 日時だけの差分なら書き込みをスキップ
     let date_only_change = cli.ignore_date
@@ -237,7 +240,12 @@ fn main() -> Result<()> {
         // 出力成功後にのみ URL 付きの完了表示を行う
         match &cli.output {
             Some(path) => {
-                let (icon, status) = file_status(path, &old_content, output_bytes.as_bytes());
+                let (icon, status) = file_status(
+                    path,
+                    file_existed_before,
+                    &old_content,
+                    output_bytes.as_bytes(),
+                );
                 progress.complete(
                     icon,
                     &format!("{} → {} ({})", cli.url, path.display(), status),
@@ -252,12 +260,18 @@ fn main() -> Result<()> {
 
 /// ファイル出力のステータスを判定する。
 ///
+/// `file_existed_before` は File::create 前に記録したファイルの存在状態。
 /// git 管理下のファイルで未ステージの変更があれば常に updated 扱い。
 /// それ以外は書き込み前後の内容比較で判定する。
-fn file_status<'a>(path: &Path, old_content: &Option<Vec<u8>>, new: &[u8]) -> (&'a str, &'a str) {
+fn file_status<'a>(
+    path: &Path,
+    file_existed_before: bool,
+    old_content: &Option<Vec<u8>>,
+    new: &[u8],
+) -> (&'a str, &'a str) {
     match old_content {
         // 既存ファイルの読み取りに失敗した場合は新規作成ではないため updated 扱いにする。
-        None if path.exists() => ("📝", "updated"),
+        None if file_existed_before => ("📝", "updated"),
         None => ("✨", "created"),
         Some(old) => {
             let changed = if old != new {
@@ -1490,7 +1504,7 @@ more code
 
     #[test]
     fn file_status_new_file() {
-        let (icon, status) = file_status(Path::new("dummy"), &None, b"content");
+        let (icon, status) = file_status(Path::new("dummy"), false, &None, b"content");
         assert_eq!(icon, "✨");
         assert_eq!(status, "created");
     }
@@ -1498,7 +1512,7 @@ more code
     #[test]
     fn file_status_content_changed() {
         let old = Some(b"old content".to_vec());
-        let (icon, status) = file_status(Path::new("dummy"), &old, b"new content");
+        let (icon, status) = file_status(Path::new("dummy"), true, &old, b"new content");
         assert_eq!(icon, "📝");
         assert_eq!(status, "updated");
     }
@@ -1508,7 +1522,7 @@ more code
         // 存在しないパスなので git diff は空を返す → unchanged
         let content = b"same content";
         let old = Some(content.to_vec());
-        let (icon, status) = file_status(Path::new("/nonexistent/path"), &old, content);
+        let (icon, status) = file_status(Path::new("/nonexistent/path"), true, &old, content);
         assert_eq!(icon, "✔");
         assert_eq!(status, "unchanged");
     }
@@ -1528,7 +1542,7 @@ more code
         let path = dir.join("existing.md");
         std::fs::write(&path, b"old").expect("failed to write fixture file");
 
-        let (icon, status) = file_status(path.as_path(), &None, b"new");
+        let (icon, status) = file_status(path.as_path(), true, &None, b"new");
         assert_eq!(icon, "📝");
         assert_eq!(status, "updated");
 
@@ -1839,6 +1853,7 @@ code
         let old = Some(content.to_vec());
         let (icon, status) = file_status(
             Path::new("/tmp/nonexistent_dir_12345/file.txt"),
+            true,
             &old,
             content,
         );
@@ -3478,7 +3493,7 @@ code
         let content = b"identical content";
         std::fs::write(&path, content).unwrap();
         let old = Some(content.to_vec());
-        let (icon, status) = file_status(&path, &old, content);
+        let (icon, status) = file_status(&path, true, &old, content);
         // git 管理外なので has_unstaged_changes は false → unchanged
         assert_eq!(icon, "✔");
         assert_eq!(status, "unchanged");
@@ -3490,7 +3505,7 @@ code
         // 既存内容と新内容が異なれば updated
         let path = Path::new("/tmp/get_md_test_diff.txt");
         let old = Some(b"old".to_vec());
-        let (icon, status) = file_status(path, &old, b"new");
+        let (icon, status) = file_status(path, true, &old, b"new");
         assert_eq!(icon, "📝");
         assert_eq!(status, "updated");
     }
