@@ -9,41 +9,41 @@ INSTALL_PATH := /usr/local/bin
 
 ## ビルドコマンド
 
-build: ## Build debug version
+build: ## デバッグビルドを実行
 	cargo build
 
-release: ## Build release version
+release: ## リリースビルドを実行
 	cargo build --release
 
 ## インストール
 
-install: release ## Build release and install to /usr/local/bin
+install: release ## リリースビルドして /usr/local/bin に配置
 	cp target/release/$(BINARY_NAME) $(INSTALL_PATH)/
 
 ## 開発
 
-test: ## Run tests
+test: ## テストを実行
 	cargo test
 
-fmt: ## Format code
+fmt: ## コードを整形
 	cargo fmt
 
-check: ## Run clippy and check
+check: ## Clippy と cargo check を実行
 	cargo clippy -- -D warnings
 	cargo check
 
-clean: ## Clean build artifacts
+clean: ## ビルド成果物を削除
 	cargo clean
 
 ## ヘルプ
 
-help: ## Show this help message
-	@echo "$(BINARY_NAME) Build Commands"
+help: ## このヘルプを表示
+	@echo "$(BINARY_NAME) ビルドコマンド"
 	@echo ""
-	@echo "Usage: make [target]"
+	@echo "使い方: make [target]"
 	@echo ""
-	@echo "Targets:"
+	@echo "ターゲット:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 	@echo ""
-	@echo "Release:"
-	@echo "  Use GitHub Actions > Release > Run workflow"
+	@echo "リリース:"
+	@echo "  GitHub Actions > Release > Run workflow を使用"

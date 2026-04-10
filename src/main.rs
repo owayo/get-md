@@ -110,7 +110,7 @@ fn main() -> Result<()> {
     }
     progress.finish("Page loaded");
 
-    // HTTP ステータスコードを確認する（200 番台以外はエラー）
+    // HTTP ステータスコードを確認する（400 以上はエラー）
     let status_code: u16 = tab
         .evaluate(
             "performance.getEntriesByType('navigation')[0]?.responseStatus ?? 0",
@@ -269,32 +269,44 @@ fn file_status<'a>(
     old_content: &Option<Vec<u8>>,
     new: &[u8],
 ) -> (&'a str, &'a str) {
+    if has_unstaged_changes(path) {
+        return ("📝", "updated");
+    }
+
     match old_content {
         // 既存ファイルの読み取りに失敗した場合は新規作成ではないため updated 扱いにする。
         None if file_existed_before => ("📝", "updated"),
         None => ("✨", "created"),
-        Some(old) => {
-            let changed = if old != new {
-                true
-            } else {
-                has_unstaged_changes(path)
-            };
-            if changed {
-                ("📝", "updated")
-            } else {
-                ("✔", "unchanged")
-            }
-        }
+        Some(old) if old != new => ("📝", "updated"),
+        Some(_) => ("✔", "unchanged"),
     }
 }
 
 /// git diff でファイルに未ステージの変更があるかを調べる
 fn has_unstaged_changes(path: &Path) -> bool {
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(dir) => dir.join(path),
+            Err(_) => return false,
+        }
+    };
+
+    // 対象パスに最も近い既存ディレクトリを起点に git を実行し、
+    // 削除済みの tracked ファイルや repo 外 cwd でも正しく判定する。
+    let git_dir = absolute_path
+        .ancestors()
+        .find(|ancestor| ancestor.is_dir())
+        .unwrap_or_else(|| Path::new("."));
+
     Command::new("git")
+        .arg("-C")
+        .arg(git_dir)
         .args(["diff", "--name-only", "--"])
-        .arg(path)
+        .arg(&absolute_path)
         .output()
-        .map(|o| !o.stdout.is_empty())
+        .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false)
 }
 
@@ -763,6 +775,32 @@ fn find_link_close_paren(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("failed to get current time")
+                .as_nanos()
+        ))
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("failed to execute git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 
     #[test]
     fn escape_simple_selector() {
@@ -1529,15 +1567,7 @@ more code
 
     #[test]
     fn file_status_existing_file_without_old_content_is_updated() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("failed to get current time")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "get-md-status-test-{}-{}",
-            std::process::id(),
-            unique
-        ));
+        let dir = make_temp_dir("get-md-status-test");
         std::fs::create_dir_all(&dir).expect("failed to create temp dir");
         let path = dir.join("existing.md");
         std::fs::write(&path, b"old").expect("failed to write fixture file");
@@ -1547,6 +1577,52 @@ more code
         assert_eq!(status, "updated");
 
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn has_unstaged_changes_detects_tracked_file_from_target_repo() {
+        let dir = make_temp_dir("get-md-git-status");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("tracked.md");
+
+        git(&dir, &["init"]);
+        git(&dir, &["config", "user.name", "Test User"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+
+        std::fs::write(&path, b"old").expect("failed to write tracked file");
+        git(&dir, &["add", "tracked.md"]);
+        git(&dir, &["commit", "-m", "init"]);
+
+        std::fs::write(&path, b"new").expect("failed to update tracked file");
+
+        assert!(has_unstaged_changes(&path));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_status_deleted_tracked_file_is_updated() {
+        let dir = make_temp_dir("get-md-deleted-status");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("tracked.md");
+
+        git(&dir, &["init"]);
+        git(&dir, &["config", "user.name", "Test User"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+
+        std::fs::write(&path, b"old").expect("failed to write tracked file");
+        git(&dir, &["add", "tracked.md"]);
+        git(&dir, &["commit", "-m", "init"]);
+
+        std::fs::remove_file(&path).expect("failed to delete tracked file");
+
+        assert!(has_unstaged_changes(&path));
+        let (icon, status) = file_status(&path, false, &None, b"new");
+        assert_eq!(icon, "📝");
+        assert_eq!(status, "updated");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

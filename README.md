@@ -38,7 +38,7 @@
 - **Table Compaction** — removes unnecessary padding in Markdown tables while preserving fenced code blocks
 - **Escaped Pipe-safe Tables** — keeps escaped cell pipes (`\|`) intact during table compaction
 - **Progress Display** — shows operation progress with quiet mode option, and reports completion only after output succeeds
-- **File Status Icons** — shows ✨ (created), 📝 (updated), or ✔ (unchanged) for file output; git-aware change detection and fallback to `updated` when an existing file cannot be read
+- **File Status Icons** — shows ✨ (created), 📝 (updated), or ✔ (unchanged) for file output; git-aware change detection is anchored to the target path so deleted tracked files and runs from outside the repo still resolve to `updated`, and existing unreadable files also fall back to `updated`
 - **Date-only Diff Ignore** — `--ignore-date` skips rewrites when only timestamp strings changed, including common ISO 8601 forms with fractional seconds and timezone suffixes; requires both old and new content to contain date patterns, and safely falls back for non-UTF-8 files
 - **Timeout Safety** — internal browser idle-timeout buffer uses saturating arithmetic to avoid overflow at extreme `--timeout` values
 

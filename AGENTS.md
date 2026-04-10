@@ -61,7 +61,7 @@ make install  # /usr/local/bin にインストール
 - 複数セレクタ指定時は `---` で区切って結合
 - ファイル出力時は末尾改行を保証
 - 完了表示は出力書き込み成功後にのみ表示する（✨ created / 📝 updated / ✔ unchanged）
-- ファイルステータス判定: 新規→created、内容変更→updated、同一内容→unchanged。git管理下で未ステージ変更がある場合は常にupdated。既存ファイルの読み取りに失敗した場合はupdated。ファイルの存在状態は `File::create` 前に記録し、書き込み後の `path.exists()` に依存しない
+- ファイルステータス判定: 新規→created、内容変更→updated、同一内容→unchanged。git管理下で未ステージ変更がある場合は常にupdated。既存ファイルの読み取りに失敗した場合はupdated。ファイルの存在状態は `File::create` 前に記録し、書き込み後の `path.exists()` に依存しない。git 判定は対象パスに最も近い既存ディレクトリを起点に行い、削除済みの tracked ファイルや repo 外 cwd からの実行でも契約を守る
 - `--ignore-date`: 日時パターン（`YYYY-MM-DD HH:MM(:SS)?`、スラッシュ区切り、`Z`・小数秒・タイムゾーン付き ISO 8601）を無視してファイル比較し、日時だけの差分なら上書きせず unchanged 扱いにする。双方に日時パターンを含む場合のみ比較し、非 UTF-8 や日時パターンを含まない場合は安全のため通常比較にフォールバックする。git 管理下の未ステージ変更がある場合は `file_status` と同じ契約で updated 扱い
 - `idle_browser_timeout` は `timeout + 30s` のバッファを saturating 加算で設定する
 - バージョニングは CalVer (YY.M.counter) 形式
