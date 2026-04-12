@@ -21,6 +21,7 @@
 
 - **JS Rendering Support** — uses system Chrome via CDP, handles SPAs and dynamic content
 - **CSS Selector Targeting** — extract only the elements you need (multiple selectors supported)
+- **Ordered Multi-selector Merge** — when multiple selectors are specified, the extracted fragments are joined with `---` in the same order
 - **No WebDriver Required** — directly controls your installed Chrome/Chromium
 - **Flexible Output** — write to file or stdout
 - **Auto Chrome Detection** — finds Chrome automatically, or specify a custom path
@@ -160,6 +161,23 @@ make install
 # Clean build artifacts
 make clean
 ```
+
+## Testing
+
+```bash
+# Run unit tests and build ignored E2E targets
+make test
+
+# Run Chrome-dependent E2E tests
+cargo test --test e2e -- --ignored
+```
+
+Ignored E2E tests cover:
+
+- Fetching a real GitHub raw document
+- Resolving relative links and images from a local `file://` page
+- Joining multiple selectors with the documented `---` separator
+- Skipping rewrites for `--ignore-date` when only timestamp text changes
 
 ## Contributing
 
