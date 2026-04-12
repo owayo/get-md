@@ -3914,4 +3914,80 @@ code
         // 'b', ')' → depth=1, 'c', ')' → depth=0
         assert_eq!(find_link_close_paren(input), Some(input.len() - 1));
     }
+
+    // --- テストカバレッジ補完: 画像リンクの alt 空テスト ---
+
+    #[test]
+    fn resolve_empty_alt_image_url() {
+        // alt テキストなしの画像 ![](url) でも URL 解決される
+        assert_eq!(
+            resolve_markdown_urls("![](./img.png)", BASE),
+            "![](https://example.com/docs/en/img.png)",
+        );
+    }
+
+    #[test]
+    fn resolve_image_empty_alt_with_title() {
+        // alt なし＋タイトル付き画像の URL 解決
+        assert_eq!(
+            resolve_markdown_urls(r#"![](./pic.png "photo")"#, BASE),
+            r#"![](https://example.com/docs/en/pic.png "photo")"#,
+        );
+    }
+
+    // --- テストカバレッジ補完: 日時比較の境界テスト ---
+
+    #[test]
+    fn date_only_change_both_non_utf8_returns_false() {
+        // 双方が非 UTF-8 の場合は安全のため false
+        let old: &[u8] = &[0xFF, 0xFE, 0x30];
+        let new: &[u8] = &[0xFF, 0xFE, 0x31];
+        assert!(!is_date_only_change(old, new));
+    }
+
+    #[test]
+    fn strip_dates_time_only_not_matched() {
+        // 日付部分のない時刻のみのパターンは DATE_RE にマッチしない
+        let s = "meeting at 12:30:00 today";
+        assert_eq!(strip_dates(s), s);
+    }
+
+    // --- テストカバレッジ補完: テーブル圧縮の空白バリエーション ---
+
+    #[test]
+    fn compact_table_row_tab_padding() {
+        // タブ文字によるセルパディングも圧縮される
+        assert_eq!(compact_markdown("|\ta\t|\tb\t|"), "| a | b |");
+    }
+
+    // --- テストカバレッジ補完: ブロッククォート内リンク ---
+
+    #[test]
+    fn resolve_link_in_blockquote() {
+        // ブロッククォート内のリンクも正しく URL 解決される
+        assert_eq!(
+            resolve_markdown_urls("> [link](./page)", BASE),
+            "> [link](https://example.com/docs/en/page)",
+        );
+    }
+
+    #[test]
+    fn resolve_nested_blockquote_link() {
+        // 多段ブロッククォート内のリンクも解決される
+        assert_eq!(
+            resolve_markdown_urls(">> [deep](./nested)", BASE),
+            ">> [deep](https://example.com/docs/en/nested)",
+        );
+    }
+
+    // --- テストカバレッジ補完: 標準・山括弧混在リンク ---
+
+    #[test]
+    fn resolve_mixed_standard_and_angle_bracket_links() {
+        // 同一行内で標準形式と山括弧形式のリンクが混在する場合
+        let input = "[a](./x) [b](<./y z>)";
+        let result = resolve_markdown_urls(input, BASE);
+        assert!(result.contains("https://example.com/docs/en/x"));
+        assert!(result.contains("https://example.com/docs/en/y%20z"));
+    }
 }
