@@ -3990,4 +3990,71 @@ code
         assert!(result.contains("https://example.com/docs/en/x"));
         assert!(result.contains("https://example.com/docs/en/y%20z"));
     }
+
+    // --- split_link_destination: タブ区切りの標準形式 ---
+
+    #[test]
+    fn split_link_destination_standard_with_tab_separator() {
+        // タブも `is_ascii_whitespace` としてタイトルの区切りに用いられる
+        let (url, title, angle) = split_link_destination("./page\t\"Title\"");
+        assert!(!angle);
+        assert_eq!(url, "./page");
+        assert_eq!(title, "\t\"Title\"");
+    }
+
+    // --- split_link_destination: 末尾が単独バックスラッシュ ---
+
+    #[test]
+    fn split_link_destination_standard_trailing_single_backslash() {
+        // 末尾のバックスラッシュ単独ではエスケープ対象がないため URL に含める
+        let (url, title, angle) = split_link_destination(r"./page\");
+        assert!(!angle);
+        assert_eq!(url, r"./page\");
+        assert_eq!(title, "");
+    }
+
+    // --- find_next_link_candidate: 開始位置が改行直後 ---
+
+    #[test]
+    fn link_candidate_start_right_after_newline_fence() {
+        // 改行直後の ``` をフェンス開始と正しく認識する
+        let md = "prefix\n```\n[skip](x)\n```\n[real](y)";
+        let start = md.find('\n').unwrap() + 1;
+        let pos = find_next_link_candidate(md, start);
+        assert!(pos.is_some());
+        let after = &md[pos.unwrap()..];
+        assert!(after.starts_with("](y)"));
+    }
+
+    // --- Progress: 既存スピナー置き換え ---
+
+    #[test]
+    fn progress_spinner_replaces_existing_spinner() {
+        // 既に表示中のスピナーがあっても、次の spinner 呼び出しで置き換えられる
+        let mut p = crate::progress::Progress::new(true);
+        p.spinner("first");
+        // 明示的な finish を挟まず上書き
+        p.spinner("second");
+        p.finish_and_clear();
+    }
+
+    // --- resolve_markdown_urls: リンクテキスト内の括弧 ---
+
+    #[test]
+    fn resolve_link_text_containing_parentheses() {
+        // リンクテキストに括弧が含まれても、直後のリンク先 `(url)` が先に閉じられる
+        let input = "[foo (bar)](./page)";
+        let result = resolve_markdown_urls(input, BASE);
+        assert_eq!(result, "[foo (bar)](https://example.com/docs/en/page)");
+    }
+
+    // --- compact_markdown: フェンス直後に改行のみ（空行）があるケース ---
+
+    #[test]
+    fn compact_table_after_fence_with_blank_line() {
+        // 閉じフェンスと次のテーブル行の間に空行がある場合も圧縮対象
+        let input = "```\ncode\n```\n\n|  a  |  b  |";
+        let expected = "```\ncode\n```\n\n| a | b |";
+        assert_eq!(compact_markdown(input), expected);
+    }
 }
