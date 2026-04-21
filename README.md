@@ -32,10 +32,10 @@
 - **Markdown Link Robustness** — supports resolving `<...>` style link destinations (including spaces) and ignores bare `](` text that is not real Markdown link syntax
 - **Literal Backtick Safety** — treats unmatched inline backticks as literal text, so later Markdown links are still resolved
 - **Angle Destination Parentheses Support** — does not treat `)` inside `<...>` link destinations as the closing delimiter
-- **Angle Bracket Escape Support** — correctly handles `\>` inside `<...>` link destinations instead of treating it as the closing `>`
-- **Escaped Parentheses Support** — correctly parses link destinations containing `\(` and `\)`
+- **Angle Bracket Escape Support** — correctly handles `\>` inside `<...>` link destinations and resolves it as a literal `>` instead of corrupting the path
+- **Escaped Parentheses Support** — correctly parses link destinations containing `\(` and `\)` and resolves them as literal parentheses
 - **Quote-safe URL Parsing** — preserves quotes/apostrophes in standard Markdown link destinations
-- **Escaped Whitespace Handling** — keeps `\ ` in standard link destinations from being split as title separators
+- **Escaped Whitespace Handling** — keeps `\ ` in standard link destinations from being split as title separators and resolves it as a literal space
 - **Table Compaction** — removes unnecessary padding in Markdown tables while preserving fenced code blocks
 - **Escaped Pipe-safe Tables** — keeps escaped cell pipes (`\|`) intact during table compaction
 - **Progress Display** — shows operation progress with quiet mode option, and reports completion only after output succeeds

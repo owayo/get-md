@@ -482,9 +482,10 @@ fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
         if let Some(close) = find_link_close_paren(part) {
             let inside = &part[..close];
             let (url, title, use_angle_brackets) = split_link_destination(inside);
+            let resolved_input = unescape_markdown_destination(url);
 
             if !url.is_empty() {
-                match base.join(url) {
+                match base.join(&resolved_input) {
                     Ok(resolved) => {
                         if use_angle_brackets {
                             result.push('<');
@@ -517,6 +518,27 @@ fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
     }
 
     result.push_str(&md[cursor..]);
+    result
+}
+
+/// Markdown リンク先に含まれる最小限のバックスラッシュエスケープを
+/// URL 解決前の実 URL 文字列へ戻す。
+///
+/// `\ ` `\(` `\)` `\>` をそのまま `Url::join` に渡すと、
+/// バックスラッシュがパス区切りや文字列の一部として解釈されてしまう。
+fn unescape_markdown_destination(url: &str) -> String {
+    let mut result = String::with_capacity(url.len());
+    let mut chars = url.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && let Some(' ' | '(' | ')' | '>') = chars.peek().copied() {
+            result.push(chars.next().expect("peek 済みの文字が存在する"));
+            continue;
+        }
+
+        result.push(ch);
+    }
+
     result
 }
 
@@ -1102,6 +1124,22 @@ mod tests {
         assert_eq!(
             resolve_markdown_urls("[link](./page\t\"Title\")", BASE),
             "[link](https://example.com/docs/en/page\t\"Title\")",
+        );
+    }
+
+    #[test]
+    fn resolve_standard_url_with_escaped_space() {
+        assert_eq!(
+            resolve_markdown_urls(r"[doc](./my\ file.md)", BASE),
+            "[doc](https://example.com/docs/en/my%20file.md)",
+        );
+    }
+
+    #[test]
+    fn resolve_standard_url_with_escaped_parentheses() {
+        assert_eq!(
+            resolve_markdown_urls(r"[doc](./file\(draft\).md)", BASE),
+            "[doc](https://example.com/docs/en/file(draft).md)",
         );
     }
 
@@ -2961,7 +2999,7 @@ code
         let base = "https://example.com/docs/";
         let md = r"[link](<path\>file>)";
         let result = resolve_markdown_urls(md, base);
-        assert!(result.contains("example.com"));
+        assert_eq!(result, "[link](<https://example.com/docs/path%3Efile>)");
     }
 
     // --- テストカバレッジ補強 ---
@@ -3661,7 +3699,7 @@ code
         // 山括弧内に複数のエスケープ済み > がある場合、URL 解決後も山括弧で囲まれる
         let md = r"[link](<a\>b\>c>)";
         let result = resolve_markdown_urls(md, "https://example.com/");
-        assert!(result.contains("example.com/a/%3Eb/%3Ec"));
+        assert_eq!(result, "[link](<https://example.com/a%3Eb%3Ec>)");
     }
 
     #[test]
