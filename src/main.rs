@@ -531,7 +531,9 @@ fn unescape_markdown_destination(url: &str) -> String {
     let mut chars = url.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if ch == '\\' && let Some(' ' | '(' | ')' | '>') = chars.peek().copied() {
+        if ch == '\\'
+            && let Some(' ' | '(' | ')' | '>') = chars.peek().copied()
+        {
             result.push(chars.next().expect("peek 済みの文字が存在する"));
             continue;
         }
