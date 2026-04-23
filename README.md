@@ -30,6 +30,7 @@
 - **URL Resolution** — converts relative URLs to absolute paths in output
 - **Code-safe URL Resolution** — leaves inline code and fenced code blocks untouched when resolving Markdown links
 - **Markdown Link Robustness** — supports resolving `<...>` style link destinations (including spaces) and ignores bare `](` text that is not real Markdown link syntax
+- **Broken Link Tolerance** — a malformed link candidate without a closing `)` no longer prevents later valid links on the page from being resolved
 - **Literal Backtick Safety** — treats unmatched inline backticks as literal text, so later Markdown links are still resolved
 - **Angle Destination Parentheses Support** — does not treat `)` inside `<...>` link destinations as the closing delimiter
 - **Angle Bracket Escape Support** — correctly handles `\>` inside `<...>` link destinations and resolves it as a literal `>` instead of corrupting the path

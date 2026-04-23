@@ -4135,4 +4135,30 @@ code
         let input = "before [link](./path and nothing";
         assert_eq!(resolve_markdown_urls(input, BASE), input);
     }
+
+    // --- resolve_markdown_urls: 壊れたリンクの後続リンク種別バリエーション ---
+
+    #[test]
+    fn resolve_broken_link_followed_by_image() {
+        // 壊れたリンクの直後に画像リンクが続く場合も、画像が解決される
+        let input = "[a](./broken ![img](./pic.png)";
+        let expected = "[a](./broken ![img](https://example.com/docs/en/pic.png)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_broken_link_followed_by_angle_bracket_link() {
+        // 壊れたリンクの後に山括弧形式のリンクが続く場合も解決される
+        let input = "[a](./broken [b](<./url>)";
+        let expected = "[a](./broken [b](<https://example.com/docs/en/url>)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_broken_link_followed_by_titled_link() {
+        // 壊れたリンクの後にタイトル付きリンクが続く場合も解決される
+        let input = r#"[a](./broken [b](./p "title")"#;
+        let expected = r#"[a](./broken [b](https://example.com/docs/en/p "title")"#;
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
 }
