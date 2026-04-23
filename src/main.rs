@@ -512,8 +512,10 @@ fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
             result.push(')');
             cursor = inside_start + close + 1;
         } else {
-            result.push_str(part);
-            return result;
+            // 閉じ `)` が見つからなければこの `](` はリンクとして扱えない。
+            // ただし後続の正常なリンクまで諦めずに、カーソルだけ `](` の直後へ進めて走査を継続する。
+            // 既に `cursor..inside_start` は結果に書き込み済みなので二重出力にはならない。
+            cursor = inside_start;
         }
     }
 
@@ -4096,5 +4098,41 @@ code
         let input = "```\ncode\n```\n\n|  a  |  b  |";
         let expected = "```\ncode\n```\n\n| a | b |";
         assert_eq!(compact_markdown(input), expected);
+    }
+
+    // --- resolve_markdown_urls: 壊れたリンク候補が後続を止めない回帰テスト ---
+
+    #[test]
+    fn resolve_broken_link_does_not_skip_later_links() {
+        // 閉じ `)` が見つからない壊れたリンクが先にあっても、
+        // 後続の正常なリンクは解決される
+        let input = "[x](./broken [y](./page)";
+        let expected = "[x](./broken [y](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_broken_link_with_newline_keeps_later_resolution() {
+        // 壊れたリンク `[incomplete](./a` の後に、改行を挟んで正常なリンク
+        let input = "[incomplete](./a\n[complete](./b)";
+        let expected = "[incomplete](./a\n[complete](https://example.com/docs/en/b)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_multiple_broken_links_preserves_final_link() {
+        // 連続する壊れたリンク候補の後でも最終的なリンクは解決される
+        let input = "[a](./x [b](./y [c](./z)";
+        let expected = "[a](./x [b](./y [c](https://example.com/docs/en/z)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    // --- resolve_markdown_urls: 既存の壊れたリンクのみ入力時の挙動 ---
+
+    #[test]
+    fn resolve_unclosed_link_in_middle_keeps_all_literal() {
+        // 閉じ `)` がどこにもないリンク候補は、そのまま出力される
+        let input = "before [link](./path and nothing";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
     }
 }
