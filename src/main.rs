@@ -419,6 +419,20 @@ fn fence_marker(line: &str) -> Option<(char, usize)> {
     if len >= 3 { Some((marker, len)) } else { None }
 }
 
+/// ブロッククォート記号を取り除いた位置にあるフェンスマーカーを検出する。
+fn fence_marker_after_blockquote(line: &str) -> Option<(char, usize)> {
+    let mut rest = line.trim_start();
+
+    while let Some(after_marker) = rest.strip_prefix('>') {
+        rest = after_marker
+            .strip_prefix(' ')
+            .unwrap_or(after_marker)
+            .trim_start();
+    }
+
+    fence_marker(rest)
+}
+
 fn compact_table_row(row: &str) -> String {
     let inner = &row[1..row.len() - 1];
     let cells: Vec<String> = split_unescaped_table_cells(inner)
@@ -562,7 +576,7 @@ fn find_next_link_candidate(md: &str, start: usize) -> Option<usize> {
                 .map(|offset| cursor + offset)
                 .unwrap_or(md.len());
             let line = &md[cursor..line_end];
-            if let Some((marker, marker_len)) = fence_marker(line.trim_start()) {
+            if let Some((marker, marker_len)) = fence_marker_after_blockquote(line) {
                 if !in_fenced_code_block {
                     in_fenced_code_block = true;
                     fence_char = marker;
@@ -4020,6 +4034,23 @@ code
             resolve_markdown_urls(">> [deep](./nested)", BASE),
             ">> [deep](https://example.com/docs/en/nested)",
         );
+    }
+
+    #[test]
+    fn resolve_link_inside_blockquote_fence_unchanged() {
+        // ブロッククォート内のフェンスコードはコードとして扱い、URL 解決しない
+        let input = "> ```\n> [skip](./code)\n> ```\n> [real](./page)";
+        let expected = "> ```\n> [skip](./code)\n> ```\n> [real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_inside_nested_blockquote_fence_unchanged() {
+        // 多段ブロッククォートのフェンスコード内も URL 解決対象から除外する
+        let input = ">> ```\n>> [skip](./code)\n>> ```\n>> [real](./page)";
+        let expected =
+            ">> ```\n>> [skip](./code)\n>> ```\n>> [real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
     // --- テストカバレッジ補完: 標準・山括弧混在リンク ---
