@@ -4192,4 +4192,149 @@ code
         let expected = r#"[a](./broken [b](https://example.com/docs/en/p "title")"#;
         assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
+
+    // --- fence_marker_after_blockquote の直接テスト ---
+
+    #[test]
+    fn fence_marker_after_blockquote_no_blockquote() {
+        // ブロッククォート記号がない通常のフェンス行
+        assert_eq!(fence_marker_after_blockquote("```"), Some(('`', 3)));
+    }
+
+    #[test]
+    fn fence_marker_after_blockquote_single_level() {
+        // 単一の `>` の後にフェンス
+        assert_eq!(fence_marker_after_blockquote("> ```"), Some(('`', 3)));
+    }
+
+    #[test]
+    fn fence_marker_after_blockquote_multiple_levels() {
+        // 多段ブロッククォートの後にフェンス
+        assert_eq!(fence_marker_after_blockquote(">>> ```"), Some(('`', 3)));
+    }
+
+    #[test]
+    fn fence_marker_after_blockquote_mixed_spacing() {
+        // ブロッククォート間に複数の空白がある場合
+        assert_eq!(fence_marker_after_blockquote(">  >   ~~~"), Some(('~', 3)),);
+    }
+
+    #[test]
+    fn fence_marker_after_blockquote_no_fence() {
+        // ブロッククォートのみでフェンスなし
+        assert_eq!(fence_marker_after_blockquote("> text"), None);
+    }
+
+    #[test]
+    fn fence_marker_after_blockquote_indented() {
+        // ブロッククォート前にインデントがある場合も認識される
+        assert_eq!(fence_marker_after_blockquote("  > ```"), Some(('`', 3)));
+    }
+
+    #[test]
+    fn fence_marker_after_blockquote_long_backtick() {
+        // 4 個以上のバッククォートも検出される
+        assert_eq!(fence_marker_after_blockquote("> ````rust"), Some(('`', 4)),);
+    }
+
+    #[test]
+    fn fence_marker_after_blockquote_no_space_between_gt_and_fence() {
+        // `>` の直後にスペースなしでフェンスマーカーが来る場合
+        assert_eq!(fence_marker_after_blockquote(">```"), Some(('`', 3)));
+    }
+
+    #[test]
+    fn fence_marker_after_blockquote_empty_line() {
+        // 空文字列はフェンスではない
+        assert_eq!(fence_marker_after_blockquote(""), None);
+    }
+
+    // --- unescape_markdown_destination の直接テスト ---
+
+    #[test]
+    fn unescape_destination_no_escapes() {
+        // エスケープを含まない通常のURL
+        assert_eq!(unescape_markdown_destination("./page.md"), "./page.md",);
+    }
+
+    #[test]
+    fn unescape_destination_escaped_space() {
+        // バックスラッシュ + 空白を実空白へ戻す
+        assert_eq!(
+            unescape_markdown_destination(r"./my\ file.md"),
+            "./my file.md",
+        );
+    }
+
+    #[test]
+    fn unescape_destination_escaped_parens() {
+        // バックスラッシュ + 括弧を実括弧へ戻す
+        assert_eq!(
+            unescape_markdown_destination(r"./file\(draft\).md"),
+            "./file(draft).md",
+        );
+    }
+
+    #[test]
+    fn unescape_destination_escaped_gt() {
+        // バックスラッシュ + > を実 > へ戻す
+        assert_eq!(
+            unescape_markdown_destination(r"./path\>file"),
+            "./path>file",
+        );
+    }
+
+    #[test]
+    fn unescape_destination_preserves_other_backslashes() {
+        // エスケープ対象でないバックスラッシュはそのまま残す
+        assert_eq!(
+            unescape_markdown_destination(r"./path\nfile"),
+            r"./path\nfile",
+        );
+    }
+
+    #[test]
+    fn unescape_destination_trailing_backslash() {
+        // 末尾のバックスラッシュ単独はそのまま残す（エスケープ対象がない）
+        assert_eq!(unescape_markdown_destination(r"./path\"), r"./path\",);
+    }
+
+    #[test]
+    fn unescape_destination_empty_string() {
+        // 空文字列の入力は空文字列のまま
+        assert_eq!(unescape_markdown_destination(""), "");
+    }
+
+    #[test]
+    fn unescape_destination_multiple_escapes() {
+        // 複数のエスケープが連続する場合
+        assert_eq!(unescape_markdown_destination(r"\(\)\ \>"), "() >",);
+    }
+
+    #[test]
+    fn unescape_destination_multibyte_with_escape() {
+        // マルチバイト文字とエスケープの混在
+        assert_eq!(
+            unescape_markdown_destination(r"./日本語\ ファイル.md"),
+            "./日本語 ファイル.md",
+        );
+    }
+
+    // --- compact_markdown: ブロッククォート内テーブル ---
+
+    #[test]
+    fn compact_table_inside_blockquote_not_compressed() {
+        // ブロッククォート内のテーブル行は `|` で始まらないため圧縮対象外
+        let input = "> | a   | b   |";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    // --- compact_markdown: ブロッククォート内フェンス内テーブル ---
+
+    #[test]
+    fn compact_blockquote_fence_preserves_inner_lines() {
+        // ブロッククォート内のフェンスコード内のテーブル行はそのまま保持
+        let input = "> ```\n> | padded   | table   |\n> ```";
+        assert_eq!(compact_markdown(input), input);
+    }
 }
