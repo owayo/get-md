@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use url::Url;
@@ -8,6 +9,8 @@ use url::Url;
 fn get_md_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_get-md"))
 }
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 struct TempDir {
     path: PathBuf,
@@ -19,7 +22,9 @@ impl TempDir {
             .duration_since(UNIX_EPOCH)
             .expect("Failed to get current time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("get-md-e2e-{}-{unique}", std::process::id()));
+        let seq = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("get-md-e2e-{}-{unique}-{seq}", std::process::id()));
         fs::create_dir_all(&path).expect("Failed to create temp dir");
         Self { path }
     }

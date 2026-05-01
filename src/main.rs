@@ -704,7 +704,12 @@ fn is_escaped_markdown_char(md: &str, idx: usize) -> bool {
 /// - 標準形式: `./path "title"`
 /// - 山括弧形式: `<./path with space> "title"`
 fn split_link_destination(inside: &str) -> (&str, &str, bool) {
-    if let Some(after_open) = inside.strip_prefix('<') {
+    let body = inside.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    if body.is_empty() {
+        return ("", inside, false);
+    }
+
+    if let Some(after_open) = body.strip_prefix('<') {
         // エスケープされていない `>` を探す（`\>` はスキップ）
         let mut backslash_run = 0usize;
         for (off, ch) in after_open.char_indices() {
@@ -714,9 +719,9 @@ fn split_link_destination(inside: &str) -> (&str, &str, bool) {
             }
             let escaped = backslash_run % 2 == 1;
             if ch == '>' && !escaped {
-                let end = 1 + off; // inside 上の '>' の位置
-                let url = &inside[1..end];
-                let title = &inside[(end + 1)..];
+                let end = 1 + off; // body 上の '>' の位置
+                let url = &body[1..end];
+                let title = &body[(end + 1)..];
                 return (url, title, true);
             }
             backslash_run = 0;
@@ -726,18 +731,18 @@ fn split_link_destination(inside: &str) -> (&str, &str, bool) {
     // 標準形式では、タイトル（あれば）は最初の
     // 「エスケープされていない空白」以降に始まる
     let mut backslash_run = 0usize;
-    for (i, c) in inside.char_indices() {
+    for (i, c) in body.char_indices() {
         if c == '\\' {
             backslash_run += 1;
             continue;
         }
         let escaped = backslash_run % 2 == 1;
         if c.is_ascii_whitespace() && !escaped {
-            return (&inside[..i], &inside[i..], false);
+            return (&body[..i], &body[i..], false);
         }
         backslash_run = 0;
     }
-    (inside, "", false)
+    (body, "", false)
 }
 
 /// `](` の暗黙の開き `(` に対応する閉じ `)` を探す。
@@ -1309,6 +1314,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_link_with_leading_destination_whitespace() {
+        assert_eq!(
+            resolve_markdown_urls("[doc](  ./page.md \"Title\")", BASE),
+            "[doc](https://example.com/docs/en/page.md \"Title\")",
+        );
+    }
+
+    #[test]
+    fn resolve_angle_bracket_link_with_leading_destination_whitespace() {
+        assert_eq!(
+            resolve_markdown_urls("[doc](  <./my file.md> \"Title\")", BASE),
+            "[doc](<https://example.com/docs/en/my%20file.md> \"Title\")",
+        );
+    }
+
+    #[test]
     fn resolve_angle_bracket_url_with_title() {
         assert_eq!(
             resolve_markdown_urls(r#"[doc](<./my file.md> "Title")"#, BASE),
@@ -1351,6 +1372,22 @@ mod tests {
         assert_eq!(
             split_link_destination(r#"./page "Title""#),
             ("./page", r#" "Title""#, false),
+        );
+    }
+
+    #[test]
+    fn split_link_destination_standard_with_leading_whitespace() {
+        assert_eq!(
+            split_link_destination(r#"  ./page.md "Title""#),
+            ("./page.md", r#" "Title""#, false),
+        );
+    }
+
+    #[test]
+    fn split_link_destination_angle_bracket_with_leading_whitespace() {
+        assert_eq!(
+            split_link_destination(r#"  <./my file.md> "Title""#),
+            ("./my file.md", r#" "Title""#, true),
         );
     }
 
