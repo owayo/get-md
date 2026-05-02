@@ -27,7 +27,7 @@
 - **Auto Chrome Detection** — finds Chrome automatically, or specify a custom path
 - **Configurable Wait** — adjustable wait time for JS rendering completion
 - **Clean Output** — strips scripts, styles, SVGs automatically
-- **URL Resolution** — converts relative URLs to absolute paths in output
+- **URL Resolution** — converts relative URLs to absolute paths using the rendered document base URL, including `<base href>`
 - **Code-safe URL Resolution** — leaves inline code, fenced code blocks, and blockquote-contained fenced code blocks untouched when resolving Markdown links
 - **Markdown Link Robustness** — supports resolving `<...>` style link destinations (including spaces) and ignores bare `](` text that is not real Markdown link syntax
 - **Broken Link Tolerance** — a malformed link candidate without a closing `)` no longer prevents later valid links on the page from being resolved
@@ -38,9 +38,11 @@
 - **Quote-safe URL Parsing** — preserves quotes/apostrophes in standard Markdown link destinations
 - **Escaped Whitespace Handling** — keeps `\ ` in standard link destinations from being split as title separators and resolves it as a literal space
 - **Leading Destination Whitespace Support** — resolves relative URLs even when valid Markdown link destinations start with whitespace before the URL
-- **Table Compaction** — removes unnecessary padding in Markdown tables while preserving fenced code blocks
+- **Table Compaction** — removes unnecessary padding in Markdown tables while preserving fenced code blocks and separator-like data cells such as `--` or `:`
 - **Escaped Pipe-safe Tables** — keeps escaped cell pipes (`\|`) intact during table compaction
 - **Progress Display** — shows operation progress with quiet mode option, and reports completion only after output succeeds
+- **CDP-backed HTTP Status Checks** — rejects real HTTP error responses using Chrome DevTools Protocol events, even if page scripts alter browser performance APIs
+- **Certificate Safety by Default** — validates HTTPS certificates by default; `--ignore-certificate-errors` is available only for explicit trusted debugging cases
 - **File Status Icons** — shows ✨ (created), 📝 (updated), or ✔ (unchanged) for file output; git-aware change detection is anchored to the target path so deleted tracked files and runs from outside the repo still resolve to `updated`, and existing unreadable files also fall back to `updated`
 - **Date-only Diff Ignore** — `--ignore-date` skips rewrites when only timestamp strings changed, including common ISO 8601 forms with fractional seconds and timezone suffixes; requires both old and new content to contain date patterns, and safely falls back for non-UTF-8 files
 - **Timeout Safety** — internal browser idle-timeout buffer uses saturating arithmetic to avoid overflow at extreme `--timeout` values
@@ -106,6 +108,7 @@ get-md [OPTIONS] <URL>
 | `--timeout <SECS>` | `-t` | Page load timeout in seconds (default: 60) |
 | `--no-headless` | | Run browser visibly (for debugging) |
 | `--no-cache` | | Disable browser cache (always fetch latest content) |
+| `--ignore-certificate-errors` | | Ignore HTTPS certificate errors (dangerous; use only for trusted debugging) |
 | `--ignore-date` | | Treat timestamp-only output diffs as unchanged when writing files |
 | `--quiet` | `-q` | Suppress progress display |
 | `--help` | `-h` | Show help |
@@ -131,6 +134,9 @@ get-md https://spa-example.com -s "#app" -w 5 -t 60
 
 # Use a specific Chrome binary
 get-md https://example.com --chrome-path /usr/bin/google-chrome
+
+# Debug a trusted site with a broken certificate
+get-md https://example.com --ignore-certificate-errors
 
 # Skip rewriting when only timestamps changed
 get-md https://example.com -o output.md --ignore-date
@@ -177,9 +183,10 @@ cargo test --test e2e -- --ignored
 Ignored E2E tests cover:
 
 - Fetching a real GitHub raw document
-- Resolving relative links and images from a local `file://` page
+- Resolving relative links and images from a local `file://` page, including `<base href>`
 - Joining multiple selectors with the documented `---` separator
 - Skipping rewrites for `--ignore-date` when only timestamp text changes
+- Rejecting a real HTTP 404 even when page scripts spoof browser performance APIs
 
 ## Contributing
 

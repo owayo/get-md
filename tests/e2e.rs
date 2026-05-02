@@ -1,7 +1,10 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use url::Url;
@@ -48,6 +51,35 @@ fn file_url(path: &Path) -> String {
     Url::from_file_path(path)
         .expect("Failed to convert path to file URL")
         .into()
+}
+
+fn static_http_url(status_code: u16, body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind test HTTP server");
+    let addr = listener
+        .local_addr()
+        .expect("Failed to get test HTTP server address");
+
+    thread::spawn(move || {
+        for stream in listener.incoming().take(8) {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let mut buffer = [0; 1024];
+            let _ = stream.read(&mut buffer);
+            let reason = if status_code == 404 {
+                "Not Found"
+            } else {
+                "OK"
+            };
+            let response = format!(
+                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    format!("http://{addr}/")
 }
 
 #[test]
@@ -120,6 +152,44 @@ fn fetch_local_html_and_resolve_relative_urls() {
     assert!(
         stdout.contains(&format!("![Logo]({image_url})")),
         "Resolved image link was not found: {stdout}",
+    );
+}
+
+#[test]
+#[ignore] // システムに Chrome/Chromium が必要
+fn base_href_is_used_for_relative_url_resolution() {
+    let temp_dir = TempDir::new();
+    let page = temp_dir.path().join("page.html");
+    write_file(
+        &page,
+        r#"<!doctype html>
+<html>
+  <head><base href="https://cdn.example/docs/"></head>
+  <body>
+    <main><a href="guide.html">Guide</a></main>
+  </body>
+</html>"#,
+    );
+
+    let output = get_md_bin()
+        .args([
+            file_url(&page),
+            "-s".to_string(),
+            "main".to_string(),
+            "-q".to_string(),
+        ])
+        .output()
+        .expect("Failed to execute get-md");
+
+    assert!(
+        output.status.success(),
+        "get-md exited with error: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[Guide](https://cdn.example/docs/guide.html)"),
+        "document.baseURI was not used for URL resolution: {stdout}",
     );
 }
 
@@ -207,4 +277,44 @@ fn ignore_date_keeps_existing_output_when_only_timestamp_differs() {
 
     let saved = fs::read_to_string(&output_path).expect("Failed to read output file");
     assert_eq!(saved, "Updated: 2026-04-12 09:00\n");
+}
+
+#[test]
+#[ignore] // システムに Chrome/Chromium が必要
+fn http_error_status_cannot_be_spoofed_by_page_script() {
+    let url = static_http_url(
+        404,
+        r#"<!doctype html>
+<html>
+  <body>
+    <script>
+      performance.getEntriesByType = () => [{ responseStatus: 200 }];
+    </script>
+    <main>spoofed 404 body</main>
+  </body>
+</html>"#,
+    );
+
+    let output = get_md_bin()
+        .args([
+            url,
+            "-s".to_string(),
+            "main".to_string(),
+            "-w".to_string(),
+            "0".to_string(),
+            "-q".to_string(),
+        ])
+        .output()
+        .expect("Failed to execute get-md");
+
+    assert!(
+        !output.status.success(),
+        "get-md should reject a real HTTP 404 even if page script spoofs PerformanceNavigationTiming: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("HTTP 404"),
+        "stderr should report the real HTTP status: {stderr}",
+    );
 }

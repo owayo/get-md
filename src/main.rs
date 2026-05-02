@@ -4,13 +4,13 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use headless_chrome::protocol::cdp::Network;
-use headless_chrome::{Browser, LaunchOptions};
+use headless_chrome::protocol::cdp::{Network, Page};
+use headless_chrome::{Browser, LaunchOptions, Tab};
 use regex::Regex;
 use url::Url;
 
@@ -54,6 +54,10 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
 
+    /// HTTPS 証明書エラーを無視する（危険: 信頼できる用途に限定）
+    #[arg(long)]
+    ignore_certificate_errors: bool,
+
     /// 進捗表示を抑制する
     #[arg(short, long)]
     quiet: bool,
@@ -71,22 +75,40 @@ fn main() -> Result<()> {
     let selectors = if cli.selector.is_empty() {
         vec!["body".to_string()]
     } else {
-        cli.selector
+        cli.selector.clone()
     };
 
     // ブラウザを起動する
     progress.spinner("Launching Chrome...");
-    let launch_options = LaunchOptions {
-        headless: !cli.no_headless,
-        path: cli.chrome_path,
-        idle_browser_timeout: idle_browser_timeout(cli.timeout),
-        ..LaunchOptions::default()
-    };
+    let launch_options = build_launch_options(&cli);
 
     let browser = Browser::new(launch_options)
         .context("Failed to launch Chrome. Make sure Chrome is installed on your system")?;
 
     let tab = browser.new_tab().context("Failed to open new tab")?;
+    let main_frame_id = tab
+        .call_method(Page::GetFrameTree(None))
+        .context("Failed to get main frame")?
+        .frame_tree
+        .frame
+        .id;
+    let main_response_status = Arc::new(Mutex::new(None::<u32>));
+    let main_frame_id_for_handler = main_frame_id.clone();
+    let status_for_handler = Arc::clone(&main_response_status);
+    tab.register_response_handling(
+        "main-document-status",
+        Box::new(move |response, _fetch_body| {
+            if response.Type == Network::ResourceType::Document
+                && response.frame_id.as_ref() == Some(&main_frame_id_for_handler)
+            {
+                *status_for_handler
+                    .lock()
+                    .expect("HTTP ステータス記録用 Mutex が poisoned になった") =
+                    Some(response.response.status);
+            }
+        }),
+    )
+    .context("Failed to register HTTP status handler")?;
     tab.set_default_timeout(Duration::from_secs(cli.timeout));
     if cli.no_cache {
         tab.call_method(Network::SetCacheDisabled {
@@ -110,16 +132,11 @@ fn main() -> Result<()> {
     }
     progress.finish("Page loaded");
 
-    // HTTP ステータスコードを確認する（400 以上はエラー）
-    let status_code: u16 = tab
-        .evaluate(
-            "performance.getEntriesByType('navigation')[0]?.responseStatus ?? 0",
-            false,
-        )
-        .ok()
-        .and_then(|r| r.value)
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u16)
+    // HTTP ステータスコードを確認する（400 以上はエラー）。
+    // ページ内 JS は改変可能なため、CDP の Network event から得た値だけを信頼する。
+    let status_code = main_response_status
+        .lock()
+        .expect("HTTP ステータス記録用 Mutex が poisoned になった")
         .unwrap_or(0);
 
     if status_code >= 400 {
@@ -182,8 +199,9 @@ fn main() -> Result<()> {
         md_parts.push(md);
     }
 
+    let base_url = document_base_url(&tab).unwrap_or_else(|| cli.url.clone());
     let markdown = compact_markdown(&md_parts.join("\n\n---\n\n"));
-    let markdown = resolve_markdown_urls(&markdown, &cli.url);
+    let markdown = resolve_markdown_urls(&markdown, &base_url);
     progress.finish("Converted to Markdown");
 
     // 出力内容を確定する（末尾改行を保証）
@@ -198,6 +216,8 @@ fn main() -> Result<()> {
     // File::create 前にファイルの存在を記録する（作成後は常に exists() が true になるため）
     let file_existed_before =
         old_content.is_some() || cli.output.as_ref().is_some_and(|p| p.exists());
+    // 削除済み tracked ファイルは書き戻し後に diff が消えるため、書き込み前の状態も保持する。
+    let had_unstaged_changes_before = cli.output.as_ref().is_some_and(|p| has_unstaged_changes(p));
 
     // --ignore-date: 日時だけの差分なら書き込みをスキップ
     let date_only_change = cli.ignore_date
@@ -209,7 +229,7 @@ fn main() -> Result<()> {
     if date_only_change {
         let path = cli.output.as_ref().unwrap();
         // 未ステージ変更があれば updated 扱い（file_status と同じ契約）
-        let (icon, status) = if has_unstaged_changes(path) {
+        let (icon, status) = if had_unstaged_changes_before || has_unstaged_changes(path) {
             ("📝", "updated")
         } else {
             ("✔", "unchanged")
@@ -245,6 +265,7 @@ fn main() -> Result<()> {
                     file_existed_before,
                     &old_content,
                     output_bytes.as_bytes(),
+                    had_unstaged_changes_before,
                 );
                 progress.complete(
                     icon,
@@ -258,6 +279,24 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn build_launch_options(cli: &Cli) -> LaunchOptions<'static> {
+    LaunchOptions {
+        headless: !cli.no_headless,
+        path: cli.chrome_path.clone(),
+        idle_browser_timeout: idle_browser_timeout(cli.timeout),
+        ignore_certificate_errors: cli.ignore_certificate_errors,
+        ..LaunchOptions::default()
+    }
+}
+
+fn document_base_url(tab: &Tab) -> Option<String> {
+    tab.evaluate("document.baseURI", false)
+        .ok()
+        .and_then(|result| result.value)
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|base| Url::parse(base).is_ok())
+}
+
 /// ファイル出力のステータスを判定する。
 ///
 /// `file_existed_before` は File::create 前に記録したファイルの存在状態。
@@ -268,8 +307,9 @@ fn file_status<'a>(
     file_existed_before: bool,
     old_content: &Option<Vec<u8>>,
     new: &[u8],
+    had_unstaged_changes_before: bool,
 ) -> (&'a str, &'a str) {
-    if has_unstaged_changes(path) {
+    if had_unstaged_changes_before || has_unstaged_changes(path) {
         return ("📝", "updated");
     }
 
@@ -324,12 +364,12 @@ static DATE_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// 非 UTF-8 や日時パターンを含まない側がある場合は false を返す。
 fn is_date_only_change(old: &[u8], new: &[u8]) -> bool {
     if old == new {
-        return false; // そもそも同一なら date-only change ではない
+        return false; // そもそも同一なら日時だけの差分ではない
     }
     let (Ok(old_str), Ok(new_str)) = (std::str::from_utf8(old), std::str::from_utf8(new)) else {
         return false; // 非 UTF-8 は安全のため false
     };
-    // 双方に日時パターンが含まれていなければ date-only change ではない
+    // 双方に日時パターンが含まれていなければ日時だけの差分ではない
     DATE_RE.is_match(old_str)
         && DATE_RE.is_match(new_str)
         && strip_dates(old_str) == strip_dates(new_str)
@@ -376,11 +416,13 @@ fn compact_markdown(md: &str) -> String {
     let mut in_fenced_code_block = false;
     let mut fence_char = '\0';
     let mut fence_len = 0usize;
+    let mut table_state = TableState::Outside;
 
     md.lines()
         .map(|line| {
             let trimmed_start = line.trim_start();
             if let Some((marker, marker_len)) = fence_marker(trimmed_start) {
+                table_state = TableState::Outside;
                 if !in_fenced_code_block {
                     in_fenced_code_block = true;
                     fence_char = marker;
@@ -400,13 +442,32 @@ fn compact_markdown(md: &str) -> String {
 
             let trimmed = line.trim();
             if trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 1 {
-                compact_table_row(trimmed)
+                let is_separator = is_table_separator_row(trimmed);
+                let normalize_separator = table_state != TableState::Body && is_separator;
+                table_state = if normalize_separator || table_state == TableState::Body {
+                    TableState::Body
+                } else {
+                    TableState::HeaderSeen
+                };
+                if normalize_separator {
+                    compact_table_row(trimmed)
+                } else {
+                    compact_table_row_with_separator(trimmed, false)
+                }
             } else {
+                table_state = TableState::Outside;
                 line.to_string()
             }
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableState {
+    Outside,
+    HeaderSeen,
+    Body,
 }
 
 fn fence_marker(line: &str) -> Option<(char, usize)> {
@@ -434,12 +495,16 @@ fn fence_marker_after_blockquote(line: &str) -> Option<(char, usize)> {
 }
 
 fn compact_table_row(row: &str) -> String {
+    compact_table_row_with_separator(row, is_table_separator_row(row))
+}
+
+fn compact_table_row_with_separator(row: &str, normalize_separator: bool) -> String {
     let inner = &row[1..row.len() - 1];
     let cells: Vec<String> = split_unescaped_table_cells(inner)
         .into_iter()
         .map(|cell| {
             let t = cell.trim();
-            if !t.is_empty() && t.chars().all(|c| c == '-' || c == ':') {
+            if normalize_separator && is_table_separator_cell(t) {
                 // セパレータセルは配置指定だけ残す
                 let start = if t.starts_with(':') { ":" } else { "" };
                 let end = if t.ends_with(':') { ":" } else { "" };
@@ -450,6 +515,19 @@ fn compact_table_row(row: &str) -> String {
         })
         .collect();
     format!("| {} |", cells.join(" | "))
+}
+
+fn is_table_separator_row(row: &str) -> bool {
+    let inner = &row[1..row.len() - 1];
+    let cells = split_unescaped_table_cells(inner);
+    !cells.is_empty()
+        && cells
+            .iter()
+            .all(|cell| is_table_separator_cell(cell.trim()))
+}
+
+fn is_table_separator_cell(cell: &str) -> bool {
+    !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':')
 }
 
 fn split_unescaped_table_cells(inner: &str) -> Vec<&str> {
@@ -895,7 +973,9 @@ mod tests {
         assert_eq!(cli.wait, 2);
         assert_eq!(cli.timeout, 60);
         assert!(!cli.no_headless);
+        assert!(!cli.ignore_certificate_errors);
         assert!(!cli.quiet);
+        assert!(!build_launch_options(&cli).ignore_certificate_errors);
     }
 
     #[test]
@@ -915,17 +995,20 @@ mod tests {
             "60",
             "--no-headless",
             "--no-cache",
+            "--ignore-certificate-errors",
             "-q",
         ])
         .unwrap();
         assert_eq!(cli.url, "https://example.com");
         assert_eq!(cli.selector, vec!["article", ".content"]);
-        assert_eq!(cli.output.unwrap().to_str().unwrap(), "out.md");
+        assert_eq!(cli.output.as_ref().unwrap().to_str().unwrap(), "out.md");
         assert_eq!(cli.wait, 5);
         assert_eq!(cli.timeout, 60);
         assert!(cli.no_headless);
         assert!(cli.no_cache);
+        assert!(cli.ignore_certificate_errors);
         assert!(cli.quiet);
+        assert!(build_launch_options(&cli).ignore_certificate_errors);
     }
 
     #[test]
@@ -1011,6 +1094,13 @@ mod tests {
             compact_markdown("| :-------------- | --------------: | :--------------: |"),
             "| :- | -: | :-: |",
         );
+    }
+
+    #[test]
+    fn compact_table_preserves_separator_like_data_cells() {
+        let input = "| key | value |\n| --- | --- |\n| dash | -- |\n| colon | : |";
+        let expected = "| key | value |\n| - | - |\n| dash | -- |\n| colon | : |";
+        assert_eq!(compact_markdown(input), expected);
     }
 
     #[test]
@@ -1635,7 +1725,7 @@ more code
 
     #[test]
     fn file_status_new_file() {
-        let (icon, status) = file_status(Path::new("dummy"), false, &None, b"content");
+        let (icon, status) = file_status(Path::new("dummy"), false, &None, b"content", false);
         assert_eq!(icon, "✨");
         assert_eq!(status, "created");
     }
@@ -1643,7 +1733,7 @@ more code
     #[test]
     fn file_status_content_changed() {
         let old = Some(b"old content".to_vec());
-        let (icon, status) = file_status(Path::new("dummy"), true, &old, b"new content");
+        let (icon, status) = file_status(Path::new("dummy"), true, &old, b"new content", false);
         assert_eq!(icon, "📝");
         assert_eq!(status, "updated");
     }
@@ -1653,7 +1743,8 @@ more code
         // 存在しないパスなので git diff は空を返す → unchanged
         let content = b"same content";
         let old = Some(content.to_vec());
-        let (icon, status) = file_status(Path::new("/nonexistent/path"), true, &old, content);
+        let (icon, status) =
+            file_status(Path::new("/nonexistent/path"), true, &old, content, false);
         assert_eq!(icon, "✔");
         assert_eq!(status, "unchanged");
     }
@@ -1665,7 +1756,7 @@ more code
         let path = dir.join("existing.md");
         std::fs::write(&path, b"old").expect("failed to write fixture file");
 
-        let (icon, status) = file_status(path.as_path(), true, &None, b"new");
+        let (icon, status) = file_status(path.as_path(), true, &None, b"new", false);
         assert_eq!(icon, "📝");
         assert_eq!(status, "updated");
 
@@ -1712,10 +1803,36 @@ more code
         std::fs::remove_file(&path).expect("failed to delete tracked file");
 
         assert!(has_unstaged_changes(&path));
-        let (icon, status) = file_status(&path, false, &None, b"new");
+        let (icon, status) = file_status(&path, false, &None, b"new", true);
         assert_eq!(icon, "📝");
         assert_eq!(status, "updated");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_status_restored_deleted_tracked_file_same_content_is_updated() {
+        let dir = make_temp_dir("get-md-restored-deleted-status");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("tracked.md");
+
+        git(&dir, &["init"]);
+        git(&dir, &["config", "user.name", "Test User"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+
+        std::fs::write(&path, b"same").expect("failed to write tracked file");
+        git(&dir, &["add", "tracked.md"]);
+        git(&dir, &["commit", "-m", "init"]);
+
+        std::fs::remove_file(&path).expect("failed to delete tracked file");
+        let had_unstaged_changes_before = has_unstaged_changes(&path);
+        std::fs::write(&path, b"same").expect("failed to restore tracked file");
+
+        let (icon, status) = file_status(&path, false, &None, b"same", had_unstaged_changes_before);
+        assert_eq!(icon, "📝");
+        assert_eq!(status, "updated");
+
+        let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2025,6 +2142,7 @@ code
             true,
             &old,
             content,
+            false,
         );
         assert_eq!(icon, "✔");
         assert_eq!(status, "unchanged");
@@ -3662,7 +3780,7 @@ code
         let content = b"identical content";
         std::fs::write(&path, content).unwrap();
         let old = Some(content.to_vec());
-        let (icon, status) = file_status(&path, true, &old, content);
+        let (icon, status) = file_status(&path, true, &old, content, false);
         // git 管理外なので has_unstaged_changes は false → unchanged
         assert_eq!(icon, "✔");
         assert_eq!(status, "unchanged");
@@ -3674,7 +3792,7 @@ code
         // 既存内容と新内容が異なれば updated
         let path = Path::new("/tmp/get_md_test_diff.txt");
         let old = Some(b"old".to_vec());
-        let (icon, status) = file_status(path, true, &old, b"new");
+        let (icon, status) = file_status(path, true, &old, b"new", false);
         assert_eq!(icon, "📝");
         assert_eq!(status, "updated");
     }
@@ -3938,7 +4056,7 @@ code
         assert!(path.exists()); // 作成後はファイルが存在する
 
         // file_existed_before=false で呼べば "created" になること
-        let (icon, status) = file_status(&path, false, &None, content);
+        let (icon, status) = file_status(&path, false, &None, content, false);
         assert_eq!(icon, "✨");
         assert_eq!(status, "created");
 
@@ -3965,7 +4083,7 @@ code
         let new = b"new content";
         std::fs::write(&path, new).unwrap();
 
-        let (icon, status) = file_status(&path, true, &Some(old.to_vec()), new);
+        let (icon, status) = file_status(&path, true, &Some(old.to_vec()), new, false);
         assert_eq!(icon, "📝");
         assert_eq!(status, "updated");
 
