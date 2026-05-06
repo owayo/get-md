@@ -564,8 +564,14 @@ fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
 
     let mut result = String::with_capacity(md.len());
     let mut cursor = 0usize;
+    // ループをまたいで、cursor 以前のコード領域外で未閉鎖の `[` を引き継ぐ。
+    // これにより `[![inner](img)](outer)` のように外側 `[` が cursor より前に
+    // ある場合でも、後続走査で外側リンクを認識できる。
+    let mut pending_open_brackets: usize = 0;
 
-    while let Some(open) = find_next_link_candidate(md, cursor) {
+    while let (Some(open), open_count_at_link) =
+        find_next_link_candidate(md, cursor, pending_open_brackets)
+    {
         let inside_start = open + 2;
 
         result.push_str(&md[cursor..inside_start]);
@@ -609,6 +615,8 @@ fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
             // 既に `cursor..inside_start` は結果に書き込み済みなので二重出力にはならない。
             cursor = inside_start;
         }
+        // リンクとして認識された `]` 1 つ分のペアを除外し、残った未閉鎖 `[` を引き継ぐ。
+        pending_open_brackets = open_count_at_link.saturating_sub(1);
     }
 
     result.push_str(&md[cursor..]);
@@ -639,13 +647,24 @@ fn unescape_markdown_destination(url: &str) -> String {
 }
 
 /// フェンスコードブロックとインラインコードを除外しつつ、次の `](` を探す。
-fn find_next_link_candidate(md: &str, start: usize) -> Option<usize> {
+///
+/// コード領域外で開いている `[` を前方走査でカウントし、エスケープされた
+/// `\]` `\`` `\[` を正しくリテラルとして扱う。`initial_open_brackets` は
+/// `start` 位置より前から引き継いだ未閉鎖 `[` の数（外側リンク対応のため）。
+/// 戻り値は `(](`の位置, 検出時点の未閉鎖 `[` 数)`。
+fn find_next_link_candidate(
+    md: &str,
+    start: usize,
+    initial_open_brackets: usize,
+) -> (Option<usize>, usize) {
     let mut cursor = start;
     let mut line_start = start == 0 || md[..start].ends_with('\n');
     let mut in_fenced_code_block = false;
     let mut fence_char = '\0';
     let mut fence_len = 0usize;
     let mut inline_code_len = 0usize;
+    // コード領域外で未閉鎖の `[` の数を追跡する。`]` で減算する。
+    let mut open_bracket_count: usize = initial_open_brackets;
 
     while cursor < md.len() {
         if line_start && inline_code_len == 0 {
@@ -675,35 +694,73 @@ fn find_next_link_candidate(md: &str, start: usize) -> Option<usize> {
         }
 
         let rest = &md[cursor..];
-        if !in_fenced_code_block
-            && inline_code_len == 0
-            && rest.starts_with("](")
-            && has_opening_link_bracket(md, cursor)
-        {
-            return Some(cursor);
+
+        // フェンスコード内は内容を解釈せずに 1 文字ずつ進める
+        if in_fenced_code_block {
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            cursor += ch.len_utf8();
+            if ch == '\n' {
+                line_start = true;
+            }
+            continue;
         }
 
-        if !in_fenced_code_block && rest.starts_with('`') {
-            let tick_len = rest.chars().take_while(|c| *c == '`').count();
-            if inline_code_len == 0 {
-                if has_matching_inline_code_closer(md, cursor + tick_len, tick_len) {
-                    inline_code_len = tick_len;
+        // インラインコード内は同じ長さのバッククォート列で閉じる
+        if inline_code_len > 0 {
+            if rest.starts_with('`') {
+                let tick_len = rest.chars().take_while(|c| *c == '`').count();
+                if tick_len == inline_code_len {
+                    inline_code_len = 0;
                 }
-            } else if tick_len == inline_code_len {
-                inline_code_len = 0;
+                cursor += tick_len;
+                continue;
+            }
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            cursor += ch.len_utf8();
+            if ch == '\n' {
+                line_start = true;
+            }
+            continue;
+        }
+
+        // `](` の検出: `]` がエスケープされておらず、対応する `[` が開いている場合のみ
+        if rest.starts_with("](") && !is_escaped_markdown_char(md, cursor) && open_bracket_count > 0
+        {
+            return (Some(cursor), open_bracket_count);
+        }
+
+        // バッククォート: エスケープされていない場合のみインラインコード開始候補
+        if rest.starts_with('`') && !is_escaped_markdown_char(md, cursor) {
+            let tick_len = rest.chars().take_while(|c| *c == '`').count();
+            if has_matching_inline_code_closer(md, cursor + tick_len, tick_len) {
+                inline_code_len = tick_len;
             }
             cursor += tick_len;
             continue;
         }
 
-        let ch = rest.chars().next()?;
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        // コード領域外で、エスケープされていない `[` `]` をカウントする
+        if !is_escaped_markdown_char(md, cursor) {
+            if ch == '[' {
+                open_bracket_count = open_bracket_count.saturating_add(1);
+            } else if ch == ']' && open_bracket_count > 0 {
+                open_bracket_count -= 1;
+            }
+        }
         cursor += ch.len_utf8();
         if ch == '\n' {
             line_start = true;
         }
     }
 
-    None
+    (None, open_bracket_count)
 }
 
 /// 開始位置より後ろに、同じ長さのバッククォート列が存在するかを調べる。
@@ -726,37 +783,6 @@ fn has_matching_inline_code_closer(md: &str, start: usize, tick_len: usize) -> b
 
         let ch = rest.chars().next().expect("cursor は文字境界上にある");
         cursor += ch.len_utf8();
-    }
-
-    false
-}
-
-/// `](` の直前に、対応する未エスケープの `[` があるかを調べる。
-fn has_opening_link_bracket(md: &str, close_bracket: usize) -> bool {
-    let mut cursor = close_bracket;
-    let mut nested_closing_brackets = 0usize;
-
-    while cursor > 0 {
-        let (idx, ch) = md[..cursor]
-            .char_indices()
-            .next_back()
-            .expect("cursor は文字境界上にある");
-        cursor = idx;
-
-        if is_escaped_markdown_char(md, idx) {
-            continue;
-        }
-
-        match ch {
-            ']' => nested_closing_brackets += 1,
-            '[' => {
-                if nested_closing_brackets == 0 {
-                    return true;
-                }
-                nested_closing_brackets -= 1;
-            }
-            _ => {}
-        }
     }
 
     false
@@ -898,6 +924,12 @@ fn find_link_close_paren(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// テスト用の `find_next_link_candidate` ラッパー。
+    /// テストでは引き継ぎ状態を 0 で固定し、位置のみを返す。
+    fn find_next_link_candidate(md: &str, start: usize) -> Option<usize> {
+        super::find_next_link_candidate(md, start, 0).0
+    }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -2323,44 +2355,6 @@ code
         assert!(!is_escaped_markdown_char("a", 0));
     }
 
-    // has_opening_link_bracket のテスト
-
-    #[test]
-    fn opening_bracket_simple() {
-        // `[text]` の `]` 位置 (5) に対応する `[` がある
-        assert!(has_opening_link_bracket("[text]", 5));
-    }
-
-    #[test]
-    fn opening_bracket_missing() {
-        // `]` だけで `[` がない
-        assert!(!has_opening_link_bracket("text]", 4));
-    }
-
-    #[test]
-    fn opening_bracket_escaped() {
-        // `\[text]` の `[` はエスケープされているので対応する開き括弧なし
-        assert!(!has_opening_link_bracket(r"\[text]", 6));
-    }
-
-    #[test]
-    fn opening_bracket_nested() {
-        // `[outer [inner]]` の外側の `]` (位置 14) に対応する `[` がある
-        assert!(has_opening_link_bracket("[outer [inner]]", 14));
-    }
-
-    #[test]
-    fn opening_bracket_image() {
-        // `![alt]` の `]` 位置 (5) に対応する `[` がある（`!` は無関係）
-        assert!(has_opening_link_bracket("![alt]", 5));
-    }
-
-    #[test]
-    fn opening_bracket_at_start() {
-        // `]` が先頭の場合、対応する `[` がない
-        assert!(!has_opening_link_bracket("]", 0));
-    }
-
     // find_next_link_candidate のテスト
 
     #[test]
@@ -2687,16 +2681,6 @@ code
         assert_eq!(result, "[section](https://example.com/page#heading)");
     }
 
-    // --- has_opening_link_bracket 追加エッジケース ---
-
-    #[test]
-    fn opening_bracket_deeply_nested() {
-        // 深いネストの括弧
-        let md = "[a[b[c]d]e](url)";
-        // `]` は位置 10
-        assert!(has_opening_link_bracket(md, 10));
-    }
-
     // --- split_link_destination 追加エッジケース ---
 
     #[test]
@@ -2763,14 +2747,6 @@ code
         // [link](#) はフラグメントのみ — ベースURLにフラグメント付与
         let result = resolve_markdown_urls("[link](#)", BASE);
         assert!(result.contains("#"));
-    }
-
-    // --- has_opening_link_bracket 位置ゼロ テスト ---
-
-    #[test]
-    fn opening_bracket_position_zero_not_found() {
-        // close_bracket が 0 の場合、while cursor > 0 に入らず false
-        assert!(!has_opening_link_bracket("](url)", 0));
     }
 
     // --- find_link_close_paren タイトル内特殊文字 ---
@@ -3001,22 +2977,6 @@ code
     fn compact_markdown_single_line_no_newline() {
         // 改行なしの単一行入力
         assert_eq!(compact_markdown("just text"), "just text");
-    }
-
-    // --- has_opening_link_bracket 追加テスト ---
-
-    #[test]
-    fn opening_bracket_empty_string() {
-        // 空文字列の位置 0 で検索（`]` がない）
-        assert!(!has_opening_link_bracket("", 0));
-    }
-
-    #[test]
-    fn opening_bracket_consecutive_brackets() {
-        // `[[text]](`  — ネストした `]` を正しくカウントする
-        let md = "[[text]](";
-        // close_bracket は外側の `]` の位置 (7)
-        assert!(has_opening_link_bracket(md, 7));
     }
 
     // --- find_next_link_candidate 追加テスト ---
@@ -3321,14 +3281,6 @@ code
     }
 
     #[test]
-    fn has_opening_link_bracket_with_image_prefix() {
-        // `![` も正しく検出される（`[` を見つければ十分）
-        let md = "![alt](url)";
-        // `]` は index 5
-        assert!(has_opening_link_bracket(md, 5));
-    }
-
-    #[test]
     fn idle_browser_timeout_typical_value() {
         // 一般的な 60 秒タイムアウトのバッファ確認
         assert_eq!(idle_browser_timeout(60), Duration::from_secs(90));
@@ -3480,16 +3432,6 @@ code
         assert!(pos.is_some());
         let after = &md[pos.unwrap()..];
         assert!(after.starts_with("](d)"));
-    }
-
-    // --- has_opening_link_bracket の追加テスト ---
-
-    #[test]
-    fn opening_bracket_all_escaped() {
-        // 全ての `[` がエスケープ済みの場合は false
-        let md = r"text \[not a link](url)";
-        // `]` は index 17
-        assert!(!has_opening_link_bracket(md, 17));
     }
 
     // --- is_escaped_markdown_char の追加テスト ---
@@ -3956,20 +3898,6 @@ code
     fn escaped_char_five_backslashes() {
         // 奇数個（5個）のバックスラッシュ → エスケープ
         assert!(is_escaped_markdown_char(r"\\\\\[", 5));
-    }
-
-    // --- has_opening_link_bracket: 追加エッジケース ---
-
-    #[test]
-    fn opening_bracket_with_single_char_text() {
-        // 1文字のリンクテキスト
-        assert!(has_opening_link_bracket("[a](url)", 2));
-    }
-
-    #[test]
-    fn opening_bracket_multiple_nested_closing() {
-        // 複数のネストした閉じ括弧（] の位置は 9）
-        assert!(has_opening_link_bracket("[a[b]c[d]](url)", 9));
     }
 
     // --- find_link_close_paren: 追加エッジケース ---
@@ -4491,5 +4419,29 @@ code
         // ブロッククォート内のフェンスコード内のテーブル行はそのまま保持
         let input = "> ```\n> | padded   | table   |\n> ```";
         assert_eq!(compact_markdown(input), input);
+    }
+
+    // --- 検証用: codex 指摘 ---
+
+    #[test]
+    fn repro_escaped_close_bracket() {
+        // `]` がエスケープされている場合、リンクとして扱ってはならない
+        let input = r"[x\](./a)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn repro_link_after_escaped_backtick() {
+        // 先頭の `\`` はリテラルなので、後続のリンクは解決される
+        let input = r"\` [link](./a) `";
+        let expected = r"\` [link](https://example.com/docs/en/a) `";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn repro_open_bracket_inside_inline_code() {
+        // インラインコード内の `[` は開き括弧として扱ってはならない
+        let input = "`[`](./a)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
     }
 }
