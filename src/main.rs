@@ -665,6 +665,8 @@ fn find_next_link_candidate(
     let mut inline_code_len = 0usize;
     // コード領域外で未閉鎖の `[` の数を追跡する。`]` で減算する。
     let mut open_bracket_count: usize = initial_open_brackets;
+    // 直前の連続したバックスラッシュの数。エスケープ判定を O(1) で行うために保持する。
+    let mut backslash_run: usize = 0;
 
     while cursor < md.len() {
         if line_start && inline_code_len == 0 {
@@ -688,6 +690,7 @@ fn find_next_link_candidate(
                     cursor += 1;
                 }
                 line_start = true;
+                backslash_run = 0;
                 continue;
             }
             line_start = false;
@@ -704,6 +707,7 @@ fn find_next_link_candidate(
             if ch == '\n' {
                 line_start = true;
             }
+            backslash_run = 0;
             continue;
         }
 
@@ -715,6 +719,7 @@ fn find_next_link_candidate(
                     inline_code_len = 0;
                 }
                 cursor += tick_len;
+                backslash_run = 0;
                 continue;
             }
             let Some(ch) = rest.chars().next() else {
@@ -724,22 +729,25 @@ fn find_next_link_candidate(
             if ch == '\n' {
                 line_start = true;
             }
+            backslash_run = 0;
             continue;
         }
 
+        let escaped = backslash_run % 2 == 1;
+
         // `](` の検出: `]` がエスケープされておらず、対応する `[` が開いている場合のみ
-        if rest.starts_with("](") && !is_escaped_markdown_char(md, cursor) && open_bracket_count > 0
-        {
+        if rest.starts_with("](") && !escaped && open_bracket_count > 0 {
             return (Some(cursor), open_bracket_count);
         }
 
         // バッククォート: エスケープされていない場合のみインラインコード開始候補
-        if rest.starts_with('`') && !is_escaped_markdown_char(md, cursor) {
+        if rest.starts_with('`') && !escaped {
             let tick_len = rest.chars().take_while(|c| *c == '`').count();
             if has_matching_inline_code_closer(md, cursor + tick_len, tick_len) {
                 inline_code_len = tick_len;
             }
             cursor += tick_len;
+            backslash_run = 0;
             continue;
         }
 
@@ -747,12 +755,17 @@ fn find_next_link_candidate(
             break;
         };
         // コード領域外で、エスケープされていない `[` `]` をカウントする
-        if !is_escaped_markdown_char(md, cursor) {
+        if !escaped {
             if ch == '[' {
                 open_bracket_count = open_bracket_count.saturating_add(1);
             } else if ch == ']' && open_bracket_count > 0 {
                 open_bracket_count -= 1;
             }
+        }
+        if ch == '\\' {
+            backslash_run += 1;
+        } else {
+            backslash_run = 0;
         }
         cursor += ch.len_utf8();
         if ch == '\n' {
@@ -789,6 +802,10 @@ fn has_matching_inline_code_closer(md: &str, start: usize, tick_len: usize) -> b
 }
 
 /// 指定位置の Markdown 記号が、直前のバックスラッシュでエスケープされているかを調べる。
+///
+/// 本体の `find_next_link_candidate` は前方走査中に `backslash_run` を
+/// 保持して O(1) で判定するため、現在は単体テストのみで参照する。
+#[cfg(test)]
 fn is_escaped_markdown_char(md: &str, idx: usize) -> bool {
     let bytes = md.as_bytes();
     let mut cursor = idx;
@@ -4421,27 +4438,63 @@ code
         assert_eq!(compact_markdown(input), input);
     }
 
-    // --- 検証用: codex 指摘 ---
+    // --- リンク検出のエスケープ・コード領域 回帰テスト ---
 
     #[test]
-    fn repro_escaped_close_bracket() {
-        // `]` がエスケープされている場合、リンクとして扱ってはならない
+    fn resolve_escaped_close_bracket_is_not_link() {
+        // `\]` でエスケープされた `]` をリンク終端として扱ってはならない。
         let input = r"[x\](./a)";
         assert_eq!(resolve_markdown_urls(input, BASE), input);
     }
 
     #[test]
-    fn repro_link_after_escaped_backtick() {
-        // 先頭の `\`` はリテラルなので、後続のリンクは解決される
+    fn resolve_link_after_escaped_backtick() {
+        // 先頭の `\`` はリテラルなので、後続のリンクは解決される。
         let input = r"\` [link](./a) `";
         let expected = r"\` [link](https://example.com/docs/en/a) `";
         assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
     #[test]
-    fn repro_open_bracket_inside_inline_code() {
-        // インラインコード内の `[` は開き括弧として扱ってはならない
+    fn resolve_open_bracket_inside_inline_code_is_not_link() {
+        // インラインコード内の `[` は開き括弧としてカウントしない。
         let input = "`[`](./a)";
         assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_even_backslashes_before_close_bracket_is_link() {
+        // 偶数個のバックスラッシュは打ち消し合い、`]` はエスケープされない。
+        // `\\\\](url)` → `\\\\` の後の `]` は通常のリンク終端。
+        let input = r"[x\\](./a)";
+        let expected = r"[x\\](https://example.com/docs/en/a)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_escaped_open_bracket_does_not_open_link() {
+        // `\[` でエスケープされた `[` は開き括弧としてカウントしない。
+        // → `](./a)` の前に開き `[` がない扱いになる。
+        let input = r"\[x](./a)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_long_backslash_run_then_link() {
+        // 直前に長いバックスラッシュ列があってもエスケープ判定が O(1) で
+        // 動作することを保証する（バックトラックなし）。
+        let mut input = String::new();
+        for _ in 0..1000 {
+            input.push('\\');
+        }
+        // `\\` を 1000 個 (偶数) → 直後の `]` はエスケープされない。
+        // 開き `[` がないのでリンクではない。
+        let no_open = format!("{input}](./a)");
+        assert_eq!(resolve_markdown_urls(&no_open, BASE), no_open);
+
+        // 開き `[` があり、偶数個のバックスラッシュ後の `]` は通常のリンク終端。
+        let with_open = format!("[x{input}](./a)");
+        let expected_with_open = format!("[x{input}](https://example.com/docs/en/a)");
+        assert_eq!(resolve_markdown_urls(&with_open, BASE), expected_with_open);
     }
 }
