@@ -666,7 +666,15 @@ fn find_next_link_candidate(
     // コード領域外で未閉鎖の `[` の数を追跡する。`]` で減算する。
     let mut open_bracket_count: usize = initial_open_brackets;
     // 直前の連続したバックスラッシュの数。エスケープ判定を O(1) で行うために保持する。
-    let mut backslash_run: usize = 0;
+    // `start` 位置以前のバックスラッシュ列も引き継ぐことで、途中再開時も
+    // 旧 `is_escaped_markdown_char(md, start)` と等価な判定になる。
+    // UTF-8 の継続バイトは 0x80-0xBF なので 0x5C(`\`) と衝突せず、
+    // バイト列の末尾を逆走査するだけで安全に数えられる。
+    let mut backslash_run: usize = md.as_bytes()[..start]
+        .iter()
+        .rev()
+        .take_while(|&&b| b == b'\\')
+        .count();
 
     while cursor < md.len() {
         if line_start && inline_code_len == 0 {
@@ -4496,5 +4504,29 @@ code
         let with_open = format!("[x{input}](./a)");
         let expected_with_open = format!("[x{input}](https://example.com/docs/en/a)");
         assert_eq!(resolve_markdown_urls(&with_open, BASE), expected_with_open);
+    }
+
+    #[test]
+    fn link_candidate_resume_after_backslash_is_escaped() {
+        // start 位置以前のバックスラッシュ列を引き継ぐことを保証する。
+        // 旧実装の `is_escaped_markdown_char(md, start)` と等価でなければならない。
+        // `[x\](./a)` の `]`(=index 3) から再開した場合、直前の `\` で
+        // `]` がエスケープされている扱いになり、リンク候補ではない。
+        let md = r"[x\](./a)";
+        let (pos, count) = super::find_next_link_candidate(md, 3, 1);
+        assert_eq!(pos, None);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn link_candidate_resume_after_even_backslashes_is_link() {
+        // 偶数個のバックスラッシュ列の直後から再開した場合は、
+        // バックスラッシュは打ち消し合い、`]` はエスケープされない。
+        // `[x\\](./a)` の `]`(=index 4) から再開すると、直前 2 個の `\` は
+        // 打ち消し合うため、`](`はリンク候補となる。
+        let md = r"[x\\](./a)";
+        let (pos, count) = super::find_next_link_candidate(md, 4, 1);
+        assert_eq!(pos, Some(4));
+        assert_eq!(count, 1);
     }
 }
