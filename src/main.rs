@@ -4529,4 +4529,45 @@ code
         assert_eq!(pos, Some(4));
         assert_eq!(count, 1);
     }
+
+    #[test]
+    fn link_candidate_resume_treats_escaped_open_bracket_as_literal() {
+        // 再開位置直前の `\` で `[` がエスケープされる場合、
+        // 開き括弧としてカウントしないことを確認する。
+        // `\[x](./a)` の `[`(=index 1) から再開すると、直前の `\` で
+        // エスケープされ、開き括弧は増えない。`](` の前に開き `[` がない
+        // ためリンク候補にならない。
+        let md = r"\[x](./a)";
+        let (pos, count) = super::find_next_link_candidate(md, 1, 0);
+        assert_eq!(pos, None);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn link_candidate_resume_treats_escaped_backtick_as_literal() {
+        // 再開位置直前の `\` で `` ` `` がエスケープされる場合、
+        // インラインコード開始としてカウントしないことを確認する。
+        // `\`` の `` ` ``(=index 1) から再開すると、直前の `\` でエスケープされ、
+        // インラインコード扱いにならず、後続の `[link](./a)` は通常通り検出される。
+        let md = r"\`[link](./a)";
+        let (pos, count) = super::find_next_link_candidate(md, 1, 0);
+        // `]( の位置 = 6 (index of `]` in `\\\`[link](./a)` => `[` at 2, link at 3..6, `]` at 7)
+        // 実際には `\` (1byte) + `` ` `` (1byte) + `[` (1byte) + `link` (4byte) = index 7 が `]`
+        assert_eq!(pos, Some(7));
+        assert!(count >= 1);
+    }
+
+    #[test]
+    fn link_candidate_resume_after_multibyte_char_is_safe() {
+        // 再開位置直前がマルチバイト文字の場合でも、
+        // バイト列の継続バイト (0x80-0xBF) は `\` (0x5C) と衝突せず安全。
+        // `あ[x](./a)` で `[` の手前 (= 3, あの直後) から再開する。
+        let md = "あ[x](./a)";
+        // "あ" は UTF-8 で 3 バイト
+        let start = "あ".len();
+        let (pos, count) = super::find_next_link_candidate(md, start, 0);
+        // `]` の位置は あ(3) + [(1) + x(1) = 5
+        assert_eq!(pos, Some(5));
+        assert_eq!(count, 1);
+    }
 }
