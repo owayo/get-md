@@ -585,22 +585,10 @@ fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
             if !url.is_empty() {
                 match base.join(&resolved_input) {
                     Ok(resolved) => {
-                        if use_angle_brackets {
-                            result.push('<');
-                            result.push_str(resolved.as_str());
-                            result.push('>');
-                        } else {
-                            result.push_str(resolved.as_str());
-                        }
+                        write_resolved_url(&mut result, resolved.as_str(), use_angle_brackets);
                     }
                     Err(_) => {
-                        if use_angle_brackets {
-                            result.push('<');
-                            result.push_str(url);
-                            result.push('>');
-                        } else {
-                            result.push_str(url);
-                        }
+                        write_resolved_url(&mut result, url, use_angle_brackets);
                     }
                 }
             } else if use_angle_brackets {
@@ -621,6 +609,43 @@ fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
 
     result.push_str(&md[cursor..]);
     result
+}
+
+/// 解決済みの URL を Markdown リンク先として書き出す。
+///
+/// 標準形式の場合に `(` と `)` のバランスが崩れていると Markdown リンクが壊れるため、
+/// アンバランスなパーレンを含む URL は山括弧形式 `<...>` に切り替えて出力する。
+/// 山括弧形式が指定されている場合は常に `<...>` で出力する。
+fn write_resolved_url(out: &mut String, url: &str, use_angle_brackets: bool) {
+    let needs_angle = use_angle_brackets || !url_has_balanced_parens(url);
+    if needs_angle {
+        out.push('<');
+        out.push_str(url);
+        out.push('>');
+    } else {
+        out.push_str(url);
+    }
+}
+
+/// URL 文字列の `(` と `)` がバランスしているかを判定する。
+///
+/// CommonMark の標準形式リンク先ではアンバランスなパーレンは許容されないため、
+/// アンバランスな場合は山括弧形式に切り替える必要がある。
+fn url_has_balanced_parens(url: &str) -> bool {
+    let mut depth: i32 = 0;
+    for c in url.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// Markdown リンク先に含まれる最小限のバックスラッシュエスケープを
@@ -1351,6 +1376,28 @@ mod tests {
         assert_eq!(
             resolve_markdown_urls("[wiki](/wiki/Rust_(language))", BASE),
             "[wiki](https://example.com/wiki/Rust_(language))",
+        );
+    }
+
+    #[test]
+    fn resolve_relative_link_with_unbalanced_open_paren_in_base_uses_angle_brackets() {
+        assert_eq!(
+            resolve_markdown_urls(
+                "[link](./next.md)",
+                "https://example.com/docs/(draft/page.md"
+            ),
+            "[link](<https://example.com/docs/(draft/next.md>)",
+        );
+    }
+
+    #[test]
+    fn resolve_relative_link_with_unbalanced_close_paren_in_base_uses_angle_brackets() {
+        assert_eq!(
+            resolve_markdown_urls(
+                "[link](./next.md)",
+                "https://example.com/docs/draft)/page.md"
+            ),
+            "[link](<https://example.com/docs/draft)/next.md>)",
         );
     }
 
@@ -4551,7 +4598,8 @@ code
         // インラインコード扱いにならず、後続の `[link](./a)` は通常通り検出される。
         let md = r"\`[link](./a)";
         let (pos, count) = super::find_next_link_candidate(md, 1, 0);
-        // `]( の位置 = 6 (index of `]` in `\\\`[link](./a)` => `[` at 2, link at 3..6, `]` at 7)
+        // `](` の位置は index 7。
+        // `[` が index 2、link が index 3..6、`]` が index 7 にある。
         // 実際には `\` (1byte) + `` ` `` (1byte) + `[` (1byte) + `link` (4byte) = index 7 が `]`
         assert_eq!(pos, Some(7));
         assert!(count >= 1);
