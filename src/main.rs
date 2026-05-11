@@ -1094,6 +1094,27 @@ mod tests {
     }
 
     #[test]
+    fn launch_options_follow_cli_browser_settings() {
+        let cli = Cli::try_parse_from([
+            "get-md",
+            "https://example.com",
+            "--chrome-path",
+            "/usr/bin/chromium",
+            "--no-headless",
+            "--ignore-certificate-errors",
+            "--timeout",
+            "45",
+        ])
+        .unwrap();
+
+        let options = build_launch_options(&cli);
+        assert!(!options.headless);
+        assert_eq!(options.path, Some(PathBuf::from("/usr/bin/chromium")));
+        assert_eq!(options.idle_browser_timeout, Duration::from_secs(75));
+        assert!(options.ignore_certificate_errors);
+    }
+
+    #[test]
     fn cli_missing_url_fails() {
         assert!(Cli::try_parse_from(["get-md"]).is_err());
     }
