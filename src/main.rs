@@ -421,22 +421,23 @@ fn compact_markdown(md: &str) -> String {
     md.lines()
         .map(|line| {
             let trimmed_start = line.trim_start();
-            if let Some((marker, marker_len)) = fence_marker(trimmed_start) {
-                table_state = TableState::Outside;
-                if !in_fenced_code_block {
-                    in_fenced_code_block = true;
-                    fence_char = marker;
-                    fence_len = marker_len;
-                    return line.to_string();
-                }
-                if marker == fence_char && marker_len >= fence_len {
+            if in_fenced_code_block {
+                // フェンス内では info string 付きのマーカーを閉じ扱いしない。
+                // 閉じフェンスはマーカー以降が空白/タブのみでなければならない。
+                if is_closing_fence_line(trimmed_start, fence_char, fence_len) {
                     in_fenced_code_block = false;
                     fence_char = '\0';
                     fence_len = 0;
+                    table_state = TableState::Outside;
                     return line.to_string();
                 }
+                return line.to_string();
             }
-            if in_fenced_code_block {
+            if let Some((marker, marker_len)) = fence_marker(trimmed_start) {
+                table_state = TableState::Outside;
+                in_fenced_code_block = true;
+                fence_char = marker;
+                fence_len = marker_len;
                 return line.to_string();
             }
 
@@ -480,18 +481,50 @@ fn fence_marker(line: &str) -> Option<(char, usize)> {
     if len >= 3 { Some((marker, len)) } else { None }
 }
 
+/// 閉じフェンスとして妥当な行か判定する。
+///
+/// CommonMark 仕様では、閉じフェンスは「同じ種類のマーカーで開始時と同じ長さ以上」かつ
+/// 「マーカー以降は空白/タブのみ」でなければならない。info string 付きの行
+/// (例: ` ```rust `) を閉じフェンスとして誤認するとフェンス内コンテンツに対して
+/// テーブル圧縮や URL 解決が誤って実行されるため、閉じ判定時はこの関数を使う。
+fn is_closing_fence_line(line: &str, marker: char, min_len: usize) -> bool {
+    // 行末の CR は line ending の一部。`find_next_link_candidate` 側は `\n` で
+    // 分割するため `\r` が残り得るので、判定前に落として CRLF 入力でも閉じ判定が
+    // 成立するようにする。
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let Some((found_marker, found_len)) = fence_marker(line) else {
+        return false;
+    };
+    if found_marker != marker || found_len < min_len {
+        return false;
+    }
+    line.chars().skip(found_len).all(|c| c == ' ' || c == '\t')
+}
+
 /// ブロッククォート記号を取り除いた位置にあるフェンスマーカーを検出する。
 fn fence_marker_after_blockquote(line: &str) -> Option<(char, usize)> {
-    let mut rest = line.trim_start();
+    strip_blockquote_markers(line).and_then(fence_marker)
+}
 
+/// 行頭のインデントとブロッククォート記号 (`>`) を取り除いた残りを返す。
+/// `fence_marker_after_blockquote` と `is_closing_fence_after_blockquote` で共通化。
+fn strip_blockquote_markers(line: &str) -> Option<&str> {
+    let mut rest = line.trim_start();
     while let Some(after_marker) = rest.strip_prefix('>') {
         rest = after_marker
             .strip_prefix(' ')
             .unwrap_or(after_marker)
             .trim_start();
     }
+    Some(rest)
+}
 
-    fence_marker(rest)
+/// `fence_marker_after_blockquote` で得たマーカーが閉じフェンスとして妥当か判定する。
+fn is_closing_fence_after_blockquote(line: &str, marker: char, min_len: usize) -> bool {
+    let Some(rest) = strip_blockquote_markers(line) else {
+        return false;
+    };
+    is_closing_fence_line(rest, marker, min_len)
 }
 
 fn compact_table_row(row: &str) -> String {
@@ -708,16 +741,22 @@ fn find_next_link_candidate(
                 .map(|offset| cursor + offset)
                 .unwrap_or(md.len());
             let line = &md[cursor..line_end];
-            if let Some((marker, marker_len)) = fence_marker_after_blockquote(line) {
-                if !in_fenced_code_block {
-                    in_fenced_code_block = true;
-                    fence_char = marker;
-                    fence_len = marker_len;
-                } else if marker == fence_char && marker_len >= fence_len {
+            let mut handled_as_fence = false;
+            if in_fenced_code_block {
+                // 閉じフェンスは marker 以降が空白/タブのみのときだけ閉じる。
+                if is_closing_fence_after_blockquote(line, fence_char, fence_len) {
                     in_fenced_code_block = false;
                     fence_char = '\0';
                     fence_len = 0;
                 }
+                handled_as_fence = true;
+            } else if let Some((marker, marker_len)) = fence_marker_after_blockquote(line) {
+                in_fenced_code_block = true;
+                fence_char = marker;
+                fence_len = marker_len;
+                handled_as_fence = true;
+            }
+            if handled_as_fence {
                 cursor = line_end;
                 if cursor < md.len() {
                     cursor += 1;
@@ -4638,5 +4677,248 @@ code
         // `]` の位置は あ(3) + [(1) + x(1) = 5
         assert_eq!(pos, Some(5));
         assert_eq!(count, 1);
+    }
+
+    // --- is_closing_fence_line の直接テスト ---
+
+    #[test]
+    fn closing_fence_line_pure_marker_only() {
+        // マーカーのみは閉じフェンスとして妥当
+        assert!(is_closing_fence_line("```", '`', 3));
+        assert!(is_closing_fence_line("~~~", '~', 3));
+    }
+
+    #[test]
+    fn closing_fence_line_trailing_spaces_only_allowed() {
+        // マーカー後の空白/タブのみは閉じフェンスとして妥当
+        assert!(is_closing_fence_line("```   ", '`', 3));
+        assert!(is_closing_fence_line("```\t\t", '`', 3));
+    }
+
+    #[test]
+    fn closing_fence_line_rejects_info_string() {
+        // CommonMark 仕様: 閉じフェンスは info string を含んではならない
+        assert!(!is_closing_fence_line("```rust", '`', 3));
+        assert!(!is_closing_fence_line("```python ", '`', 3));
+        assert!(!is_closing_fence_line("~~~text", '~', 3));
+    }
+
+    #[test]
+    fn closing_fence_line_rejects_shorter_marker() {
+        // 開始フェンスより短いマーカーは閉じない
+        assert!(!is_closing_fence_line("``", '`', 3));
+        assert!(!is_closing_fence_line("```", '`', 4));
+    }
+
+    #[test]
+    fn closing_fence_line_accepts_longer_marker() {
+        // 開始フェンスより長いマーカーは閉じる
+        assert!(is_closing_fence_line("`````", '`', 3));
+        assert!(is_closing_fence_line("`````   ", '`', 3));
+    }
+
+    #[test]
+    fn closing_fence_line_rejects_different_marker_char() {
+        // 異なるマーカー文字では閉じない
+        assert!(!is_closing_fence_line("~~~", '`', 3));
+        assert!(!is_closing_fence_line("```", '~', 3));
+    }
+
+    // --- is_closing_fence_after_blockquote の直接テスト ---
+
+    #[test]
+    fn closing_fence_after_blockquote_with_marker_only() {
+        // ブロッククォート記号 + マーカーのみは閉じフェンスとして妥当
+        assert!(is_closing_fence_after_blockquote("> ```", '`', 3));
+        assert!(is_closing_fence_after_blockquote(">> ~~~", '~', 3));
+    }
+
+    #[test]
+    fn closing_fence_after_blockquote_rejects_info_string() {
+        // ブロッククォート内でも info string 付きは閉じフェンスにしない
+        assert!(!is_closing_fence_after_blockquote("> ```rust", '`', 3));
+        assert!(!is_closing_fence_after_blockquote(">> ```py", '`', 3));
+    }
+
+    // --- compact_markdown: info string 付きの行を閉じフェンスとして誤認しない回帰テスト ---
+
+    #[test]
+    fn compact_markdown_does_not_close_fence_on_info_string_line() {
+        // フェンス内の info string 付き行 (例: ```python) を閉じフェンスとして
+        // 誤認すると、その後のテーブル行が圧縮対象になってしまう。
+        let input = "\
+```
+```rust
+| inside  | fence  |
+```
+| outside  | fence  |";
+        // 修正後: ```rust は閉じフェンスではない → 最初の ``` だけがフェンスを閉じる
+        // ↓ "```" がフェンスを開き、"```rust" はコード内、"| inside  | fence  |" もコード内、
+        //   "```" がフェンスを閉じ、"| outside  | fence  |" が圧縮される
+        let expected = "\
+```
+```rust
+| inside  | fence  |
+```
+| outside | fence |";
+        assert_eq!(compact_markdown(input), expected);
+    }
+
+    #[test]
+    fn compact_markdown_does_not_close_fence_on_info_string_then_compress_outer_table() {
+        // フェンス内の info string 付き行 (```python) を閉じフェンスとして扱わず、
+        // 外側のテーブル行のみ圧縮されることを確認する。
+        let input = "\
+```
+```python
+inside-of-fence
+```
+| outside  | table  |";
+        let expected = "\
+```
+```python
+inside-of-fence
+```
+| outside | table |";
+        assert_eq!(compact_markdown(input), expected);
+    }
+
+    // --- resolve_markdown_urls: info string 付きの行を閉じフェンスとして誤認しない回帰テスト ---
+
+    #[test]
+    fn resolve_markdown_urls_does_not_close_fence_on_info_string_line() {
+        // フェンス内の info string 付き行 (```rust) を閉じフェンスとして
+        // 誤認するとフェンス内のリンクが URL 解決対象になってしまう。
+        let input = "\
+```
+```rust
+[skip](./inside)
+```
+[resolved](./outside)";
+        let expected = "\
+```
+```rust
+[skip](./inside)
+```
+[resolved](https://example.com/docs/en/outside)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_markdown_urls_does_not_close_blockquote_fence_on_info_string_line() {
+        // ブロッククォート内のフェンスでも info string 付き行は閉じフェンスにしない。
+        let input = "\
+> ```
+> ```python
+> [skip](./inside)
+> ```
+> [resolved](./outside)";
+        let expected = "\
+> ```
+> ```python
+> [skip](./inside)
+> ```
+> [resolved](https://example.com/docs/en/outside)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_markdown_urls_closes_fence_on_crlf_line_endings() {
+        // CRLF 改行のフェンスでも閉じフェンスが正しく成立し、後続のリンクが解決される。
+        // `find_next_link_candidate` は `\n` で分割するため line 末尾に `\r` が残るが、
+        // `is_closing_fence_line` は末尾 `\r` を line ending として無視する。
+        let input = "```\r\ncode\r\n```\r\n[link](./page)";
+        let expected = "```\r\ncode\r\n```\r\n[link](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    // --- is_closing_fence_line: CRLF 改行末尾の許容 ---
+
+    #[test]
+    fn closing_fence_line_trailing_cr_allowed() {
+        // 末尾 CR (`\r`) は line ending の一部として無視され、閉じフェンスとして妥当。
+        assert!(is_closing_fence_line("```\r", '`', 3));
+        assert!(is_closing_fence_line("```   \r", '`', 3));
+    }
+
+    #[test]
+    fn closing_fence_line_rejects_info_string_with_cr() {
+        // 末尾 CR を取り除いた上でも info string 付きは閉じ扱いしない
+        assert!(!is_closing_fence_line("```rust\r", '`', 3));
+    }
+
+    // --- url_has_balanced_parens の直接テスト ---
+
+    #[test]
+    fn url_balanced_parens_simple_balanced() {
+        assert!(url_has_balanced_parens("https://example.com/wiki/Rust_(language)"));
+    }
+
+    #[test]
+    fn url_balanced_parens_no_parens() {
+        assert!(url_has_balanced_parens("https://example.com/page.html"));
+    }
+
+    #[test]
+    fn url_balanced_parens_empty() {
+        assert!(url_has_balanced_parens(""));
+    }
+
+    #[test]
+    fn url_balanced_parens_unbalanced_open() {
+        // 開きパーレンが多すぎる
+        assert!(!url_has_balanced_parens("https://example.com/(draft"));
+    }
+
+    #[test]
+    fn url_balanced_parens_unbalanced_close_first() {
+        // 閉じパーレンが先に来る場合は即座に false
+        assert!(!url_has_balanced_parens("https://example.com/draft)"));
+    }
+
+    #[test]
+    fn url_balanced_parens_nested_balanced() {
+        // ネストした括弧もバランスしていれば true
+        assert!(url_has_balanced_parens("a(b(c)d)e"));
+    }
+
+    #[test]
+    fn url_balanced_parens_nested_close_imbalance() {
+        // ネストの途中で閉じ過剰
+        assert!(!url_has_balanced_parens("a(b)c)d"));
+    }
+
+    // --- write_resolved_url の直接テスト ---
+
+    #[test]
+    fn write_resolved_url_standard_balanced() {
+        // 標準形式 + バランスした URL は山括弧なし
+        let mut out = String::new();
+        write_resolved_url(&mut out, "https://example.com/page", false);
+        assert_eq!(out, "https://example.com/page");
+    }
+
+    #[test]
+    fn write_resolved_url_standard_unbalanced_forces_angle() {
+        // アンバランスな URL は山括弧で出力
+        let mut out = String::new();
+        write_resolved_url(&mut out, "https://example.com/(draft", false);
+        assert_eq!(out, "<https://example.com/(draft>");
+    }
+
+    #[test]
+    fn write_resolved_url_angle_always_wraps() {
+        // use_angle_brackets=true は常に山括弧
+        let mut out = String::new();
+        write_resolved_url(&mut out, "https://example.com/page", true);
+        assert_eq!(out, "<https://example.com/page>");
+    }
+
+    #[test]
+    fn write_resolved_url_angle_with_balanced_parens() {
+        // 山括弧指定 + バランスした URL でも山括弧で囲む
+        let mut out = String::new();
+        write_resolved_url(&mut out, "https://example.com/(a)", true);
+        assert_eq!(out, "<https://example.com/(a)>");
     }
 }
