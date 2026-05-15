@@ -3047,6 +3047,17 @@ code
     }
 
     #[test]
+    fn resolve_image_inside_link_with_unbalanced_base_parens() {
+        // ネストした画像リンクでも、基準 URL 由来のアンバランスな括弧は山括弧形式で保護する
+        let md = "[![logo](./logo.png)](./home)";
+        let result = resolve_markdown_urls(md, "https://example.com/docs/(draft/");
+        assert_eq!(
+            result,
+            "[![logo](<https://example.com/docs/(draft/logo.png>)](<https://example.com/docs/(draft/home>)"
+        );
+    }
+
+    #[test]
     fn resolve_link_with_backslash_in_url() {
         // URL にバックスラッシュを含むリンク
         let md = r"[link](path%5Cfile)";
@@ -4851,7 +4862,9 @@ inside-of-fence
 
     #[test]
     fn url_balanced_parens_simple_balanced() {
-        assert!(url_has_balanced_parens("https://example.com/wiki/Rust_(language)"));
+        assert!(url_has_balanced_parens(
+            "https://example.com/wiki/Rust_(language)"
+        ));
     }
 
     #[test]
