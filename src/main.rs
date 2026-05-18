@@ -4066,6 +4066,13 @@ code
         assert_eq!(find_link_close_paren(input), Some(input.len() - 1));
     }
 
+    #[test]
+    fn find_close_paren_unclosed_angle_destination_returns_none() {
+        // 閉じ `>` がない山括弧リンク先では、後続の `)` をリンク終端として扱わない
+        let input = "<broken [next](./ok)";
+        assert_eq!(find_link_close_paren(input), None);
+    }
+
     // --- strip_dates: 追加エッジケース ---
 
     #[test]
@@ -4408,6 +4415,14 @@ code
         // 壊れたリンクの後に山括弧形式のリンクが続く場合も解決される
         let input = "[a](./broken [b](<./url>)";
         let expected = "[a](./broken [b](<https://example.com/docs/en/url>)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_unclosed_angle_destination_keeps_later_resolution() {
+        // 閉じ `>` がない壊れた山括弧リンク先でも、後続の正常なリンクは解決される
+        let input = "[a](<./broken [b](./ok)";
+        let expected = "[a](<./broken [b](https://example.com/docs/en/ok)";
         assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
