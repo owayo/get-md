@@ -4949,4 +4949,110 @@ inside-of-fence
         write_resolved_url(&mut out, "https://example.com/(a)", true);
         assert_eq!(out, "<https://example.com/(a)>");
     }
+
+    // --- strip_blockquote_markers の直接テスト ---
+
+    #[test]
+    fn strip_blockquote_markers_no_marker() {
+        // ブロッククォート記号がない通常の行
+        assert_eq!(strip_blockquote_markers("plain text"), Some("plain text"));
+    }
+
+    #[test]
+    fn strip_blockquote_markers_single_level_with_space() {
+        // 単一の `>` + スペースを取り除く
+        assert_eq!(strip_blockquote_markers("> content"), Some("content"));
+    }
+
+    #[test]
+    fn strip_blockquote_markers_single_level_no_space() {
+        // `>` の直後にスペースがない場合も取り除く
+        assert_eq!(strip_blockquote_markers(">content"), Some("content"));
+    }
+
+    #[test]
+    fn strip_blockquote_markers_multiple_levels() {
+        // 多段ブロッククォート記号を順に取り除く
+        assert_eq!(strip_blockquote_markers(">>> deep"), Some("deep"));
+    }
+
+    #[test]
+    fn strip_blockquote_markers_with_leading_indent() {
+        // 行頭インデントも取り除いたうえでブロッククォート記号を処理
+        assert_eq!(strip_blockquote_markers("   > content"), Some("content"));
+    }
+
+    #[test]
+    fn strip_blockquote_markers_mixed_spacing_between_markers() {
+        // ブロッククォート間に複数空白がある場合でも順に剥がせる
+        assert_eq!(strip_blockquote_markers(">  >   inner"), Some("inner"));
+    }
+
+    #[test]
+    fn strip_blockquote_markers_empty_line() {
+        // 空行はそのまま空文字列を返す
+        assert_eq!(strip_blockquote_markers(""), Some(""));
+    }
+
+    #[test]
+    fn strip_blockquote_markers_only_markers() {
+        // ブロッククォート記号だけで内容がない行
+        assert_eq!(strip_blockquote_markers(">>"), Some(""));
+    }
+
+    // --- is_closing_fence_after_blockquote の追加境界テスト ---
+
+    #[test]
+    fn closing_fence_after_blockquote_trailing_spaces_allowed() {
+        // ブロッククォート内の閉じフェンス + 末尾空白
+        assert!(is_closing_fence_after_blockquote("> ```   ", '`', 3));
+    }
+
+    #[test]
+    fn closing_fence_after_blockquote_trailing_cr_allowed() {
+        // ブロッククォート内でも末尾 CR は line ending として無視
+        assert!(is_closing_fence_after_blockquote("> ```\r", '`', 3));
+    }
+
+    #[test]
+    fn closing_fence_after_blockquote_longer_marker() {
+        // 開始フェンスより長い閉じマーカーも有効
+        assert!(is_closing_fence_after_blockquote(">> `````", '`', 3));
+    }
+
+    #[test]
+    fn closing_fence_after_blockquote_shorter_marker_rejected() {
+        // 開始フェンスより短いマーカーは閉じ扱いしない
+        assert!(!is_closing_fence_after_blockquote("> ```", '`', 5));
+    }
+
+    #[test]
+    fn closing_fence_after_blockquote_different_marker_rejected() {
+        // 異なるマーカー文字は閉じ扱いしない
+        assert!(!is_closing_fence_after_blockquote("> ~~~", '`', 3));
+    }
+
+    // --- resolve_markdown_urls: ブロッククォート内 CRLF フェンスの境界 ---
+
+    #[test]
+    fn resolve_markdown_urls_closes_blockquote_fence_on_crlf() {
+        // ブロッククォート内のフェンスが CRLF でも正しく閉じ、後続のリンクが解決される
+        let input = "> ```\r\n> code\r\n> ```\r\n> [link](./page)";
+        let expected = "> ```\r\n> code\r\n> ```\r\n> [link](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    // --- unescape_markdown_destination: バックスラッシュとエスケープ対象の混在 ---
+
+    #[test]
+    fn unescape_destination_backslash_then_unrelated_char() {
+        // バックスラッシュの直後がエスケープ対象でない場合、両方そのまま残す
+        assert_eq!(unescape_markdown_destination(r"\a\b"), r"\a\b");
+    }
+
+    #[test]
+    fn unescape_destination_consecutive_backslashes_before_escape_target() {
+        // `\\(` は最初の `\` がリテラル、2 つ目以降の `\(` が実括弧に展開される
+        assert_eq!(unescape_markdown_destination(r"\\("), r"\(");
+    }
 }
