@@ -902,6 +902,11 @@ fn split_link_destination(inside: &str) -> (&str, &str, bool) {
         return ("", inside, false);
     }
 
+    // `]( "title")` は空のリンク先 + title なので、title を URL と誤認しない。
+    if body.len() < inside.len() && matches!(body.chars().next(), Some('"' | '\'')) {
+        return ("", inside, false);
+    }
+
     if let Some(after_open) = body.strip_prefix('<') {
         // エスケープされていない `>` を探す（`\>` はスキップ）
         let mut backslash_run = 0usize;
@@ -975,14 +980,14 @@ fn find_link_close_paren(s: &str) -> Option<usize> {
             if !saw_dest_non_ws && c == '<' {
                 in_angle_destination = true;
                 saw_dest_non_ws = true;
+                saw_sep_ws = false;
                 backslash_run = 0;
                 continue;
             }
 
-            if c.is_ascii_whitespace() {
-                if saw_dest_non_ws {
-                    saw_sep_ws = true;
-                }
+            if c.is_ascii_whitespace() && !escaped {
+                // 先頭空白 + quote は「空のリンク先 + title」として扱う。
+                saw_sep_ws = true;
             } else if saw_sep_ws && (c == '"' || c == '\'') {
                 title_quote = Some(c);
                 backslash_run = 0;
@@ -1383,6 +1388,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_title_only_link_keeps_empty_destination() {
+        assert_eq!(
+            resolve_markdown_urls(r#"[link]( "Title")"#, BASE),
+            r#"[link]( "Title")"#,
+        );
+    }
+
+    #[test]
+    fn resolve_title_only_link_ignores_paren_in_title() {
+        assert_eq!(
+            resolve_markdown_urls(r#"[link]( "Title ) text") [next](./page)"#, BASE),
+            r#"[link]( "Title ) text") [next](https://example.com/docs/en/page)"#,
+        );
+    }
+
+    #[test]
     fn resolve_standard_url_with_escaped_space() {
         assert_eq!(
             resolve_markdown_urls(r"[doc](./my\ file.md)", BASE),
@@ -1622,6 +1643,12 @@ mod tests {
     }
 
     #[test]
+    fn find_close_paren_ignores_paren_in_title_only_link() {
+        let input = r#" "title ) marker")"#;
+        assert_eq!(find_link_close_paren(input), Some(input.len() - 1));
+    }
+
+    #[test]
     fn split_link_destination_standard_with_title() {
         assert_eq!(
             split_link_destination(r#"./page "Title""#),
@@ -1634,6 +1661,14 @@ mod tests {
         assert_eq!(
             split_link_destination(r#"  ./page.md "Title""#),
             ("./page.md", r#" "Title""#, false),
+        );
+    }
+
+    #[test]
+    fn split_link_destination_title_only_with_leading_whitespace() {
+        assert_eq!(
+            split_link_destination(r#"  "Title""#),
+            ("", r#"  "Title""#, false),
         );
     }
 
