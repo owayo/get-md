@@ -1380,6 +1380,14 @@ mod tests {
     }
 
     #[test]
+    fn resolve_link_with_single_quoted_title() {
+        assert_eq!(
+            resolve_markdown_urls("[link](./page 'Title')", BASE),
+            "[link](https://example.com/docs/en/page 'Title')",
+        );
+    }
+
+    #[test]
     fn resolve_link_with_tab_before_title() {
         assert_eq!(
             resolve_markdown_urls("[link](./page\t\"Title\")", BASE),
@@ -1392,6 +1400,14 @@ mod tests {
         assert_eq!(
             resolve_markdown_urls(r#"[link]( "Title")"#, BASE),
             r#"[link]( "Title")"#,
+        );
+    }
+
+    #[test]
+    fn resolve_single_quoted_title_only_link_keeps_empty_destination() {
+        assert_eq!(
+            resolve_markdown_urls("[link]( 'Title')", BASE),
+            "[link]( 'Title')",
         );
     }
 
@@ -1653,6 +1669,14 @@ mod tests {
         assert_eq!(
             split_link_destination(r#"./page "Title""#),
             ("./page", r#" "Title""#, false),
+        );
+    }
+
+    #[test]
+    fn split_link_destination_standard_with_single_quoted_title() {
+        assert_eq!(
+            split_link_destination("./page 'Title'"),
+            ("./page", " 'Title'", false),
         );
     }
 

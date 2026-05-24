@@ -38,7 +38,7 @@
 - **Escaped Parentheses Support** — correctly parses link destinations containing `\(` and `\)` and resolves them as literal parentheses
 - **Unbalanced Parentheses Safety** — emits resolved URLs with unbalanced `(` or `)` as `<...>` link destinations so Markdown links stay valid
 - **Quote-safe URL Parsing** — preserves quotes/apostrophes in standard Markdown link destinations
-- **Empty Destination Title Support** — preserves valid empty-destination links such as `[text]( "title")` without treating the title as a URL
+- **Empty Destination Title Support** — preserves valid empty-destination links such as `[text]( "title")` or `[text]( 'title')` without treating the title as a URL
 - **Escaped Whitespace Handling** — keeps `\ ` in standard link destinations from being split as title separators and resolves it as a literal space
 - **Leading Destination Whitespace Support** — resolves relative URLs even when valid Markdown link destinations start with whitespace before the URL
 - **Table Compaction** — removes unnecessary padding in Markdown tables while preserving fenced code blocks and separator-like data cells such as `--` or `:`
