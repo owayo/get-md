@@ -957,6 +957,13 @@ fn find_link_close_paren(s: &str) -> Option<usize> {
 
         if c == '\\' {
             backslash_run += 1;
+            // バックスラッシュ自体もリンク先の非空白文字。これを反映しないと、
+            // `\\<a)` のように先頭が `\` で始まるリンク先で後続の `<` が
+            // 山括弧形式の開始として誤認される。
+            if depth == 1 && !in_angle_destination && title_quote.is_none() {
+                saw_dest_non_ws = true;
+                saw_sep_ws = false;
+            }
             continue;
         }
 
@@ -5159,11 +5166,21 @@ inside-of-fence
     }
 
     #[test]
-    fn find_close_paren_double_backslash_lt_keeps_angle_destination() {
-        // `\\<a)` は `\\`(エスケープ済みバックスラッシュ) + `<a)`。
-        // 最後の `<` はエスケープされていないので山括弧開始扱いになり、
-        // 閉じ `>` が見つからず None。
+    fn find_close_paren_double_backslash_lt_is_standard_destination() {
+        // `\\<a)` のように `\` で始まるリンク先は、CommonMark 上「`<` で
+        // 始まらない」ため標準形式として扱う。途中の `<` は山括弧形式の
+        // 開始ではなく文字 `<` として処理し、`)` でリンクが閉じる。
         let input = r"\\<a)";
-        assert_eq!(find_link_close_paren(input), None);
+        assert_eq!(find_link_close_paren(input), Some(4));
+    }
+
+    #[test]
+    fn resolve_link_with_leading_backslash_then_lt_in_destination() {
+        // 先頭が `\` で始まるリンク先 `\\<a` は標準形式として処理される。
+        // unescape_markdown_destination は `\<` を `<` に戻すため、結果として
+        // `\<a` が `Url::join` に渡る。`Url::join` は path での `\` を `/`
+        // と等価に解釈するため、結果はオリジン直下に解決される。
+        let result = resolve_markdown_urls(r"[x](\\<a)", BASE);
+        assert_eq!(result, "[x](https://example.com/%3Ca)");
     }
 }
