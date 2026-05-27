@@ -35,6 +35,7 @@
 - **Literal Backtick Safety** — treats unmatched inline backticks as literal text, so later Markdown links are still resolved
 - **Angle Destination Parentheses Support** — does not treat `)` inside `<...>` link destinations as the closing delimiter
 - **Angle Bracket Escape Support** — correctly handles `\>` inside `<...>` link destinations and resolves it as a literal `>` instead of corrupting the path
+- **Escaped Less-Than Support** — treats `\<` in a standard link destination as a literal `<` (not the start of `<...>` form) and resolves it correctly via percent-encoding
 - **Escaped Parentheses Support** — correctly parses link destinations containing `\(` and `\)` and resolves them as literal parentheses
 - **Unbalanced Parentheses Safety** — emits resolved URLs with unbalanced `(` or `)` as `<...>` link destinations so Markdown links stay valid
 - **Quote-safe URL Parsing** — preserves quotes/apostrophes in standard Markdown link destinations

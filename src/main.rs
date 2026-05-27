@@ -684,7 +684,7 @@ fn url_has_balanced_parens(url: &str) -> bool {
 /// Markdown リンク先に含まれる最小限のバックスラッシュエスケープを
 /// URL 解決前の実 URL 文字列へ戻す。
 ///
-/// `\ ` `\(` `\)` `\>` をそのまま `Url::join` に渡すと、
+/// `\ ` `\(` `\)` `\<` `\>` をそのまま `Url::join` に渡すと、
 /// バックスラッシュがパス区切りや文字列の一部として解釈されてしまう。
 fn unescape_markdown_destination(url: &str) -> String {
     let mut result = String::with_capacity(url.len());
@@ -692,7 +692,7 @@ fn unescape_markdown_destination(url: &str) -> String {
 
     while let Some(ch) = chars.next() {
         if ch == '\\'
-            && let Some(' ' | '(' | ')' | '>') = chars.peek().copied()
+            && let Some(' ' | '(' | ')' | '<' | '>') = chars.peek().copied()
         {
             result.push(chars.next().expect("peek 済みの文字が存在する"));
             continue;
@@ -977,7 +977,7 @@ fn find_link_close_paren(s: &str) -> Option<usize> {
         }
 
         if depth == 1 {
-            if !saw_dest_non_ws && c == '<' {
+            if !saw_dest_non_ws && c == '<' && !escaped {
                 in_angle_destination = true;
                 saw_dest_non_ws = true;
                 saw_sep_ws = false;
@@ -5113,5 +5113,57 @@ inside-of-fence
     fn unescape_destination_consecutive_backslashes_before_escape_target() {
         // `\\(` は最初の `\` がリテラル、2 つ目以降の `\(` が実括弧に展開される
         assert_eq!(unescape_markdown_destination(r"\\("), r"\(");
+    }
+
+    // --- 回帰テスト: エスケープされた `<` は角括弧リンク先の開始ではない ---
+
+    #[test]
+    fn find_close_paren_escaped_lt_is_not_angle_destination_start() {
+        // `\<` は CommonMark のエスケープ済み `<` なので、山括弧形式リンク先の
+        // 開始として扱ってはならない。
+        // 入力: `\<a)` → depth=1 のまま `)` で閉じ → Some(3)
+        let input = r"\<a)";
+        assert_eq!(find_link_close_paren(input), Some(3));
+    }
+
+    #[test]
+    fn resolve_link_with_escaped_lt_in_destination() {
+        // `[x](\<a)` は標準形式リンク先 `\<a` として処理し、URL 解決後は
+        // `<` が percent-encoded で出力される。
+        let result = resolve_markdown_urls(r"[x](\<a)", BASE);
+        assert_eq!(result, "[x](https://example.com/docs/en/%3Ca)");
+    }
+
+    #[test]
+    fn unescape_destination_escaped_lt() {
+        // バックスラッシュ + `<` を実 `<` へ戻す
+        assert_eq!(
+            unescape_markdown_destination(r"./path\<file"),
+            "./path<file",
+        );
+    }
+
+    #[test]
+    fn resolve_link_with_escaped_lt_and_title() {
+        // `\<` を含む標準形式リンク先 + title
+        let result = resolve_markdown_urls(r#"[x](\<a "title")"#, BASE);
+        assert_eq!(result, r#"[x](https://example.com/docs/en/%3Ca "title")"#,);
+    }
+
+    #[test]
+    fn resolve_angle_bracket_url_with_escaped_lt_inside() {
+        // 山括弧形式リンク先の中に `\<` が含まれる場合、URL 解決後も `<` が
+        // percent-encoded で出力される。
+        let result = resolve_markdown_urls(r"[x](<a\<b>)", BASE);
+        assert_eq!(result, "[x](<https://example.com/docs/en/a%3Cb>)");
+    }
+
+    #[test]
+    fn find_close_paren_double_backslash_lt_keeps_angle_destination() {
+        // `\\<a)` は `\\`(エスケープ済みバックスラッシュ) + `<a)`。
+        // 最後の `<` はエスケープされていないので山括弧開始扱いになり、
+        // 閉じ `>` が見つからず None。
+        let input = r"\\<a)";
+        assert_eq!(find_link_close_paren(input), None);
     }
 }
