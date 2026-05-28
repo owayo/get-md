@@ -2017,6 +2017,20 @@ more code
     }
 
     #[test]
+    fn has_unstaged_changes_returns_false_outside_git_repo() {
+        let dir = make_temp_dir("get-md-no-git-status");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("plain.md");
+        std::fs::write(&path, b"content").expect("failed to write fixture file");
+
+        // git 管理外の出力先では diff 判定に失敗しても安全側の false に倒す。
+        assert!(!has_unstaged_changes(&path));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn file_status_deleted_tracked_file_is_updated() {
         let dir = make_temp_dir("get-md-deleted-status");
         std::fs::create_dir_all(&dir).expect("failed to create temp dir");
