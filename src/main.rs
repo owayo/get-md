@@ -1476,6 +1476,27 @@ mod tests {
     }
 
     #[test]
+    fn resolve_invalid_destination_url_is_preserved() {
+        // URL として解釈できないリンク先は、壊さず元の文字列のまま保持する。
+        let input = "[bad](http://[::1)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_invalid_angle_destination_url_is_preserved() {
+        // 山括弧形式でも URL 解決に失敗した場合は山括弧形式を維持する。
+        let input = "[bad](<http://[::1>)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_invalid_destination_url_preserves_title() {
+        // URL 解決に失敗しても title は切り落とさず保持する。
+        let input = r#"[bad](http://[::1 "title")"#;
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
     fn resolve_nested_parens_in_url() {
         assert_eq!(
             resolve_markdown_urls("[wiki](/wiki/Rust_(language))", BASE),
