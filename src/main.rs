@@ -1,11 +1,11 @@
 mod progress;
 
-use std::fs::File;
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -212,8 +212,8 @@ fn main() -> Result<()> {
     };
 
     // 出力
-    let old_content = cli.output.as_ref().and_then(|p| std::fs::read(p).ok());
-    // File::create 前にファイルの存在を記録する（作成後は常に exists() が true になるため）
+    let old_content = cli.output.as_ref().and_then(|p| fs::read(p).ok());
+    // 書き込み前にファイルの存在を記録する（書き込み後は常に exists() が true になるため）
     let file_existed_before =
         old_content.is_some() || cli.output.as_ref().is_some_and(|p| p.exists());
     // 削除済み tracked ファイルは書き戻し後に diff が消えるため、書き込み前の状態も保持する。
@@ -239,27 +239,13 @@ fn main() -> Result<()> {
             &format!("{} → {} ({})", cli.url, path.display(), status),
         );
     } else {
-        let mut writer: Box<dyn Write> = match &cli.output {
-            Some(path) => {
-                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    std::fs::create_dir_all(parent).with_context(|| {
-                        format!("Failed to create output directory: {}", parent.display())
-                    })?;
-                }
-                let file = File::create(path)
-                    .with_context(|| format!("Failed to create output file: {}", path.display()))?;
-                Box::new(file)
-            }
-            None => Box::new(io::stdout().lock()),
-        };
-
-        writer
-            .write_all(output_bytes.as_bytes())
-            .context("Failed to write output")?;
-
         // 出力成功後にのみ URL 付きの完了表示を行う
         match &cli.output {
             Some(path) => {
+                // 既存ファイルを直接 truncate せず、同一ディレクトリの一時ファイルへ
+                // 書き込んでから rename でアトミックに置き換える。これにより書き込み中に
+                // I/O エラー（ディスク容量不足など）が起きても既存ファイルの内容が失われない。
+                atomic_write(path, output_bytes.as_bytes())?;
                 let (icon, status) = file_status(
                     path,
                     file_existed_before,
@@ -272,7 +258,13 @@ fn main() -> Result<()> {
                     &format!("{} → {} ({})", cli.url, path.display(), status),
                 );
             }
-            None => progress.complete("✔", &cli.url),
+            None => {
+                io::stdout()
+                    .lock()
+                    .write_all(output_bytes.as_bytes())
+                    .context("Failed to write output")?;
+                progress.complete("✔", &cli.url);
+            }
         }
     }
 
@@ -297,9 +289,173 @@ fn document_base_url(tab: &Tab) -> Option<String> {
         .filter(|base| Url::parse(base).is_ok())
 }
 
+/// 出力内容を一時ファイル経由でアトミックに書き込む。
+///
+/// 同一ディレクトリに一時ファイルを作成して書き込み、`rename` で目的のパスへ
+/// 置き換える。`rename` は同一ファイルシステム内ではアトミックなため、書き込み中に
+/// I/O エラー（ディスク容量不足など）が発生しても既存ファイルが中途半端な状態に
+/// ならない。既存ファイルがある場合はそのパーミッションを引き継ぎ、出力先が
+/// シンボリックリンクのときは実体パスへ解決してリンクを保ったまま更新する。
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
+
+    // シンボリックリンクは実体パスへ解決し、リンク自体を通常ファイルで置き換えない。
+    let write_path = resolve_output_write_path(path)?;
+    let write_parent = write_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    // 既存ファイルがあれば、書き込み権限を事前確認しつつパーミッションを保持する。
+    let existing_permissions = match fs::metadata(&write_path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                bail!("Output path is not a regular file: {}", path.display());
+            }
+            // rename は親ディレクトリの権限だけで既存ファイルを置換できてしまうため、
+            // ここで書き込み用に開いて File::create と同じ「権限がなければ失敗」契約を保つ。
+            OpenOptions::new()
+                .write(true)
+                .open(&write_path)
+                .with_context(|| {
+                    format!("Failed to open output file for writing: {}", path.display())
+                })?;
+            Some(metadata.permissions())
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("Failed to read output file metadata: {}", path.display())
+            });
+        }
+    };
+
+    let (tmp_path, mut tmp_file) = create_temp_file(write_parent)?;
+    // 書き込み失敗時に一時ファイルを残さないようガードする。
+    let mut guard = TempFileGuard {
+        path: tmp_path,
+        persisted: false,
+    };
+
+    tmp_file.write_all(bytes).with_context(|| {
+        format!(
+            "Failed to write temporary output file: {}",
+            guard.path.display()
+        )
+    })?;
+
+    if let Some(permissions) = existing_permissions {
+        tmp_file.set_permissions(permissions).with_context(|| {
+            format!(
+                "Failed to preserve output file permissions: {}",
+                path.display()
+            )
+        })?;
+    }
+
+    tmp_file.sync_all().with_context(|| {
+        format!(
+            "Failed to sync temporary output file: {}",
+            guard.path.display()
+        )
+    })?;
+    drop(tmp_file);
+
+    fs::rename(&guard.path, &write_path).with_context(|| {
+        format!(
+            "Failed to replace output file atomically: {}",
+            path.display()
+        )
+    })?;
+    guard.persisted = true;
+
+    // rename 後に親ディレクトリを同期し、ディレクトリエントリの更新を永続化する。
+    sync_parent_dir(write_parent);
+    Ok(())
+}
+
+/// 出力先がシンボリックリンクの場合は実体パスへ解決する。
+///
+/// `File::create` はリンクをたどって実体を更新するため、`rename` でも同じ挙動に
+/// 揃える。リンクでない、または存在しないパスはそのまま返す。
+fn resolve_output_write_path(path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)
+            .with_context(|| format!("Failed to resolve output symlink: {}", path.display())),
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(err) => Err(err)
+            .with_context(|| format!("Failed to read output path metadata: {}", path.display())),
+    }
+}
+
+/// 指定ディレクトリ内に一意な一時ファイルを排他的に作成する。
+///
+/// プロセス ID・時刻・連番で名前を一意化し、衝突時は別名で再試行する。
+fn create_temp_file(parent: &Path) -> Result<(PathBuf, File)> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    for attempt in 0..1000u32 {
+        let path = parent.join(format!(
+            ".get-md-{}-{nanos}-{attempt}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("Failed to create temporary output file: {}", path.display())
+                });
+            }
+        }
+    }
+
+    bail!(
+        "Failed to allocate a unique temporary output file in {}",
+        parent.display()
+    )
+}
+
+/// 一時ファイルの後始末を保証するガード。
+///
+/// `rename` 成功前にエラーや早期リターンで処理が中断しても、`Drop` で一時ファイルを
+/// 削除して残骸を残さない。
+struct TempFileGuard {
+    path: PathBuf,
+    persisted: bool,
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if !self.persisted {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// `rename` 後に親ディレクトリを同期し、ディレクトリエントリの更新を永続化する。
+#[cfg(unix)]
+fn sync_parent_dir(parent: &Path) {
+    if let Ok(dir) = File::open(parent) {
+        let _ = dir.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_parent: &Path) {}
+
 /// ファイル出力のステータスを判定する。
 ///
-/// `file_existed_before` は File::create 前に記録したファイルの存在状態。
+/// `file_existed_before` は書き込み前に記録したファイルの存在状態。
 /// git 管理下のファイルで未ステージの変更があれば常に updated 扱い。
 /// それ以外は書き込み前後の内容比較で判定する。
 fn file_status<'a>(
@@ -2098,6 +2254,108 @@ more code
         assert_eq!(status, "updated");
 
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // atomic_write のテスト
+
+    #[test]
+    fn atomic_write_creates_new_file() {
+        let dir = make_temp_dir("get-md-atomic-new");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("out.md");
+
+        atomic_write(&path, b"new content").expect("atomic_write should succeed");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new content");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_overwrites_existing_file() {
+        let dir = make_temp_dir("get-md-atomic-overwrite");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("out.md");
+        std::fs::write(&path, b"old content").expect("failed to write fixture");
+
+        atomic_write(&path, b"new content").expect("atomic_write should succeed");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new content");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_creates_missing_parent_directory() {
+        let dir = make_temp_dir("get-md-atomic-parent");
+        let path = dir.join("nested").join("sub").join("out.md");
+
+        atomic_write(&path, b"content").expect("atomic_write should create parents");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"content");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_file_on_success() {
+        let dir = make_temp_dir("get-md-atomic-cleanup");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("out.md");
+
+        atomic_write(&path, b"content").expect("atomic_write should succeed");
+
+        // 成功後は出力ファイルだけが残り、一時ファイル（.get-md-*.tmp）は残らない。
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["out.md".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = make_temp_dir("get-md-atomic-perms");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("out.md");
+        std::fs::write(&path, b"old").expect("failed to write fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("failed to set permissions");
+
+        atomic_write(&path, b"new").expect("atomic_write should succeed");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_follows_symlink_and_keeps_link() {
+        use std::os::unix::fs::symlink;
+
+        let dir = make_temp_dir("get-md-atomic-symlink");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let target = dir.join("real.md");
+        let link = dir.join("link.md");
+        std::fs::write(&target, b"old").expect("failed to write target");
+        symlink(&target, &link).expect("failed to create symlink");
+
+        atomic_write(&link, b"new content").expect("atomic_write should follow symlink");
+
+        // リンク自体は symlink のまま保持され、実体ファイルの内容が更新される。
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"new content");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4214,7 +4472,7 @@ code
 
     #[test]
     fn file_status_new_file_after_creation() {
-        // バグ再現: File::create でファイルを作成した後でも
+        // バグ再現: 書き込みでファイルを作成した後でも
         // file_existed_before=false なら "created" を返すこと
         let dir = std::env::temp_dir().join(format!(
             "get-md-fs-new-{}",
@@ -4230,7 +4488,7 @@ code
         assert!(!path.exists());
         let content = b"new content";
 
-        // File::create でファイルを作成する（実プログラムと同じ流れ）
+        // 書き込みでファイルを作成する（書き込み後はファイルが存在する点が実プログラムと同じ）
         std::fs::write(&path, content).unwrap();
         assert!(path.exists()); // 作成後はファイルが存在する
 
