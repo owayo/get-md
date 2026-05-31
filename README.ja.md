@@ -164,7 +164,7 @@ make test
 # リリースビルド
 cargo build --release
 
-# Clippy + フォーマットチェック
+# フォーマット確認、Clippy、cargo check
 make check
 
 # /usr/local/bin にインストール
@@ -189,7 +189,7 @@ ignored の E2E テストでは次を確認します。
 - GitHub Raw 上の実ドキュメント取得
 - ローカル `file://` ページでの相対リンク・画像 URL 解決（`<base href>` を含む）
 - 複数セレクタ指定時の `---` 区切り結合
-- `--ignore-date` 指定時に日時差分だけなら既存ファイルを書き換えないこと
+- `--ignore-date` 指定時に日時差分だけなら既存ファイルを書き換えず、日時以外の差分は上書きすること
 - ページスクリプトが Performance API を偽装しても実際の HTTP 404 を拒否すること
 
 ## コントリビュート

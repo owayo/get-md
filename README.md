@@ -164,7 +164,7 @@ make test
 # Run release build
 cargo build --release
 
-# Run clippy and format check
+# Run format check, Clippy, and cargo check
 make check
 
 # Install to /usr/local/bin
@@ -189,7 +189,7 @@ Ignored E2E tests cover:
 - Fetching a real GitHub raw document
 - Resolving relative links and images from a local `file://` page, including `<base href>`
 - Joining multiple selectors with the documented `---` separator
-- Skipping rewrites for `--ignore-date` when only timestamp text changes
+- Skipping rewrites for `--ignore-date` when only timestamp text changes, while still overwriting non-date content changes
 - Rejecting a real HTTP 404 even when page scripts spoof browser performance APIs
 
 ## Contributing

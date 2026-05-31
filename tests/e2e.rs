@@ -281,6 +281,49 @@ fn ignore_date_keeps_existing_output_when_only_timestamp_differs() {
 
 #[test]
 #[ignore] // システムに Chrome/Chromium が必要
+fn ignore_date_overwrites_output_when_non_date_content_differs() {
+    let temp_dir = TempDir::new();
+    let page = temp_dir.path().join("page.html");
+    let output_path = temp_dir.path().join("output.md");
+    write_file(
+        &page,
+        r#"<!doctype html>
+<html>
+  <body>
+    <main><p>Updated: 2026-04-13 10:00</p><p>Status: done</p></main>
+  </body>
+</html>"#,
+    );
+    write_file(&output_path, "Updated: 2026-04-12 09:00\nStatus: pending\n");
+
+    let output = get_md_bin()
+        .args([
+            file_url(&page),
+            "-s".to_string(),
+            "main".to_string(),
+            "-o".to_string(),
+            output_path.display().to_string(),
+            "--ignore-date".to_string(),
+            "-q".to_string(),
+        ])
+        .output()
+        .expect("Failed to execute get-md");
+
+    assert!(
+        output.status.success(),
+        "get-md exited with error: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let saved = fs::read_to_string(&output_path).expect("Failed to read output file");
+    assert!(
+        saved.contains("Status: done"),
+        "--ignore-date must not suppress non-date content changes: {saved}",
+    );
+}
+
+#[test]
+#[ignore] // システムに Chrome/Chromium が必要
 fn http_error_status_cannot_be_spoofed_by_page_script() {
     let url = static_http_url(
         404,

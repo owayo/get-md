@@ -28,9 +28,10 @@ test: ## テストを実行
 fmt: ## コードを整形
 	cargo fmt
 
-check: ## Clippy と cargo check を実行
-	cargo clippy -- -D warnings
-	cargo check
+check: ## フォーマット確認、Clippy、cargo check を実行
+	cargo fmt -- --check
+	cargo clippy --all-targets --all-features -- -D warnings
+	cargo check --all-targets --all-features
 
 clean: ## ビルド成果物を削除
 	cargo clean
