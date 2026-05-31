@@ -50,6 +50,7 @@
 - **File Status Icons** — shows ✨ (created), 📝 (updated), or ✔ (unchanged) for file output; git-aware change detection is anchored to the target path so deleted tracked files and runs from outside the repo still resolve to `updated`, and existing unreadable files also fall back to `updated`
 - **Date-only Diff Ignore** — `--ignore-date` skips rewrites when only timestamp strings changed, including common ISO 8601 forms with fractional seconds and timezone suffixes; requires both old and new content to contain date patterns, and safely falls back for non-UTF-8 files
 - **Timeout Safety** — internal browser idle-timeout buffer uses saturating arithmetic to avoid overflow at extreme `--timeout` values
+- **Atomic File Writes** — output is written to a temporary file in the same directory and atomically renamed into place, so an I/O error mid-write (e.g. disk full) never truncates or corrupts an existing file; existing file permissions are preserved, write permission is checked up front, and symlinked outputs resolve to the real target so the link stays intact. Renaming replaces the inode, so hard links are broken and ACLs/xattrs are not carried over (a deliberate trade-off for crash safety)
 
 ## Requirements
 

@@ -294,8 +294,12 @@ fn document_base_url(tab: &Tab) -> Option<String> {
 /// 同一ディレクトリに一時ファイルを作成して書き込み、`rename` で目的のパスへ
 /// 置き換える。`rename` は同一ファイルシステム内ではアトミックなため、書き込み中に
 /// I/O エラー（ディスク容量不足など）が発生しても既存ファイルが中途半端な状態に
-/// ならない。既存ファイルがある場合はそのパーミッションを引き継ぎ、出力先が
-/// シンボリックリンクのときは実体パスへ解決してリンクを保ったまま更新する。
+/// ならない。既存ファイルがある場合はそのパーミッション（Unix のモードビット等）を
+/// 引き継ぎ、出力先がシンボリックリンクのときは実体パスへ解決してリンクを保ったまま
+/// 更新する。
+///
+/// なお `rename` は新しい inode で既存ファイルを置き換えるため、出力先へのハードリンクは
+/// 切れ、ACL や拡張属性（xattr）は引き継がれない。データ損失を防ぐことを優先した仕様。
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -374,24 +378,52 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     })?;
     guard.persisted = true;
 
-    // rename 後に親ディレクトリを同期し、ディレクトリエントリの更新を永続化する。
+    // rename 後に親ディレクトリを best-effort で同期する（失敗してもデータは置換済み）。
     sync_parent_dir(write_parent);
     Ok(())
 }
 
 /// 出力先がシンボリックリンクの場合は実体パスへ解決する。
 ///
-/// `File::create` はリンクをたどって実体を更新するため、`rename` でも同じ挙動に
-/// 揃える。リンクでない、または存在しないパスはそのまま返す。
+/// `File::create` はリンクをたどって実体（リンク先が未作成でも、その親が存在すれば
+/// 新規作成）を更新するため、`rename` でも同じ挙動に揃える。`canonicalize` はリンク先が
+/// 存在しないと失敗するので使わず、`read_link` でリンクチェーンを手繰り、最終的なリンク先
+/// （未作成でも可）を返す。リンクでないパスはそのまま返す。リンクのループや過度に深い
+/// チェーンは打ち切ってエラーにする。
 fn resolve_output_write_path(path: &Path) -> Result<PathBuf> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)
-            .with_context(|| format!("Failed to resolve output symlink: {}", path.display())),
-        Ok(_) => Ok(path.to_path_buf()),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(path.to_path_buf()),
-        Err(err) => Err(err)
-            .with_context(|| format!("Failed to read output path metadata: {}", path.display())),
+    let mut current = path.to_path_buf();
+    // シンボリックリンクのループや極端に深いチェーンを防ぐため反復回数を制限する。
+    for _ in 0..40 {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = fs::read_link(&current).with_context(|| {
+                    format!("Failed to read output symlink: {}", current.display())
+                })?;
+                // 相対リンクはリンクのあるディレクトリを基準に解決する。
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    current
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(target)
+                };
+            }
+            // リンクでない通常パス、または最終リンク先が未作成（dangling）なら
+            // そのパスへ書く（File::create と同じく実体を新規作成・更新する）。
+            Ok(_) => return Ok(current),
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(current),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("Failed to read output path metadata: {}", current.display())
+                });
+            }
+        }
     }
+    bail!(
+        "Output symlink chain is too deep (possible loop): {}",
+        path.display()
+    )
 }
 
 /// 指定ディレクトリ内に一意な一時ファイルを排他的に作成する。
@@ -442,7 +474,11 @@ impl Drop for TempFileGuard {
     }
 }
 
-/// `rename` 後に親ディレクトリを同期し、ディレクトリエントリの更新を永続化する。
+/// `rename` 後に親ディレクトリを best-effort で同期する。
+///
+/// ディレクトリエントリの更新を fsync で永続化してクラッシュ耐性を高めるが、データ自体は
+/// `rename` 完了時点で既存ファイルを壊さず置き換え済みなので、fsync の失敗は無視する
+/// （durability の追加保証が得られないだけ）。
 #[cfg(unix)]
 fn sync_parent_dir(parent: &Path) {
     if let Ok(dir) = File::open(parent) {
@@ -2356,6 +2392,54 @@ more code
                 .is_symlink()
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"new content");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_through_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = make_temp_dir("get-md-atomic-dangling");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let target = dir.join("real.md");
+        let link = dir.join("link.md");
+        // リンク先 real.md は未作成（dangling symlink）。
+        symlink(&target, &link).expect("failed to create symlink");
+
+        atomic_write(&link, b"created via dangling link")
+            .expect("atomic_write should follow a dangling symlink");
+
+        // dangling だったリンク先が新規作成され、リンク自体は保持される。
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"created via dangling link"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_breaks_hard_links_by_design() {
+        let dir = make_temp_dir("get-md-atomic-hardlink");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let a = dir.join("a.md");
+        let b = dir.join("b.md");
+        std::fs::write(&a, b"shared").expect("failed to write fixture");
+        std::fs::hard_link(&a, &b).expect("failed to create hard link");
+
+        atomic_write(&a, b"updated").expect("atomic_write should succeed");
+
+        // atomic write は新しい inode で置き換えるため hard link は切れ、b は旧内容のまま。
+        // これはデータ損失防止と引き換えの意図的な仕様。
+        assert_eq!(std::fs::read(&a).unwrap(), b"updated");
+        assert_eq!(std::fs::read(&b).unwrap(), b"shared");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
