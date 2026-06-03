@@ -2443,6 +2443,95 @@ more code
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn atomic_write_rejects_directory_path() {
+        // 出力先が既存ディレクトリの場合は通常ファイルではないためエラーにする。
+        let dir = make_temp_dir("get-md-atomic-dir");
+        let target = dir.join("subdir");
+        std::fs::create_dir_all(&target).expect("failed to create dir");
+
+        let result = atomic_write(&target, b"content");
+        assert!(result.is_err());
+
+        // ディレクトリは壊されずに残る。
+        assert!(target.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_rejects_symlink_loop() {
+        use std::os::unix::fs::symlink;
+
+        let dir = make_temp_dir("get-md-atomic-symlink-loop");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let a = dir.join("a.md");
+        let b = dir.join("b.md");
+        // 相互に参照する symlink ループ（a → b → a）を作る。
+        symlink(&b, &a).expect("failed to create symlink a");
+        symlink(&a, &b).expect("failed to create symlink b");
+
+        // ループは反復回数の上限で打ち切られ、無限ループにならずエラーになる。
+        let result = atomic_write(&a, b"should not be written");
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_follows_relative_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = make_temp_dir("get-md-atomic-rel-symlink");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let target = dir.join("real.md");
+        let link = dir.join("link.md");
+        std::fs::write(&target, b"old").expect("failed to write target");
+        // リンクと同じディレクトリの実体を指す相対パスの symlink。
+        symlink("real.md", &link).expect("failed to create relative symlink");
+
+        atomic_write(&link, b"new content").expect("atomic_write should follow relative symlink");
+
+        // リンク自体は保持され、相対リンク先の実体が更新される。
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"new content");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_follows_multi_level_symlink_chain() {
+        use std::os::unix::fs::symlink;
+
+        let dir = make_temp_dir("get-md-atomic-symlink-chain");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let real = dir.join("real.md");
+        let mid = dir.join("mid.md");
+        let entry = dir.join("entry.md");
+        std::fs::write(&real, b"old").expect("failed to write target");
+        // entry → mid → real の 2 段 symlink チェーン。
+        symlink(&real, &mid).expect("failed to create mid symlink");
+        symlink(&mid, &entry).expect("failed to create entry symlink");
+
+        atomic_write(&entry, b"new content").expect("atomic_write should resolve the chain");
+
+        // 入口リンクは保持され、チェーン終端の実体が更新される。
+        assert!(
+            std::fs::symlink_metadata(&entry)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&real).unwrap(), b"new content");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // compact_markdown の追加エッジケース
 
     #[test]
