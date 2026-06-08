@@ -612,11 +612,10 @@ fn compact_markdown(md: &str) -> String {
 
     md.lines()
         .map(|line| {
-            let trimmed_start = line.trim_start();
             if in_fenced_code_block {
                 // フェンス内では info string 付きのマーカーを閉じ扱いしない。
                 // 閉じフェンスはマーカー以降が空白/タブのみでなければならない。
-                if is_closing_fence_line(trimmed_start, fence_char, fence_len) {
+                if is_closing_fence_line_after_indent(line, fence_char, fence_len) {
                     in_fenced_code_block = false;
                     fence_char = '\0';
                     fence_len = 0;
@@ -625,7 +624,7 @@ fn compact_markdown(md: &str) -> String {
                 }
                 return line.to_string();
             }
-            if let Some((marker, marker_len)) = fence_marker(trimmed_start) {
+            if let Some((marker, marker_len)) = fence_marker_after_indent(line) {
                 table_state = TableState::Outside;
                 in_fenced_code_block = true;
                 fence_char = marker;
@@ -673,6 +672,33 @@ fn fence_marker(line: &str) -> Option<(char, usize)> {
     if len >= 3 { Some((marker, len)) } else { None }
 }
 
+/// CommonMark のフェンス用インデント（最大 3 スペース）を取り除く。
+///
+/// 4 スペース以上の行はインデントコードブロックなので、フェンス開始/終了として
+/// 扱わない。タブは列幅計算が必要になるため、ここでは安全側に倒して除外する。
+fn strip_fence_indent(line: &str) -> Option<&str> {
+    let mut spaces = 0usize;
+    for (idx, ch) in line.char_indices() {
+        match ch {
+            ' ' if spaces < 3 => spaces += 1,
+            ' ' | '\t' => return None,
+            _ => return Some(&line[idx..]),
+        }
+    }
+    Some("")
+}
+
+fn fence_marker_after_indent(line: &str) -> Option<(char, usize)> {
+    strip_fence_indent(line).and_then(fence_marker)
+}
+
+fn is_closing_fence_line_after_indent(line: &str, marker: char, min_len: usize) -> bool {
+    let Some(rest) = strip_fence_indent(line) else {
+        return false;
+    };
+    is_closing_fence_line(rest, marker, min_len)
+}
+
 /// 閉じフェンスとして妥当な行か判定する。
 ///
 /// CommonMark 仕様では、閉じフェンスは「同じ種類のマーカーで開始時と同じ長さ以上」かつ
@@ -695,11 +721,13 @@ fn is_closing_fence_line(line: &str, marker: char, min_len: usize) -> bool {
 
 /// ブロッククォート記号を取り除いた位置にあるフェンスマーカーを検出する。
 fn fence_marker_after_blockquote(line: &str) -> Option<(char, usize)> {
-    strip_blockquote_markers(line).and_then(fence_marker)
+    strip_fence_blockquote_markers(line).and_then(fence_marker)
 }
 
 /// 行頭のインデントとブロッククォート記号 (`>`) を取り除いた残りを返す。
-/// `fence_marker_after_blockquote` と `is_closing_fence_after_blockquote` で共通化。
+///
+/// 任意インデントを許容する旧来の剥がし処理として、直接テストで境界を固定する。
+#[cfg(test)]
 fn strip_blockquote_markers(line: &str) -> Option<&str> {
     let mut rest = line.trim_start();
     while let Some(after_marker) = rest.strip_prefix('>') {
@@ -711,9 +739,19 @@ fn strip_blockquote_markers(line: &str) -> Option<&str> {
     Some(rest)
 }
 
+/// フェンス検出用に CommonMark のインデント規則を守ってブロッククォート記号を取り除く。
+fn strip_fence_blockquote_markers(line: &str) -> Option<&str> {
+    let mut rest = strip_fence_indent(line)?;
+    while let Some(after_marker) = rest.strip_prefix('>') {
+        rest = after_marker.strip_prefix(' ').unwrap_or(after_marker);
+        rest = strip_fence_indent(rest)?;
+    }
+    Some(rest)
+}
+
 /// `fence_marker_after_blockquote` で得たマーカーが閉じフェンスとして妥当か判定する。
 fn is_closing_fence_after_blockquote(line: &str, marker: char, min_len: usize) -> bool {
-    let Some(rest) = strip_blockquote_markers(line) else {
+    let Some(rest) = strip_fence_blockquote_markers(line) else {
         return false;
     };
     is_closing_fence_line(rest, marker, min_len)
@@ -1984,6 +2022,14 @@ mod tests {
     }
 
     #[test]
+    fn fence_marker_after_indent_allows_up_to_three_spaces() {
+        assert_eq!(fence_marker_after_indent("```"), Some(('`', 3)));
+        assert_eq!(fence_marker_after_indent("   ```"), Some(('`', 3)));
+        assert_eq!(fence_marker_after_indent("    ```"), None);
+        assert_eq!(fence_marker_after_indent("\t```"), None);
+    }
+
+    #[test]
     fn fence_marker_backtick_five() {
         assert_eq!(fence_marker("`````"), Some(('`', 5)));
     }
@@ -2730,6 +2776,15 @@ more code
         );
     }
 
+    #[test]
+    fn resolve_four_space_indented_backticks_do_not_open_fence() {
+        // 4 スペースインデントのバッククォート行をフェンス扱いすると、
+        // 後続の通常リンクがフェンス内として解決されなくなる。
+        let input = "    ```\n[link](./next.md)";
+        let expected = "    ```\n[link](https://example.com/docs/en/next.md)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
     // find_link_close_paren: 追加エッジケース
 
     #[test]
@@ -2758,6 +2813,23 @@ more code
   ```
 | padded           | table           |
   ```";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    #[test]
+    fn compact_four_space_indented_backticks_do_not_open_fence() {
+        // CommonMark では 4 スペースインデントのバッククォート行はフェンスではない。
+        // ここをフェンス扱いすると後続の通常テーブルまで圧縮されなくなる。
+        let input = "    ```\n| padded           | table           |";
+        let expected = "    ```\n| padded | table |";
+        assert_eq!(compact_markdown(input), expected);
+    }
+
+    #[test]
+    fn compact_four_space_indented_backticks_do_not_close_fence() {
+        // 閉じフェンスも最大 3 スペースまで。4 スペース行で閉じるとフェンス内の
+        // テーブル行を通常テーブルとして誤って圧縮してしまう。
+        let input = "```\n| keep           | spacing        |\n    ```\n| still          | code           |\n```";
         assert_eq!(compact_markdown(input), input);
     }
 
@@ -5001,7 +5073,14 @@ code
     #[test]
     fn fence_marker_after_blockquote_indented() {
         // ブロッククォート前にインデントがある場合も認識される
+        assert_eq!(fence_marker_after_blockquote("   > ```"), Some(('`', 3)));
         assert_eq!(fence_marker_after_blockquote("  > ```"), Some(('`', 3)));
+    }
+
+    #[test]
+    fn fence_marker_after_blockquote_rejects_four_space_indent() {
+        // ブロッククォート前でも 4 スペースはインデントコード扱いで、フェンスではない。
+        assert_eq!(fence_marker_after_blockquote("    > ```"), None);
     }
 
     #[test]
