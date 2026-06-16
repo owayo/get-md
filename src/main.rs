@@ -5728,4 +5728,37 @@ inside-of-fence
         let result = resolve_markdown_urls(r"[x](\\<a)", BASE);
         assert_eq!(result, "[x](https://example.com/%3Ca)");
     }
+
+    #[test]
+    fn compact_consecutive_separator_rows_second_not_normalized() {
+        // セパレータ行が連続する場合、1 本目はセパレータとして正規化されるが、
+        // 2 本目は table_state が Body のため正規化対象外となり、ダッシュがそのまま残る。
+        let input = "| --- |\n| --- |";
+        assert_eq!(compact_markdown(input), "| - |\n| --- |");
+    }
+
+    #[test]
+    fn split_link_destination_leading_quote_without_whitespace_is_url() {
+        // 先頭に空白が無くクォートで始まるリンク先は「空のリンク先 + title」ガード
+        // (body.len() < inside.len()) に該当せず、標準形式として全体が URL 扱いになる。
+        assert_eq!(
+            split_link_destination("\"title\""),
+            ("\"title\"", "", false)
+        );
+    }
+
+    #[test]
+    fn find_close_paren_quote_after_space_then_nonquote_is_not_title() {
+        // 空白 (saw_sep_ws=true) の直後に非クォート文字が来ると saw_sep_ws がリセットされ、
+        // 続くクォートは title 開始として扱われない。よって後続の `)` が終端になる。
+        assert_eq!(find_link_close_paren("a b\"c)"), Some(5));
+    }
+
+    #[test]
+    fn link_candidate_multiline_inline_code_then_link() {
+        // インラインコードが改行をまたぐ場合でも、閉じバッククォートまで正しくスキップし、
+        // その後ろのリンクの `](` 位置を返す。
+        let md = "`a\nb` [x](y)";
+        assert_eq!(find_next_link_candidate(md, 0), Some(8));
+    }
 }
