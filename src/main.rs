@@ -632,6 +632,14 @@ fn compact_markdown(md: &str) -> String {
                 return line.to_string();
             }
 
+            // 4 スペース以上のインデント行は CommonMark のインデントコードブロックなので
+            // テーブル扱いせずに行をそのまま保持する。`line.trim()` で先頭空白を落として
+            // しまうとコード内容が壊れる。
+            if strip_fence_indent(line).is_none() {
+                table_state = TableState::Outside;
+                return line.to_string();
+            }
+
             let trimmed = line.trim();
             if trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 1 {
                 let is_separator = is_table_separator_row(trimmed);
@@ -797,20 +805,54 @@ fn split_unescaped_table_cells(inner: &str) -> Vec<&str> {
     let mut cells = Vec::new();
     let mut start = 0usize;
     let mut backslash_run = 0usize;
+    // 開いているインラインコードスパンのバッククォート列の長さ。0 ならコード外。
+    // コードスパン内の `|` はセル区切りとして扱わない（CommonMark/GFM 仕様）。
+    let mut inline_code_len = 0usize;
+    let mut i = 0;
 
-    for (i, c) in inner.char_indices() {
-        if c == '\\' {
+    while i < inner.len() {
+        let rest = &inner[i..];
+
+        if rest.starts_with('`') {
+            let tick_len = rest.chars().take_while(|c| *c == '`').count();
+            if inline_code_len == 0 {
+                let escaped = backslash_run % 2 == 1;
+                // 同じ長さの閉じバッククォート列が後続にあるときだけインラインコードとして開く。
+                if !escaped && has_matching_inline_code_closer(inner, i + tick_len, tick_len) {
+                    inline_code_len = tick_len;
+                }
+            } else if tick_len == inline_code_len {
+                inline_code_len = 0;
+            }
+            i += tick_len;
+            backslash_run = 0;
+            continue;
+        }
+
+        let ch = rest.chars().next().expect("cursor は文字境界上にある");
+        let ch_len = ch.len_utf8();
+
+        // インラインコード内は内容を解釈しない（`|` も `\` もリテラル扱い）。
+        if inline_code_len > 0 {
+            i += ch_len;
+            backslash_run = 0;
+            continue;
+        }
+
+        if ch == '\\' {
             backslash_run += 1;
+            i += ch_len;
             continue;
         }
 
         let escaped = backslash_run % 2 == 1;
-        if c == '|' && !escaped {
+        if ch == '|' && !escaped {
             cells.push(&inner[start..i]);
             start = i + 1;
         }
 
         backslash_run = 0;
+        i += ch_len;
     }
 
     cells.push(&inner[start..]);
@@ -5760,5 +5802,74 @@ inside-of-fence
         // その後ろのリンクの `](` 位置を返す。
         let md = "`a\nb` [x](y)";
         assert_eq!(find_next_link_candidate(md, 0), Some(8));
+    }
+
+    // --- 4 スペース以上インデントされたテーブル風行はコードとして保持される ---
+
+    #[test]
+    fn compact_markdown_indented_table_row_kept_as_code() {
+        // CommonMark のインデントコードブロック（4 スペース以上）に該当する行は
+        // テーブル扱いせず、行をそのまま保持する。`line.trim()` で先頭インデントを
+        // 落としてセル間空白も圧縮すると、コードの内容が破壊される。
+        let input = "    | a   | b   |";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    #[test]
+    fn compact_markdown_indented_table_row_with_tab_kept_as_code() {
+        // タブ始まりの行も CommonMark のインデントコードブロックとして扱い、
+        // テーブル圧縮を適用しない。
+        let input = "\t| a   | b   |";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    #[test]
+    fn compact_markdown_three_space_indent_still_compresses_table() {
+        // 3 スペースまでのインデントはテーブル行として許容され、
+        // 通常通り圧縮される。
+        let input = "   | a   | b   |";
+        assert_eq!(compact_markdown(input), "| a | b |");
+    }
+
+    // --- インラインコード内の `|` はセル区切りにならない ---
+
+    #[test]
+    fn split_unescaped_table_cells_pipe_inside_inline_code() {
+        // インラインコードスパン `|` `|` `|` をセル区切りとして扱うと
+        // コード内容が壊れる。CommonMark/GFM ではコードスパン内はリテラル扱い。
+        let cells = split_unescaped_table_cells(" `a | b` | x ");
+        assert_eq!(cells, vec![" `a | b` ", " x "]);
+    }
+
+    #[test]
+    fn split_unescaped_table_cells_double_backtick_code_with_pipe() {
+        // `` ``a|b`` `` のような二重バッククォートでもコードスパン扱いとなり、
+        // 内側の `|` をセル区切りとして扱わない。
+        let cells = split_unescaped_table_cells(" ``a|b`` | x ");
+        assert_eq!(cells, vec![" ``a|b`` ", " x "]);
+    }
+
+    #[test]
+    fn split_unescaped_table_cells_unmatched_backtick_falls_back_to_split() {
+        // 閉じバッククォートがなければインラインコード扱いせず、
+        // `|` は通常通りセル区切りとして扱う。
+        let cells = split_unescaped_table_cells(" `unclosed | x ");
+        assert_eq!(cells, vec![" `unclosed ", " x "]);
+    }
+
+    #[test]
+    fn split_unescaped_table_cells_escaped_backtick_is_not_code_start() {
+        // バックスラッシュでエスケープされたバッククォートはコードスパン開始扱いしない。
+        // 続く `|` は通常のセル区切りとなる。
+        let cells = split_unescaped_table_cells(r" \`a | b\` | x ");
+        assert_eq!(cells, vec![r" \`a ", r" b\` ", " x "]);
+    }
+
+    #[test]
+    fn compact_table_with_pipe_in_inline_code_cell() {
+        // テーブル行内のインラインコードに `|` を含む場合、セル数を保ったまま圧縮する。
+        let input = "| `a | b` | x |";
+        // 2 セル (`code`, `x`) として圧縮される
+        assert_eq!(compact_markdown(input), "| `a | b` | x |");
     }
 }
