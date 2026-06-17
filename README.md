@@ -44,6 +44,8 @@
 - **Leading Destination Whitespace Support** — resolves relative URLs even when valid Markdown link destinations start with whitespace before the URL
 - **Table Compaction** — removes unnecessary padding in Markdown tables while preserving fenced code blocks and separator-like data cells such as `--` or `:`
 - **Escaped Pipe-safe Tables** — keeps escaped cell pipes (`\|`) intact during table compaction
+- **Inline-code Pipe-safe Tables** — keeps pipes inside inline code spans (` `` `) within table cells from being treated as cell separators, preserving code content during compaction
+- **Indented Code Block Awareness** — lines indented with four or more spaces (CommonMark indented code blocks) are not treated as table rows, preserving their leading indentation and inner cell spacing
 - **Progress Display** — shows operation progress with quiet mode option, and reports completion only after output succeeds
 - **CDP-backed HTTP Status Checks** — rejects real HTTP error responses using Chrome DevTools Protocol events, even if page scripts alter browser performance APIs
 - **Certificate Safety by Default** — validates HTTPS certificates by default; `--ignore-certificate-errors` is available only for explicit trusted debugging cases
