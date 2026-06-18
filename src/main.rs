@@ -1523,6 +1523,41 @@ mod tests {
     }
 
     #[test]
+    fn is_table_separator_cell_accepts_dashes_and_colons() {
+        // セパレータセルは `-` 単独、`:---`, `---:`, `:---:` を許容する。
+        assert!(is_table_separator_cell("-"));
+        assert!(is_table_separator_cell("---"));
+        assert!(is_table_separator_cell(":---"));
+        assert!(is_table_separator_cell("---:"));
+        assert!(is_table_separator_cell(":---:"));
+        // コロンだけの行はテーブル本文側でデータセルとして残す必要があるが、
+        // セパレータ判定単体としては true（実際の保持判定は別関数）。
+        assert!(is_table_separator_cell(":"));
+    }
+
+    #[test]
+    fn is_table_separator_cell_rejects_non_separator_chars() {
+        assert!(!is_table_separator_cell(""));
+        assert!(!is_table_separator_cell("a"));
+        assert!(!is_table_separator_cell("- - -"));
+        assert!(!is_table_separator_cell("--a--"));
+    }
+
+    #[test]
+    fn is_table_separator_row_accepts_all_separator_cells() {
+        assert!(is_table_separator_row("| --- |"));
+        assert!(is_table_separator_row("| --- | --- |"));
+        assert!(is_table_separator_row("| :--- | ---: | :-: |"));
+    }
+
+    #[test]
+    fn is_table_separator_row_rejects_when_any_cell_is_data() {
+        // 1 つでも非セパレータセルがあれば false。
+        assert!(!is_table_separator_row("| --- | data |"));
+        assert!(!is_table_separator_row("| a | b |"));
+    }
+
+    #[test]
     fn compact_table_preserves_separator_like_data_cells() {
         let input = "| key | value |\n| --- | --- |\n| dash | -- |\n| colon | : |";
         let expected = "| key | value |\n| - | - |\n| dash | -- |\n| colon | : |";
@@ -2072,6 +2107,41 @@ mod tests {
     }
 
     #[test]
+    fn strip_fence_indent_no_indent_returns_input() {
+        assert_eq!(strip_fence_indent("```"), Some("```"));
+    }
+
+    #[test]
+    fn strip_fence_indent_up_to_three_spaces_allowed() {
+        assert_eq!(strip_fence_indent(" ```"), Some("```"));
+        assert_eq!(strip_fence_indent("  ```"), Some("```"));
+        assert_eq!(strip_fence_indent("   ```"), Some("```"));
+    }
+
+    #[test]
+    fn strip_fence_indent_four_spaces_rejected() {
+        assert_eq!(strip_fence_indent("    ```"), None);
+    }
+
+    #[test]
+    fn strip_fence_indent_leading_tab_rejected() {
+        // タブは CommonMark のインデントコードブロック扱い。
+        assert_eq!(strip_fence_indent("\t```"), None);
+    }
+
+    #[test]
+    fn strip_fence_indent_tab_after_spaces_rejected() {
+        // スペースの後にタブが混ざってもインデントコード扱いで拒否。
+        assert_eq!(strip_fence_indent(" \t```"), None);
+        assert_eq!(strip_fence_indent("  \t```"), None);
+    }
+
+    #[test]
+    fn strip_fence_indent_empty_line_passes_through() {
+        assert_eq!(strip_fence_indent(""), Some(""));
+    }
+
+    #[test]
     fn fence_marker_backtick_five() {
         assert_eq!(fence_marker("`````"), Some(('`', 5)));
     }
@@ -2617,6 +2687,94 @@ more code
                 .is_symlink()
         );
         assert_eq!(std::fs::read(&real).unwrap(), b"new content");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temp_file_guard_removes_file_when_not_persisted() {
+        // persisted=false で Drop されたら一時ファイルは削除されること。
+        let dir = make_temp_dir("get-md-guard-cleanup");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("orphan.tmp");
+        std::fs::write(&path, b"junk").expect("failed to write fixture");
+        assert!(path.exists());
+        {
+            let _guard = TempFileGuard {
+                path: path.clone(),
+                persisted: false,
+            };
+        } // Drop here
+        assert!(!path.exists(), "persisted=false の Drop で削除されるべき");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temp_file_guard_keeps_file_when_persisted() {
+        // persisted=true（rename 成功後）は Drop で削除しないこと。
+        let dir = make_temp_dir("get-md-guard-keep");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("kept.tmp");
+        std::fs::write(&path, b"data").expect("failed to write fixture");
+        {
+            let _guard = TempFileGuard {
+                path: path.clone(),
+                persisted: true,
+            };
+        }
+        assert!(
+            path.exists(),
+            "persisted=true なら Drop で削除されてはならない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_temp_file_returns_unique_paths_across_calls() {
+        // 連続呼び出しで衝突しないことを直接検証する。
+        let dir = make_temp_dir("get-md-create-temp-unique");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let (p1, f1) = create_temp_file(&dir).expect("first temp file");
+        let (p2, f2) = create_temp_file(&dir).expect("second temp file");
+        assert_ne!(p1, p2, "二度呼び出しで同じ一時ファイル名が返ってはいけない");
+        assert!(p1.exists());
+        assert!(p2.exists());
+        drop(f1);
+        drop(f2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_temp_file_creates_inside_specified_parent() {
+        // 引数で指定した親ディレクトリの直下に作成されること。
+        let dir = make_temp_dir("get-md-create-temp-parent");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let (path, file) = create_temp_file(&dir).expect("temp file");
+        assert_eq!(path.parent().unwrap(), dir.as_path());
+        // Windows でクリーンアップ前にハンドルを閉じる。
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_output_write_path_returns_regular_file_unchanged() {
+        // 通常ファイルはそのままのパスを返すこと。
+        let dir = make_temp_dir("get-md-resolve-regular");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let file = dir.join("plain.md");
+        std::fs::write(&file, b"data").expect("failed to write fixture");
+        let resolved = resolve_output_write_path(&file).expect("resolve regular file");
+        assert_eq!(resolved, file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_output_write_path_returns_missing_path_unchanged() {
+        // 存在しないパスもそのまま返すこと（新規作成パスの想定）。
+        let dir = make_temp_dir("get-md-resolve-missing");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let missing = dir.join("does-not-exist.md");
+        let resolved = resolve_output_write_path(&missing).expect("resolve missing path");
+        assert_eq!(resolved, missing);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
