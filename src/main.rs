@@ -68,19 +68,54 @@ struct Cli {
     ignore_date: bool,
 }
 
+type MainResponseStatus = Arc<Mutex<Option<u32>>>;
+
+struct BrowserPage {
+    browser: Browser,
+    tab: Arc<Tab>,
+    main_response_status: MainResponseStatus,
+}
+
+struct OutputWriteState {
+    old_content: Option<Vec<u8>>,
+    file_existed_before: bool,
+    had_unstaged_changes_before: bool,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut progress = Progress::new(!cli.quiet);
+    let selectors = prepare_selectors(&cli.selector);
 
-    let selectors = if cli.selector.is_empty() {
+    let BrowserPage {
+        browser: _browser,
+        tab,
+        main_response_status,
+    } = launch_browser(&cli, &mut progress)?;
+    load_page(&tab, &cli.url, cli.wait, &mut progress)?;
+    validate_http_status(&main_response_status, &cli.url)?;
+
+    let html_fragments = extract_html_fragments(&tab, &selectors, &mut progress)?;
+    let markdown = convert_html_fragments(&tab, &html_fragments, &cli.url, &mut progress)?;
+    let output_text = finalize_output_text(markdown, cli.output.is_some());
+    let output_state = capture_output_write_state(cli.output.as_deref());
+    write_or_print_output(&cli, &output_text, output_state, &progress)?;
+
+    Ok(())
+}
+
+fn prepare_selectors(selector_args: &[String]) -> Vec<String> {
+    if selector_args.is_empty() {
         vec!["body".to_string()]
     } else {
-        cli.selector.clone()
-    };
+        selector_args.to_vec()
+    }
+}
 
+fn launch_browser(cli: &Cli, progress: &mut Progress) -> Result<BrowserPage> {
     // ブラウザを起動する
     progress.spinner("Launching Chrome...");
-    let launch_options = build_launch_options(&cli);
+    let launch_options = build_launch_options(cli);
 
     let browser = Browser::new(launch_options)
         .context("Failed to launch Chrome. Make sure Chrome is installed on your system")?;
@@ -118,20 +153,32 @@ fn main() -> Result<()> {
     }
     progress.finish("Chrome launched");
 
+    Ok(BrowserPage {
+        browser,
+        tab,
+        main_response_status,
+    })
+}
+
+fn load_page(tab: &Tab, url: &str, wait_secs: u64, progress: &mut Progress) -> Result<()> {
     // ページへ遷移する
-    progress.spinner(&format!("Loading page: {}", cli.url));
-    tab.navigate_to(&cli.url)
-        .with_context(|| format!("Failed to navigate to URL: {}", cli.url))?;
+    progress.spinner(&format!("Loading page: {url}"));
+    tab.navigate_to(url)
+        .with_context(|| format!("Failed to navigate to URL: {url}"))?;
 
     tab.wait_until_navigated().context("Page load timed out")?;
 
     // JS 描画完了を待つための追加待機
-    if cli.wait > 0 {
-        progress.set_message(&format!("Waiting for JS rendering ({}s)...", cli.wait));
-        std::thread::sleep(Duration::from_secs(cli.wait));
+    if wait_secs > 0 {
+        progress.set_message(&format!("Waiting for JS rendering ({wait_secs}s)..."));
+        std::thread::sleep(Duration::from_secs(wait_secs));
     }
     progress.finish("Page loaded");
 
+    Ok(())
+}
+
+fn validate_http_status(main_response_status: &MainResponseStatus, url: &str) -> Result<()> {
     // HTTP ステータスコードを確認する（400 以上はエラー）。
     // ページ内 JS は改変可能なため、CDP の Network event から得た値だけを信頼する。
     let status_code = main_response_status
@@ -140,13 +187,21 @@ fn main() -> Result<()> {
         .unwrap_or(0);
 
     if status_code >= 400 {
-        bail!("HTTP {} — page not saved: {}", status_code, cli.url);
+        bail!("HTTP {} — page not saved: {}", status_code, url);
     }
 
+    Ok(())
+}
+
+fn extract_html_fragments(
+    tab: &Tab,
+    selectors: &[String],
+    progress: &mut Progress,
+) -> Result<Vec<String>> {
     // セレクタに一致した要素の HTML を抽出する
     progress.spinner("Extracting HTML elements...");
     let mut html_fragments = Vec::new();
-    for selector in &selectors {
+    for selector in selectors {
         progress.set_message(&format!("Extracting selector '{}'...", selector));
 
         // 一致した全要素の outerHTML を取得する
@@ -181,6 +236,15 @@ fn main() -> Result<()> {
         bail!("No elements matched the specified selectors");
     }
 
+    Ok(html_fragments)
+}
+
+fn convert_html_fragments(
+    tab: &Tab,
+    html_fragments: &[String],
+    fallback_base_url: &str,
+    progress: &mut Progress,
+) -> Result<String> {
     // HTML を Markdown に変換する
     progress.spinner("Converting to Markdown...");
     let converter = htmd::HtmlToMarkdown::builder()
@@ -192,48 +256,67 @@ fn main() -> Result<()> {
         })
         .build();
     let mut md_parts = Vec::new();
-    for html in &html_fragments {
+    for html in html_fragments {
         let md = converter
             .convert(html)
             .context("Failed to convert HTML to Markdown")?;
         md_parts.push(md);
     }
 
-    let base_url = document_base_url(&tab).unwrap_or_else(|| cli.url.clone());
+    let base_url = document_base_url(tab).unwrap_or_else(|| fallback_base_url.to_string());
     let markdown = compact_markdown(&md_parts.join("\n\n---\n\n"));
     let markdown = resolve_markdown_urls(&markdown, &base_url);
     progress.finish("Converted to Markdown");
 
+    Ok(markdown)
+}
+
+fn finalize_output_text(markdown: String, file_output: bool) -> String {
     // 出力内容を確定する（末尾改行を保証）
-    let output_bytes = if cli.output.is_some() && !markdown.ends_with('\n') {
+    if file_output && !markdown.ends_with('\n') {
         format!("{markdown}\n")
     } else {
         markdown
-    };
+    }
+}
 
-    // 出力
-    let old_content = cli.output.as_ref().and_then(|p| fs::read(p).ok());
+fn capture_output_write_state(output: Option<&Path>) -> OutputWriteState {
+    let old_content = output.and_then(|p| fs::read(p).ok());
     // 書き込み前にファイルの存在を記録する（書き込み後は常に exists() が true になるため）
-    let file_existed_before =
-        old_content.is_some() || cli.output.as_ref().is_some_and(|p| p.exists());
+    let file_existed_before = old_content.is_some() || output.is_some_and(|p| p.exists());
     // 削除済み tracked ファイルは書き戻し後に diff が消えるため、書き込み前の状態も保持する。
-    let had_unstaged_changes_before = cli.output.as_ref().is_some_and(|p| has_unstaged_changes(p));
+    let had_unstaged_changes_before = output.is_some_and(has_unstaged_changes);
 
+    OutputWriteState {
+        old_content,
+        file_existed_before,
+        had_unstaged_changes_before,
+    }
+}
+
+fn write_or_print_output(
+    cli: &Cli,
+    output_text: &str,
+    output_state: OutputWriteState,
+    progress: &Progress,
+) -> Result<()> {
     // --ignore-date: 日時だけの差分なら書き込みをスキップ
     let date_only_change = cli.ignore_date
         && cli.output.is_some()
-        && old_content
+        && output_state
+            .old_content
             .as_ref()
-            .is_some_and(|old| is_date_only_change(old, output_bytes.as_bytes()));
+            .is_some_and(|old| is_date_only_change(old, output_text.as_bytes()));
 
     if date_only_change {
         let path = cli.output.as_ref().unwrap();
         // 未ステージ変更があれば updated 扱い（file_status と同じ契約）
-        let (icon, status) = if had_unstaged_changes_before || has_unstaged_changes(path) {
-            ("📝", "updated")
-        } else {
-            ("✔", "unchanged")
-        };
+        let (icon, status) =
+            if output_state.had_unstaged_changes_before || has_unstaged_changes(path) {
+                ("📝", "updated")
+            } else {
+                ("✔", "unchanged")
+            };
         progress.complete(
             icon,
             &format!("{} → {} ({})", cli.url, path.display(), status),
@@ -245,13 +328,13 @@ fn main() -> Result<()> {
                 // 既存ファイルを直接 truncate せず、同一ディレクトリの一時ファイルへ
                 // 書き込んでから rename でアトミックに置き換える。これにより書き込み中に
                 // I/O エラー（ディスク容量不足など）が起きても既存ファイルの内容が失われない。
-                atomic_write(path, output_bytes.as_bytes())?;
+                atomic_write(path, output_text.as_bytes())?;
                 let (icon, status) = file_status(
                     path,
-                    file_existed_before,
-                    &old_content,
-                    output_bytes.as_bytes(),
-                    had_unstaged_changes_before,
+                    output_state.file_existed_before,
+                    &output_state.old_content,
+                    output_text.as_bytes(),
+                    output_state.had_unstaged_changes_before,
                 );
                 progress.complete(
                     icon,
@@ -261,7 +344,7 @@ fn main() -> Result<()> {
             None => {
                 io::stdout()
                     .lock()
-                    .write_all(output_bytes.as_bytes())
+                    .write_all(output_text.as_bytes())
                     .context("Failed to write output")?;
                 progress.complete("✔", &cli.url);
             }
@@ -1328,6 +1411,101 @@ mod tests {
             args,
             String::from_utf8_lossy(&output.stderr),
         );
+    }
+
+    #[test]
+    fn prepare_selectors_defaults_to_body() {
+        assert_eq!(prepare_selectors(&[]), vec!["body".to_string()]);
+    }
+
+    #[test]
+    fn prepare_selectors_preserves_multiple_selectors() {
+        let selectors = vec!["main".to_string(), "article".to_string()];
+        assert_eq!(prepare_selectors(&selectors), selectors);
+    }
+
+    #[test]
+    fn validate_http_status_accepts_missing_and_success_status() {
+        let status = Arc::new(Mutex::new(None));
+        assert!(validate_http_status(&status, "https://example.com").is_ok());
+
+        *status.lock().unwrap() = Some(200);
+        assert!(validate_http_status(&status, "https://example.com").is_ok());
+    }
+
+    #[test]
+    fn validate_http_status_rejects_client_error() {
+        let status = Arc::new(Mutex::new(Some(404)));
+        let err = validate_http_status(&status, "https://example.com/missing")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("HTTP 404"));
+        assert!(err.contains("https://example.com/missing"));
+    }
+
+    #[test]
+    fn finalize_output_text_adds_newline_for_file_output() {
+        assert_eq!(
+            finalize_output_text("content".to_string(), true),
+            "content\n"
+        );
+    }
+
+    #[test]
+    fn finalize_output_text_does_not_duplicate_trailing_newline() {
+        assert_eq!(
+            finalize_output_text("content\n".to_string(), true),
+            "content\n"
+        );
+    }
+
+    #[test]
+    fn finalize_output_text_keeps_stdout_output_unchanged() {
+        assert_eq!(
+            finalize_output_text("content".to_string(), false),
+            "content"
+        );
+    }
+
+    #[test]
+    fn capture_output_write_state_none_is_empty() {
+        let state = capture_output_write_state(None);
+
+        assert!(state.old_content.is_none());
+        assert!(!state.file_existed_before);
+        assert!(!state.had_unstaged_changes_before);
+    }
+
+    #[test]
+    fn capture_output_write_state_reads_existing_file() {
+        let dir = make_temp_dir("get-md-output-state");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("output.md");
+        std::fs::write(&path, b"old content").expect("failed to write fixture file");
+
+        let state = capture_output_write_state(Some(&path));
+
+        assert_eq!(state.old_content.as_deref(), Some(&b"old content"[..]));
+        assert!(state.file_existed_before);
+        assert!(!state.had_unstaged_changes_before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_output_write_state_missing_file_is_not_existing() {
+        let dir = make_temp_dir("get-md-output-state-missing");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("missing.md");
+
+        let state = capture_output_write_state(Some(&path));
+
+        assert!(state.old_content.is_none());
+        assert!(!state.file_existed_before);
+        assert!(!state.had_unstaged_changes_before);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
