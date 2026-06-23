@@ -664,7 +664,10 @@ fn idle_browser_timeout(timeout_secs: u64) -> Duration {
     Duration::from_secs(timeout_secs.saturating_add(30))
 }
 
-/// CSS セレクタ文字列を JavaScript 文字列リテラルとしてエスケープする
+/// CSS セレクタ文字列を JavaScript 文字列リテラルとしてエスケープする。
+///
+/// 制御文字（タブ、NUL を含む U+0000〜U+001F）は CSS パーサや CDP 経由の
+/// プロトコル層で予期しない挙動を起こすため、すべて Unicode エスケープにする。
 fn escape_js_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -674,8 +677,13 @@ fn escape_js_string(s: &str) -> String {
             '\\' => out.push_str(r"\\"),
             '\n' => out.push_str(r"\n"),
             '\r' => out.push_str(r"\r"),
+            '\t' => out.push_str(r"\t"),
             '\u{2028}' => out.push_str(r"\u2028"),
             '\u{2029}' => out.push_str(r"\u2029"),
+            // 残りの制御文字(NUL を含む U+0000 から U+001F)は \uXXXX で表現する
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
             _ => out.push(c),
         }
     }
@@ -760,7 +768,18 @@ fn fence_marker(line: &str) -> Option<(char, usize)> {
     }
 
     let len = line.chars().take_while(|c| *c == marker).count();
-    if len >= 3 { Some((marker, len)) } else { None }
+    if len < 3 {
+        return None;
+    }
+
+    // CommonMark §4.5: backtick fence の info string にはバッククォートを含められない
+    // (含めるとインラインコードがフェンス開始と誤認されてしまうため)。
+    // tilde fence にはこの制約は無い。
+    if marker == '`' && line[len..].contains('`') {
+        return None;
+    }
+
+    Some((marker, len))
 }
 
 /// CommonMark のフェンス用インデント（最大 3 スペース）を取り除く。
@@ -1207,10 +1226,28 @@ fn find_next_link_candidate(
 ///
 /// CommonMark では未閉鎖のバッククォート列はリテラルとして扱われるため、
 /// 対応する閉じ列が見つかる場合だけインラインコードとして扱う。
+///
+/// インラインコードは段落をまたいで延びることが無いため、フェンスコードブロック
+/// の開始行に到達した時点で「閉じ列なし」と判定する。これを行わないと、
+/// 未閉鎖の `` ` `` のあとに現れたフェンス内の `` ` `` を閉じと誤認してしまう。
 fn has_matching_inline_code_closer(md: &str, start: usize, tick_len: usize) -> bool {
     let mut cursor = start;
+    let mut line_start = start == 0 || md[..start].ends_with('\n');
 
     while cursor < md.len() {
+        if line_start {
+            let line_end = md[cursor..]
+                .find('\n')
+                .map(|offset| cursor + offset)
+                .unwrap_or(md.len());
+            // フェンス開始行に到達したら、ここでインラインコード探索を打ち切る。
+            // ブロッククォート内のフェンスも対象にする。
+            if fence_marker_after_blockquote(&md[cursor..line_end]).is_some() {
+                return false;
+            }
+            line_start = false;
+        }
+
         let rest = &md[cursor..];
         if rest.starts_with('`') {
             let run_len = rest.chars().take_while(|c| *c == '`').count();
@@ -1223,6 +1260,9 @@ fn has_matching_inline_code_closer(md: &str, start: usize, tick_len: usize) -> b
 
         let ch = rest.chars().next().expect("cursor は文字境界上にある");
         cursor += ch.len_utf8();
+        if ch == '\n' {
+            line_start = true;
+        }
     }
 
     false
@@ -1661,7 +1701,8 @@ mod tests {
 
     #[test]
     fn escape_tab_character() {
-        assert_eq!(escape_js_string("a\tb"), "\"a\tb\"");
+        // タブ文字は \t にエスケープする
+        assert_eq!(escape_js_string("a\tb"), r#""a\tb""#);
     }
 
     #[test]
@@ -3057,8 +3098,17 @@ more code
 
     #[test]
     fn escape_null_byte() {
-        // NULバイトはそのまま通過する（CSS セレクタには通常含まれない）
-        assert_eq!(escape_js_string("a\0b"), "\"a\0b\"");
+        // NULバイトは \u0000 にエスケープする(CDP プロトコル層の終端誤認を回避)
+        assert_eq!(escape_js_string("a\0b"), r#""a\u0000b""#);
+    }
+
+    #[test]
+    fn escape_other_control_characters() {
+        // 0x01-0x1F の制御文字は \uXXXX にエスケープする
+        assert_eq!(escape_js_string("a\u{01}b"), r#""a\u0001b""#);
+        assert_eq!(escape_js_string("a\u{1f}b"), r#""a\u001fb""#);
+        // 0x20 (スペース) はそのまま
+        assert_eq!(escape_js_string("a b"), r#""a b""#);
     }
 
     // resolve_markdown_urls の追加テスト
@@ -4325,9 +4375,9 @@ code
 
     #[test]
     fn escape_js_string_with_form_feed_and_backspace() {
-        // フォームフィードとバックスペースはそのまま通過する
+        // フォームフィードとバックスペースは \uXXXX にエスケープする
         let result = escape_js_string("a\x08b\x0cc");
-        assert_eq!(result, "\"a\x08b\x0cc\"");
+        assert_eq!(result, r#""a\u0008b\u000cc""#);
     }
 
     #[test]
@@ -4729,11 +4779,14 @@ code
 
     #[test]
     fn link_candidate_mid_line_start_treats_backticks_as_inline_code() {
-        // 行の途中から開始した場合、``` はフェンスではなくインラインコードとして扱われる。
-        // インラインコードが [link](url) を包含するため、リンクは検出されない。
+        // 行の途中から開始した場合、``` はインラインコード開始候補になる。
+        // CommonMark ではインラインコードはフェンス境界を越えないため、未閉鎖の `` ``` `` は
+        // リテラル扱いとなり、後続行の [link](url) は通常リンクとして検出される。
         let md = "text ```\n[link](url)\n```";
         let result = find_next_link_candidate(md, 5);
-        assert!(result.is_none());
+        assert!(result.is_some());
+        let pos = result.unwrap();
+        assert!(md[pos..].starts_with("](url)"));
     }
 
     // --- find_next_link_candidate: 未閉鎖の長いバッククォート列 ---
@@ -4867,9 +4920,9 @@ code
     // --- escape_js_string: 追加エッジケース ---
 
     #[test]
-    fn escape_js_string_tab_preserved() {
-        // タブ文字はそのまま通過する（CSS セレクタには通常含まれないが安全）
-        assert_eq!(escape_js_string("\t"), "\"\t\"");
+    fn escape_js_string_tab_escaped() {
+        // タブ文字は \t にエスケープする
+        assert_eq!(escape_js_string("\t"), r#""\t""#);
     }
 
     #[test]
