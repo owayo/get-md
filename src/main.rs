@@ -666,8 +666,10 @@ fn idle_browser_timeout(timeout_secs: u64) -> Duration {
 
 /// CSS セレクタ文字列を JavaScript 文字列リテラルとしてエスケープする。
 ///
-/// 制御文字（タブ、NUL を含む U+0000〜U+001F）は CSS パーサや CDP 経由の
-/// プロトコル層で予期しない挙動を起こすため、すべて Unicode エスケープにする。
+/// 改行/CR/タブは可読性のため短縮エスケープ(\n/\r/\t)を使い、それ以外の
+/// 制御文字(NUL を含む U+0000 から U+001F)は \uXXXX で表現する。
+/// 制御文字を素通しすると CSS パーサや CDP 経由のプロトコル層で
+/// 予期しない挙動を起こすため、すべて何らかのエスケープに変換する。
 fn escape_js_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -2381,6 +2383,30 @@ mod tests {
     }
 
     #[test]
+    fn fence_marker_backtick_info_string_with_backtick_is_rejected() {
+        // CommonMark §4.5: backtick fence の info string にバッククォートを含めると
+        // フェンス開始として無効になる(さもなくばインラインコード `code` がフェンスと誤認される)。
+        assert_eq!(fence_marker("``` `code`"), None);
+        assert_eq!(fence_marker("```foo`bar"), None);
+        // info string 末尾にバッククォートがある場合も拒否
+        assert_eq!(fence_marker("```rust`"), None);
+    }
+
+    #[test]
+    fn fence_marker_backtick_info_string_without_backtick_is_accepted() {
+        // バッククォートを含まない info string は受理する
+        assert_eq!(fence_marker("```rust"), Some(('`', 3)));
+        assert_eq!(fence_marker("```{.rust .numberLines}"), Some(('`', 3)));
+    }
+
+    #[test]
+    fn fence_marker_tilde_info_string_with_backtick_is_accepted() {
+        // tilde fence にはバッククォート禁止の制約はない。
+        assert_eq!(fence_marker("~~~ `code`"), Some(('~', 3)));
+        assert_eq!(fence_marker("~~~foo`bar"), Some(('~', 3)));
+    }
+
+    #[test]
     fn fence_marker_non_fence_char() {
         assert_eq!(fence_marker("---"), None);
     }
@@ -2508,6 +2534,25 @@ more code
     fn resolve_unclosed_inline_code_backticks_are_literal() {
         let input = "`literal [link](./page)";
         let expected = "`literal [link](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_url_when_backtick_fence_info_string_contains_backtick() {
+        // CommonMark §4.5: backtick fence の info string にバッククォートを含む行は
+        // フェンス開始ではないため、後続の [link](./page) は通常リンクとして解決される。
+        let input = "``` `bad`\n[link](./page)\n```";
+        let expected = "``` `bad`\n[link](https://example.com/docs/en/page)\n```";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_url_when_unclosed_inline_code_meets_fence() {
+        // 未閉鎖のインラインコード `` ` `` のあとに本物のフェンス開始行があるとき、
+        // インラインコード探索はフェンス境界で打ち切られるため、未閉鎖の `` ` `` は
+        // リテラル扱いになる。よって `[link](./page)` は通常リンクとして解決される。
+        let input = "` literal [link](./page)\n```\ncode\n```";
+        let expected = "` literal [link](https://example.com/docs/en/page)\n```\ncode\n```";
         assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
@@ -3613,6 +3658,39 @@ code
     #[test]
     fn inline_code_closer_empty_input() {
         assert!(!has_matching_inline_code_closer("", 0, 1));
+    }
+
+    #[test]
+    fn inline_code_closer_stops_at_fence_start() {
+        // CommonMark ではインラインコードはフェンスコードブロック境界を越えない。
+        // 未閉鎖の `` ` `` の後にフェンス開始行が現れたら、その先のフェンス内 `` ` `` を
+        // 閉じ列として誤認してはいけない。
+        let md = "alpha\n```\n`\n```";
+        // start=0 から長さ1で閉じを探すと、フェンス開始行で打ち切られて false
+        assert!(!has_matching_inline_code_closer(md, 0, 1));
+    }
+
+    #[test]
+    fn inline_code_closer_stops_at_fence_start_in_blockquote() {
+        // ブロッククォート内のフェンス開始も境界として扱う
+        let md = "alpha\n> ```\n`\n> ```";
+        assert!(!has_matching_inline_code_closer(md, 0, 1));
+    }
+
+    #[test]
+    fn inline_code_closer_finds_closer_before_fence() {
+        // フェンス開始より前に閉じ列があれば true
+        let md = "alpha`\n```\n`\n```";
+        // start=0, tick_len=1: 行内に閉じ ` があるため true
+        assert!(has_matching_inline_code_closer(md, 0, 1));
+    }
+
+    #[test]
+    fn inline_code_closer_ignores_indented_fence_lookalike() {
+        // 4 スペース以上インデントされた「フェンスもどき」はインデントコード扱いで
+        // フェンスではないため、`has_matching_inline_code_closer` は閉じを探し続ける。
+        let md = "alpha\n    ```\n`";
+        assert!(has_matching_inline_code_closer(md, 0, 1));
     }
 
     // --- マルチバイト文字を含むテーブル圧縮テスト ---
