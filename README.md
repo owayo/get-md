@@ -31,7 +31,7 @@
 - **Code-safe URL Resolution** — leaves inline code, fenced code blocks, and blockquote-contained fenced code blocks untouched when resolving Markdown links
 - **CommonMark-compliant Fence Detection** — recognizes opening and closing fences only with up to three leading spaces, keeps four-space-indented backtick lines as indented code, and does not treat lines with info strings (e.g. ` ```rust `) as closing fences
 - **Markdown Link Robustness** — supports resolving `<...>` style link destinations (including spaces) and ignores bare `](` text that is not real Markdown link syntax
-- **Broken Link Tolerance** — a malformed link candidate without a closing `)` or a malformed `<...>` destination without a closing `>` no longer prevents later valid links on the page from being resolved
+- **Broken Link Tolerance** — a malformed link candidate without a closing `)` or a malformed `<...>` destination without a closing `>` no longer prevents later valid links, including nested links, from being resolved
 - **Literal Backtick Safety** — treats unmatched inline backticks as literal text, so later Markdown links are still resolved
 - **Angle Destination Parentheses Support** — does not treat `)` inside `<...>` link destinations as the closing delimiter
 - **Angle Bracket Escape Support** — correctly handles `\>` inside `<...>` link destinations and resolves it as a literal `>` instead of corrupting the path

@@ -5504,6 +5504,23 @@ code
         assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
+    #[test]
+    fn resolve_broken_nested_link_keeps_outer_link_resolution() {
+        // 外側リンクのテキスト内に閉じ括弧のないリンク候補があっても、
+        // 未閉鎖の外側 `[` を引き継ぎ、内側リンクと外側リンクの両方を解決する。
+        let input = "[outer [broken](./missing [inner](./ok)](./target)";
+        let expected = "[outer [broken](./missing [inner](https://example.com/docs/en/ok)](https://example.com/docs/en/target)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_broken_nested_image_link_keeps_outer_link_resolution() {
+        // 画像リンク形式でも、壊れた候補の後に残る外側リンクの開き括弧を維持する。
+        let input = "[![broken](./missing ![inner](./img.png)](./outer)";
+        let expected = "[![broken](./missing ![inner](https://example.com/docs/en/img.png)](https://example.com/docs/en/outer)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
     // --- resolve_markdown_urls: 既存の壊れたリンクのみ入力時の挙動 ---
 
     #[test]
