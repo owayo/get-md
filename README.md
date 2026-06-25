@@ -58,7 +58,7 @@
 
 - **OS**: macOS, Windows
 - **Chrome/Chromium**: installed on the system
-- **Rust**: 1.85+ (for building from source)
+- **Rust**: 1.88+ (for building from source)
 
 ## Installation
 

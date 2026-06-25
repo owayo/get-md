@@ -1487,6 +1487,41 @@ mod tests {
     }
 
     #[test]
+    fn validate_http_status_accepts_below_400_and_rejects_400_boundary() {
+        // 399 はエラー閾値 (>= 400) の直下なので通過する（境界値の下側）
+        let status = Arc::new(Mutex::new(Some(399)));
+        assert!(validate_http_status(&status, "https://example.com").is_ok());
+
+        // 400 はちょうど閾値でエラーになる（境界値）
+        let status = Arc::new(Mutex::new(Some(400)));
+        assert!(validate_http_status(&status, "https://example.com").is_err());
+    }
+
+    #[test]
+    fn validate_http_status_accepts_redirects_and_rejects_server_errors() {
+        // 3xx リダイレクトは成功扱い（< 400）
+        for code in [301u32, 302, 304, 308] {
+            let status = Arc::new(Mutex::new(Some(code)));
+            assert!(
+                validate_http_status(&status, "https://example.com").is_ok(),
+                "ステータス {code} は通過すべき"
+            );
+        }
+
+        // 5xx サーバエラーはメッセージ付きで拒否する
+        for code in [500u32, 503] {
+            let status = Arc::new(Mutex::new(Some(code)));
+            let err = validate_http_status(&status, "https://example.com")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("HTTP {code}")),
+                "ステータス {code} は拒否しメッセージに含むべき: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn finalize_output_text_adds_newline_for_file_output() {
         assert_eq!(
             finalize_output_text("content".to_string(), true),
