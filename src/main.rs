@@ -5984,6 +5984,48 @@ code
         assert!(!is_closing_fence_line("```", '~', 3));
     }
 
+    // --- is_closing_fence_line_after_indent の直接テスト ---
+
+    #[test]
+    fn closing_fence_after_indent_no_indent() {
+        // インデントなしのマーカーのみは閉じフェンスとして妥当
+        assert!(is_closing_fence_line_after_indent("```", '`', 3));
+        assert!(is_closing_fence_line_after_indent("~~~", '~', 3));
+    }
+
+    #[test]
+    fn closing_fence_after_indent_allows_up_to_three_spaces() {
+        // 最大 3 スペースのインデントは閉じフェンスとして許容する
+        assert!(is_closing_fence_line_after_indent(" ```", '`', 3));
+        assert!(is_closing_fence_line_after_indent("   ```", '`', 3));
+    }
+
+    #[test]
+    fn closing_fence_after_indent_rejects_four_space_or_tab_indent() {
+        // 4 スペース以上・タブはインデントコードブロックなので閉じフェンスにしない
+        assert!(!is_closing_fence_line_after_indent("    ```", '`', 3));
+        assert!(!is_closing_fence_line_after_indent("\t```", '`', 3));
+    }
+
+    #[test]
+    fn closing_fence_after_indent_rejects_info_string() {
+        // インデントを剥がした後も info string 付きは閉じフェンスにしない
+        assert!(!is_closing_fence_line_after_indent("  ```rust", '`', 3));
+    }
+
+    #[test]
+    fn closing_fence_after_indent_allows_trailing_cr() {
+        // 末尾 CR は line ending として無視し CRLF 入力でも閉じる
+        assert!(is_closing_fence_line_after_indent("  ```\r", '`', 3));
+    }
+
+    #[test]
+    fn closing_fence_after_indent_respects_min_len() {
+        // 開始フェンスより短いマーカーは閉じず、同長以上なら閉じる
+        assert!(!is_closing_fence_line_after_indent("  ```", '`', 4));
+        assert!(is_closing_fence_line_after_indent("  ````", '`', 4));
+    }
+
     // --- is_closing_fence_after_blockquote の直接テスト ---
 
     #[test]
@@ -6232,6 +6274,73 @@ inside-of-fence
     fn strip_blockquote_markers_only_markers() {
         // ブロッククォート記号だけで内容がない行
         assert_eq!(strip_blockquote_markers(">>"), Some(""));
+    }
+
+    // --- strip_fence_blockquote_markers の直接テスト ---
+
+    #[test]
+    fn strip_fence_blockquote_markers_no_marker() {
+        // ブロッククォート記号がない行はそのまま返す
+        assert_eq!(
+            strip_fence_blockquote_markers("plain text"),
+            Some("plain text")
+        );
+    }
+
+    #[test]
+    fn strip_fence_blockquote_markers_single_level() {
+        // `>` + スペース、および `>` 直後にスペースが無い場合も取り除く
+        assert_eq!(strip_fence_blockquote_markers("> content"), Some("content"));
+        assert_eq!(strip_fence_blockquote_markers(">content"), Some("content"));
+    }
+
+    #[test]
+    fn strip_fence_blockquote_markers_nested_levels() {
+        // 多段ブロッククォート記号を順に取り除く
+        assert_eq!(strip_fence_blockquote_markers(">> deep"), Some("deep"));
+    }
+
+    #[test]
+    fn strip_fence_blockquote_markers_allows_up_to_three_leading_spaces() {
+        // 行頭は最大 3 スペースまで許容してから記号を処理する
+        assert_eq!(
+            strip_fence_blockquote_markers("   > content"),
+            Some("content")
+        );
+    }
+
+    #[test]
+    fn strip_fence_blockquote_markers_rejects_four_leading_spaces() {
+        // strip_blockquote_markers と異なり、4 スペース以上の行頭インデントは
+        // CommonMark のインデントコードブロック扱いで None を返す
+        assert_eq!(strip_fence_blockquote_markers("    > content"), None);
+    }
+
+    #[test]
+    fn strip_fence_blockquote_markers_allows_up_to_three_spaces_after_marker() {
+        // `>` の後は 1 スペース + 最大 3 スペースインデントまで許容する
+        assert_eq!(
+            strip_fence_blockquote_markers(">    content"),
+            Some("content")
+        );
+    }
+
+    #[test]
+    fn strip_fence_blockquote_markers_rejects_excess_spaces_after_marker() {
+        // `>` の後が過剰インデント(1 スペース + 4 スペース)になると None
+        assert_eq!(strip_fence_blockquote_markers(">     content"), None);
+    }
+
+    #[test]
+    fn strip_fence_blockquote_markers_markers_only() {
+        // ブロッククォート記号だけの行は空文字列を返す
+        assert_eq!(strip_fence_blockquote_markers(">>"), Some(""));
+    }
+
+    #[test]
+    fn strip_fence_blockquote_markers_empty_line() {
+        // 空行はそのまま空文字列を返す
+        assert_eq!(strip_fence_blockquote_markers(""), Some(""));
     }
 
     // --- is_closing_fence_after_blockquote の追加境界テスト ---
