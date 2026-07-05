@@ -861,6 +861,11 @@ fn strip_fence_blockquote_markers(line: &str) -> Option<&str> {
     Some(rest)
 }
 
+/// URL 解決の走査対象から外す CommonMark のインデントコード行か判定する。
+fn is_indented_code_line_for_link_scan(line: &str) -> bool {
+    strip_fence_indent(line).is_none() || strip_fence_blockquote_markers(line).is_none()
+}
+
 /// `fence_marker_after_blockquote` で得たマーカーが閉じフェンスとして妥当か判定する。
 fn is_closing_fence_after_blockquote(line: &str, marker: char, min_len: usize) -> bool {
     let Some(rest) = strip_fence_blockquote_markers(line) else {
@@ -1117,6 +1122,15 @@ fn find_next_link_candidate(
                 .map(|offset| cursor + offset)
                 .unwrap_or(md.len());
             let line = &md[cursor..line_end];
+            if !in_fenced_code_block && is_indented_code_line_for_link_scan(line) {
+                cursor = line_end;
+                if cursor < md.len() {
+                    cursor += 1;
+                }
+                line_start = true;
+                backslash_run = 0;
+                continue;
+            }
             let mut handled_as_fence = false;
             if in_fenced_code_block {
                 // 閉じフェンスは marker 以降が空白/タブのみのときだけ閉じる。
@@ -5493,6 +5507,22 @@ code
         let input = ">> ```\n>> [skip](./code)\n>> ```\n>> [real](./page)";
         let expected =
             ">> ```\n>> [skip](./code)\n>> ```\n>> [real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_inside_indented_code_unchanged() {
+        // CommonMark のインデントコードブロック内は URL 解決対象から除外する
+        let input = "    [skip](./code)\n[real](./page)";
+        let expected = "    [skip](./code)\n[real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_inside_blockquote_indented_code_unchanged() {
+        // ブロッククォート内のインデントコードブロックも URL 解決対象から除外する
+        let input = ">     [skip](./code)\n> [real](./page)";
+        let expected = ">     [skip](./code)\n> [real](https://example.com/docs/en/page)";
         assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
