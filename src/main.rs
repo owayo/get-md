@@ -1662,6 +1662,45 @@ mod tests {
     }
 
     #[test]
+    fn write_or_print_output_creates_missing_file_output() {
+        let dir = make_temp_dir("get-md-write-create");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("output.md");
+
+        let cli = cli_with_output(path.clone(), false);
+        let output_state = capture_output_write_state(Some(&path));
+        let progress = Progress::new(false);
+
+        write_or_print_output(&cli, "new content\n", output_state, &progress)
+            .expect("failed to handle output");
+
+        let saved = std::fs::read_to_string(&path).expect("failed to read output file");
+        assert_eq!(saved, "new content\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_or_print_output_without_ignore_date_overwrites_date_only_change() {
+        let dir = make_temp_dir("get-md-write-no-ignore-date");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("output.md");
+        std::fs::write(&path, "Updated: 2026-04-12 09:00\n").expect("failed to write fixture file");
+
+        let cli = cli_with_output(path.clone(), false);
+        let output_state = capture_output_write_state(Some(&path));
+        let progress = Progress::new(false);
+
+        write_or_print_output(&cli, "Updated: 2026-04-13 10:00\n", output_state, &progress)
+            .expect("failed to handle output");
+
+        let saved = std::fs::read_to_string(&path).expect("failed to read output file");
+        assert_eq!(saved, "Updated: 2026-04-13 10:00\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn escape_simple_selector() {
         assert_eq!(escape_js_string("body"), r#""body""#);
     }
