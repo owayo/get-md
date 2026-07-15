@@ -1181,6 +1181,11 @@ fn find_next_link_candidate(
                     inline_code_len = 0;
                 }
                 cursor += tick_len;
+                // バッククォート列は改行を含まないため、消費後は行頭ではない。
+                // これを反映しないと、改行をまたぐインラインコードが行の途中で
+                // 閉じたとき、行の残りがフェンス開始/インデントコード行として
+                // 誤判定され、同一行以降のリンクが解決されなくなる。
+                line_start = false;
                 backslash_run = 0;
                 continue;
             }
@@ -1188,9 +1193,8 @@ fn find_next_link_candidate(
                 break;
             };
             cursor += ch.len_utf8();
-            if ch == '\n' {
-                line_start = true;
-            }
+            // 非改行文字を消費したら行頭フラグを下ろし、行頭判定の陳腐化を防ぐ。
+            line_start = ch == '\n';
             backslash_run = 0;
             continue;
         }
@@ -6561,6 +6565,36 @@ inside-of-fence
         // その後ろのリンクの `](` 位置を返す。
         let md = "`a\nb` [x](y)";
         assert_eq!(find_next_link_candidate(md, 0), Some(8));
+    }
+
+    // --- 改行をまたぐインラインコードが行途中で閉じた後の行頭判定の陳腐化防止 ---
+
+    #[test]
+    fn resolve_link_after_multiline_inline_code_closing_before_fence_lookalike() {
+        // 改行をまたぐインラインコードが行の途中で閉じた直後に ``` が続いても、
+        // 行の残りを「行頭のフェンス開始」と誤認せず、後続行のリンクを解決する。
+        // (CommonMark ではフェンスは物理行頭でのみ開始する)
+        let input = "`a\nb` ```\n[x](./y)";
+        let expected = "`a\nb` ```\n[x](https://example.com/docs/en/y)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_after_multiline_inline_code_closing_before_indented_lookalike() {
+        // 改行をまたぐインラインコードが行の途中で閉じた直後に 4 スペースが続いても、
+        // 行の残りを「インデントコード行」と誤認せず、同一行のリンクを解決する。
+        let input = "`a\n    b`    [x](./y)";
+        let expected = "`a\n    b`    [x](https://example.com/docs/en/y)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn link_candidate_multiline_inline_code_close_at_line_start_then_fence_lookalike() {
+        // 閉じバッククォート列が物理行頭にある場合も、消費後は行頭扱いにしない。
+        // 直後の ``` は未閉鎖のリテラルなバッククォート列であり、フェンスではない。
+        let input = "`a\n` ```\n[x](./y)";
+        let expected = "`a\n` ```\n[x](https://example.com/docs/en/y)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
     // --- 4 スペース以上インデントされたテーブル風行はコードとして保持される ---
