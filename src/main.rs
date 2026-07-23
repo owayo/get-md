@@ -1359,6 +1359,11 @@ fn split_link_destination(inside: &str) -> (&str, &str, bool) {
 }
 
 /// `](` の暗黙の開き `(` に対応する閉じ `)` を探す。
+///
+/// CommonMark ではリンクの構成要素(リンク先・title・その前後の空白)は
+/// 空行(ブロック境界)を跨げないため、空行を検出した時点で打ち切る。
+/// これを行わないと、空行の先にある無関係な `)` を閉じと誤認し、
+/// リンクではない通常テキストを URL に書き換えてしまう。
 fn find_link_close_paren(s: &str) -> Option<usize> {
     let mut depth = 1;
     let mut backslash_run = 0usize;
@@ -1366,8 +1371,20 @@ fn find_link_close_paren(s: &str) -> Option<usize> {
     let mut saw_dest_non_ws = false;
     let mut saw_sep_ws = false;
     let mut in_angle_destination = false;
+    // 改行後に空白/タブ/CR のみが続いている間 true。この状態で再度改行が
+    // 現れたら空行(ブロック境界)なので、山括弧内・title 内を問わず打ち切る。
+    let mut blank_line_pending = false;
 
     for (i, c) in s.char_indices() {
+        if c == '\n' {
+            if blank_line_pending {
+                return None;
+            }
+            blank_line_pending = true;
+        } else if blank_line_pending && !matches!(c, ' ' | '\t' | '\r') {
+            blank_line_pending = false;
+        }
+
         let escaped = c != '\\' && backslash_run % 2 == 1;
 
         if c == '\\' {
@@ -2179,6 +2196,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_does_not_cross_blank_line_for_close_paren() {
+        // CommonMark ではリンク構文の構成要素は空行(ブロック境界)を跨げない。
+        // 空行の先にある `)` を閉じと誤認して通常テキストを URL 化しないこと。
+        let input = "Some [text]( and more.\n\nLater a closing ) here.";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_link_after_blank_line_inside_broken_candidate() {
+        // 空行跨ぎの壊れた候補に飲み込まれず、空行後の本物のリンクを解決すること。
+        let input = "[a]( x\n\n[real](./page) y )";
+        let expected = "[a]( x\n\n[real](https://example.com/docs/en/page) y )";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
     fn resolve_nested_parens_in_url() {
         assert_eq!(
             resolve_markdown_urls("[wiki](/wiki/Rust_(language))", BASE),
@@ -2243,6 +2276,24 @@ mod tests {
     #[test]
     fn find_close_paren_ignores_escaped_open() {
         assert_eq!(find_link_close_paren(r"foo\(bar)"), Some(8));
+    }
+
+    #[test]
+    fn find_close_paren_stops_at_blank_line() {
+        // 空行はブロック境界なので、その先の `)` は閉じとして採用しない。
+        assert_eq!(find_link_close_paren("text\n\nmore )"), None);
+        // 空白/タブだけの行も CommonMark の blank line として扱う。
+        assert_eq!(find_link_close_paren("text\n \t\nmore )"), None);
+        // CRLF の空行も同様に打ち切る。
+        assert_eq!(find_link_close_paren("text\r\n\r\nmore )"), None);
+    }
+
+    #[test]
+    fn find_close_paren_allows_single_newline() {
+        // 単一改行(空行でない)は従来どおり許容し、閉じ `)` を返す。
+        assert_eq!(find_link_close_paren("./a\ntitlepart)"), Some(13));
+        // title 内の単一改行も許容する。
+        assert_eq!(find_link_close_paren("./a \"line\nbreak\")"), Some(16));
     }
 
     // compact_table_row の境界ケース
