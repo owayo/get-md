@@ -236,6 +236,43 @@ fn multiple_selectors_are_joined_with_separator() {
 
 #[test]
 #[ignore] // システムに Chrome/Chromium が必要
+fn invalid_css_selector_is_reported_as_error() {
+    let temp_dir = TempDir::new();
+    let page = temp_dir.path().join("page.html");
+    write_file(
+        &page,
+        r#"<!doctype html>
+<html>
+  <body><main>content</main></body>
+</html>"#,
+    );
+
+    let output = get_md_bin()
+        .args([
+            file_url(&page),
+            "-s".to_string(),
+            "[".to_string(),
+            "-w".to_string(),
+            "0".to_string(),
+            "-q".to_string(),
+        ])
+        .output()
+        .expect("Failed to execute get-md");
+
+    assert!(
+        !output.status.success(),
+        "get-md should reject an invalid CSS selector: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Invalid CSS selector '['"),
+        "stderr should identify the invalid selector: {stderr}",
+    );
+}
+
+#[test]
+#[ignore] // システムに Chrome/Chromium が必要
 fn ignore_date_keeps_existing_output_when_only_timestamp_differs() {
     let temp_dir = TempDir::new();
     let page = temp_dir.path().join("page.html");

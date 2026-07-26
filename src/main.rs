@@ -1,5 +1,6 @@
 mod progress;
 
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -193,6 +194,17 @@ fn validate_http_status(main_response_status: &MainResponseStatus, url: &str) ->
     Ok(())
 }
 
+/// セレクタ評価 JS が例外を捕捉した際に返す文字列の番兵プレフィックス。
+///
+/// HTML パーサは文書中の U+0000 を U+FFFD に置換するため、実際の outerHTML が
+/// このプレフィックスで始まることはなく、正規の抽出結果とは衝突しない。
+const SELECTOR_ERROR_SENTINEL: &str = "\u{0}get-md-selector-error\u{0}";
+
+/// セレクタ評価結果からエラー番兵を判別し、エラーであれば例外メッセージを返す。
+fn selector_evaluation_error(value: &str) -> Option<&str> {
+    value.strip_prefix(SELECTOR_ERROR_SENTINEL)
+}
+
 fn extract_html_fragments(
     tab: &Tab,
     selectors: &[String],
@@ -204,13 +216,20 @@ fn extract_html_fragments(
     for selector in selectors {
         progress.set_message(&format!("Extracting selector '{}'...", selector));
 
-        // 一致した全要素の outerHTML を取得する
+        // 一致した全要素の outerHTML を取得する。headless_chrome の evaluate は
+        // exceptionDetails を検査せず例外を空値として返すため、無効なセレクタ等の
+        // 例外は JS 側で捕捉して番兵付きメッセージにし、「マッチ 0 件」と区別する。
         let js = format!(
             r#"(() => {{
-                const els = document.querySelectorAll({selector});
-                return Array.from(els).map(el => el.outerHTML).join('\n');
+                try {{
+                    const els = document.querySelectorAll({selector});
+                    return Array.from(els).map(el => el.outerHTML).join('\n');
+                }} catch (err) {{
+                    return {sentinel} + String(err && err.message ? err.message : err);
+                }}
             }})()"#,
             selector = escape_js_string(selector),
+            sentinel = escape_js_string(SELECTOR_ERROR_SENTINEL),
         );
 
         let result = tab
@@ -223,6 +242,10 @@ fn extract_html_fragments(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+
+        if let Some(message) = selector_evaluation_error(&html) {
+            bail!("Invalid CSS selector '{}': {}", selector, message);
+        }
 
         if html.is_empty() {
             eprintln!("Warning: no elements matched selector '{}'", selector);
@@ -429,13 +452,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         persisted: false,
     };
 
-    tmp_file.write_all(bytes).with_context(|| {
-        format!(
-            "Failed to write temporary output file: {}",
-            guard.path.display()
-        )
-    })?;
-
+    // 内容を書き込む前にパーミッションを揃える。書き込み後に絞ると、既存ファイルが
+    // 制限モード(0600 等)の場合に新しい内容が一時的に緩いモードで読める窓ができる。
+    // 開いたファイルディスクリプタへの書き込み権限は open 時に確定しており、
+    // 先に読み取り専用へ変更しても後続の write_all は失敗しない。
     if let Some(permissions) = existing_permissions {
         tmp_file.set_permissions(permissions).with_context(|| {
             format!(
@@ -444,6 +464,13 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             )
         })?;
     }
+
+    tmp_file.write_all(bytes).with_context(|| {
+        format!(
+            "Failed to write temporary output file: {}",
+            guard.path.display()
+        )
+    })?;
 
     tmp_file.sync_all().with_context(|| {
         format!(
@@ -615,11 +642,23 @@ fn has_unstaged_changes(path: &Path) -> bool {
         .find(|ancestor| ancestor.is_dir())
         .unwrap_or_else(|| Path::new("."));
 
+    // glob メタ文字(`*` `?` `[...]`)を含むパスが pathspec として展開され、
+    // 同パターンにマッチする別ファイルの未ステージ変更を誤検出しないよう
+    // literal magic を付けてリテラル一致に固定する。
+    // `git -C` 後の作業ディレクトリを基準にした相対パスを渡す。絶対パスへ
+    // pathspec magic を直接連結すると、Windows のドライブレターを含むパスを
+    // Git がリポジトリ内 pathspec として解釈できない。
+    let Ok(relative_path) = absolute_path.strip_prefix(git_dir) else {
+        return false;
+    };
+    let mut literal_pathspec = OsString::from(":(literal)");
+    literal_pathspec.push(relative_path.as_os_str());
+
     Command::new("git")
         .arg("-C")
         .arg(git_dir)
         .args(["diff", "--name-only", "--"])
-        .arg(&absolute_path)
+        .arg(literal_pathspec)
         .output()
         .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false)
@@ -864,6 +903,14 @@ fn strip_fence_blockquote_markers(line: &str) -> Option<&str> {
 /// URL 解決の走査対象から外す CommonMark のインデントコード行か判定する。
 fn is_indented_code_line_for_link_scan(line: &str) -> bool {
     strip_fence_indent(line).is_none() || strip_fence_blockquote_markers(line).is_none()
+}
+
+/// URL 解決時の段落境界となる空行か判定する。
+///
+/// 通常の空行に加え、ブロッククォート記号だけの行も、そのクォート内では
+/// 空行として扱う。
+fn is_blank_line_for_link_scan(line: &str) -> bool {
+    line.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '>'))
 }
 
 /// `fence_marker_after_blockquote` で得たマーカーが閉じフェンスとして妥当か判定する。
@@ -1122,7 +1169,15 @@ fn find_next_link_candidate(
                 .map(|offset| cursor + offset)
                 .unwrap_or(md.len());
             let line = &md[cursor..line_end];
+
+            // 空行は段落境界なので、前段落で未閉鎖だった `[` を引き継がない。
+            // ブロッククォート記号だけの行も、そのクォート内では空行として扱う。
+            if is_blank_line_for_link_scan(line) {
+                open_bracket_count = 0;
+            }
             if !in_fenced_code_block && is_indented_code_line_for_link_scan(line) {
+                // コードブロックも段落境界なので、その前後をリンクとして接続しない。
+                open_bracket_count = 0;
                 cursor = line_end;
                 if cursor < md.len() {
                     cursor += 1;
@@ -1147,6 +1202,8 @@ fn find_next_link_candidate(
                 handled_as_fence = true;
             }
             if handled_as_fence {
+                // フェンスコードブロックの前後をまたぐリンクは成立しない。
+                open_bracket_count = 0;
                 cursor = line_end;
                 if cursor < md.len() {
                     cursor += 1;
@@ -1248,8 +1305,9 @@ fn find_next_link_candidate(
 /// 対応する閉じ列が見つかる場合だけインラインコードとして扱う。
 ///
 /// インラインコードは段落をまたいで延びることが無いため、フェンスコードブロック
-/// の開始行に到達した時点で「閉じ列なし」と判定する。これを行わないと、
-/// 未閉鎖の `` ` `` のあとに現れたフェンス内の `` ` `` を閉じと誤認してしまう。
+/// の開始行、または空行(段落境界)に到達した時点で「閉じ列なし」と判定する。
+/// これを行わないと、未閉鎖の `` ` `` のあとに現れたフェンス内・別段落の `` ` `` を
+/// 閉じと誤認してしまう。
 fn has_matching_inline_code_closer(md: &str, start: usize, tick_len: usize) -> bool {
     let mut cursor = start;
     let mut line_start = start == 0 || md[..start].ends_with('\n');
@@ -1260,9 +1318,15 @@ fn has_matching_inline_code_closer(md: &str, start: usize, tick_len: usize) -> b
                 .find('\n')
                 .map(|offset| cursor + offset)
                 .unwrap_or(md.len());
+            let line = &md[cursor..line_end];
+            // 空行（ブロッククォート記号だけの行を含む）は段落境界なので、
+            // ここで探索を打ち切る。
+            if is_blank_line_for_link_scan(line) {
+                return false;
+            }
             // フェンス開始行に到達したら、ここでインラインコード探索を打ち切る。
             // ブロッククォート内のフェンスも対象にする。
-            if fence_marker_after_blockquote(&md[cursor..line_end]).is_some() {
+            if fence_marker_after_blockquote(line).is_some() {
                 return false;
             }
             line_start = false;
@@ -1759,6 +1823,35 @@ mod tests {
         );
     }
 
+    // --- selector_evaluation_error テスト ---
+
+    #[test]
+    fn selector_error_sentinel_is_detected() {
+        // 番兵プレフィックス付きの評価結果は例外メッセージとして判別される。
+        let value = format!("{SELECTOR_ERROR_SENTINEL}'div:has(' is not a valid selector.");
+        assert_eq!(
+            selector_evaluation_error(&value),
+            Some("'div:has(' is not a valid selector."),
+        );
+    }
+
+    #[test]
+    fn selector_error_sentinel_absent_for_normal_results() {
+        // 正規の抽出結果(HTML・空文字)はエラー扱いにならない。
+        assert_eq!(selector_evaluation_error("<div>ok</div>"), None);
+        assert_eq!(selector_evaluation_error(""), None);
+    }
+
+    #[test]
+    fn selector_error_sentinel_survives_js_escaping() {
+        // 番兵は JS 文字列リテラルとして埋め込まれるため、NUL が \u0000 に
+        // エスケープされ、評価時に元の番兵文字列へ復元される表現であること。
+        assert_eq!(
+            escape_js_string(SELECTOR_ERROR_SENTINEL),
+            r#""\u0000get-md-selector-error\u0000""#,
+        );
+    }
+
     #[test]
     fn cli_default_values() {
         let cli = Cli::try_parse_from(["get-md", "https://example.com"]).unwrap();
@@ -2208,6 +2301,54 @@ mod tests {
         // 空行跨ぎの壊れた候補に飲み込まれず、空行後の本物のリンクを解決すること。
         let input = "[a]( x\n\n[real](./page) y )";
         let expected = "[a]( x\n\n[real](https://example.com/docs/en/page) y )";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_open_bracket_does_not_cross_blank_line() {
+        // 空行の前にある未閉鎖 `[` と後段落の `](` はリンクを構成しないため、
+        // 後段落の文字列を URL として書き換えないこと。
+        let input = "[broken\n\ntext](./page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_open_bracket_does_not_cross_blockquote_blank_line() {
+        // ブロッククォート記号だけの行もクォート内の段落境界として扱う。
+        let input = "> [broken\n>\n> text](./page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_open_bracket_does_not_cross_fenced_code_block() {
+        // フェンスコードブロック前の未閉鎖 `[` をブロック後へ引き継がないこと。
+        let input = "[broken\n```text\ncode\n```\ntext](./page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_link_text_may_cross_single_line_break() {
+        // 空行でない単一改行はリンクテキスト内の soft break なので URL 解決を維持する。
+        let input = "[first\nsecond](./page)";
+        let expected = "[first\nsecond](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_backticks_across_blank_line_do_not_form_code_span() {
+        // インラインコードは段落(空行)を跨げない。空行を挟んだバッククォート同士を
+        // コードスパンと誤認して、後続段落のリンクを未解決のまま残さないこと。
+        let input = "`a\n\nb [x](./y) c`";
+        let expected = "`a\n\nb [x](https://example.com/docs/en/y) c`";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_backticks_across_blockquote_blank_line_do_not_form_code_span() {
+        // `>` だけの行もブロッククォート内の段落境界。前段落の未閉鎖バッククォートで
+        // 後段落のリンクをコード扱いしないこと。
+        let input = "> `a\n>\n> b [x](./y) c`";
+        let expected = "> `a\n>\n> b [x](https://example.com/docs/en/y) c`";
         assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
@@ -2853,6 +2994,35 @@ more code
         assert!(has_unstaged_changes(&path));
 
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn has_unstaged_changes_does_not_glob_match_sibling_files() {
+        let dir = make_temp_dir("get-md-git-glob-status");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        // glob メタ文字 `[...]` を含む出力ファイル名(Windows でも合法)と、
+        // その文字クラスにマッチしてしまう隣接ファイルを用意する。
+        let glob_named = dir.join("notes [draft].md");
+        let sibling = dir.join("notes d.md");
+
+        git(&dir, &["init"]);
+        git(&dir, &["config", "user.name", "Test User"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+
+        std::fs::write(&glob_named, b"glob").expect("failed to write glob-named file");
+        std::fs::write(&sibling, b"sibling").expect("failed to write sibling file");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-m", "init"]);
+
+        // 隣接ファイルだけの変更を、pathspec の glob 展開で誤検出しないこと。
+        std::fs::write(&sibling, b"changed").expect("failed to update sibling file");
+        assert!(!has_unstaged_changes(&glob_named));
+
+        // 出力ファイル自身の変更は従来どおり検出されること。
+        std::fs::write(&glob_named, b"changed").expect("failed to update glob-named file");
+        assert!(has_unstaged_changes(&glob_named));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3888,6 +4058,25 @@ code
         let md = "alpha`\n```\n`\n```";
         // start=0, tick_len=1: 行内に閉じ ` があるため true
         assert!(has_matching_inline_code_closer(md, 0, 1));
+    }
+
+    #[test]
+    fn inline_code_closer_stops_at_blank_line() {
+        // CommonMark ではインラインコードは段落(空行)を越えない。
+        // 空行の先にあるバッククォートを閉じ列として誤認してはいけない。
+        assert!(!has_matching_inline_code_closer("a\n\nb `", 0, 1));
+        // 空白/タブだけの行も blank line として扱う。
+        assert!(!has_matching_inline_code_closer("a\n \t\nb `", 0, 1));
+        // CRLF の空行も同様に打ち切る。
+        assert!(!has_matching_inline_code_closer("a\r\n\r\nb `", 0, 1));
+        // ブロッククォート記号だけの行もクォート内の空行として扱う。
+        assert!(!has_matching_inline_code_closer("a\n>\nb `", 0, 1));
+    }
+
+    #[test]
+    fn inline_code_closer_finds_closer_before_blank_line() {
+        // 空行より前に閉じ列があれば従来どおり true
+        assert!(has_matching_inline_code_closer("a`\n\nb", 0, 1));
     }
 
     #[test]

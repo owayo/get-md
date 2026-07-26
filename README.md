@@ -21,6 +21,7 @@
 
 - **JS Rendering Support** — uses system Chrome via CDP, handles SPAs and dynamic content
 - **CSS Selector Targeting** — extract only the elements you need (multiple selectors supported)
+- **Invalid Selector Errors** — reports invalid CSS selectors as errors instead of misreporting them as selectors with no matches
 - **Ordered Multi-selector Merge** — when multiple selectors are specified, the extracted fragments are joined with `---` in the same order
 - **No WebDriver Required** — directly controls your installed Chrome/Chromium
 - **Flexible Output** — write to file or stdout
@@ -32,6 +33,7 @@
 - **CommonMark-compliant Fence Detection** — recognizes opening and closing fences only with up to three leading spaces, keeps four-space-indented backtick lines as indented code, and does not treat lines with info strings (e.g. ` ```rust `) as closing fences
 - **Markdown Link Robustness** — supports resolving `<...>` style link destinations (including spaces) and ignores bare `](` text that is not real Markdown link syntax
 - **Broken Link Tolerance** — a malformed link candidate without a closing `)` or a malformed `<...>` destination without a closing `>` no longer prevents later valid links, including nested links, from being resolved
+- **Paragraph-boundary Link Safety** — does not combine unmatched `[` or inline backticks with delimiters beyond blank lines (including blockquote-only blank lines) or code-block boundaries, while preserving valid link text across a single soft line break
 - **Literal Backtick Safety** — treats unmatched inline backticks as literal text, so later Markdown links are still resolved
 - **Multiline Inline-code Scanning** — keeps physical line-start tracking accurate after multiline inline code closes, so fence-like or indented text later on that line cannot hide subsequent links
 - **Angle Destination Parentheses Support** — does not treat `)` inside `<...>` link destinations as the closing delimiter
@@ -50,10 +52,10 @@
 - **Progress Display** — shows operation progress with quiet mode option, and reports completion only after output succeeds
 - **CDP-backed HTTP Status Checks** — rejects real HTTP error responses using Chrome DevTools Protocol events, even if page scripts alter browser performance APIs
 - **Certificate Safety by Default** — validates HTTPS certificates by default; `--ignore-certificate-errors` is available only for explicit trusted debugging cases
-- **File Status Icons** — shows ✨ (created), 📝 (updated), or ✔ (unchanged) for file output; git-aware change detection is anchored to the target path so deleted tracked files and runs from outside the repo still resolve to `updated`, and existing unreadable files also fall back to `updated`
+- **File Status Icons** — shows ✨ (created), 📝 (updated), or ✔ (unchanged) for file output; git-aware change detection is anchored to the literal target path (including names with glob metacharacters), so deleted tracked files and runs from outside the repo still resolve to `updated`, and existing unreadable files also fall back to `updated`
 - **Date-only Diff Ignore** — `--ignore-date` skips rewrites when only timestamp strings changed, including common ISO 8601 forms with fractional seconds and timezone suffixes; requires both old and new content to contain date patterns, and safely falls back for non-UTF-8 files
 - **Timeout Safety** — internal browser idle-timeout buffer uses saturating arithmetic to avoid overflow at extreme `--timeout` values
-- **Atomic File Writes** — output is written to a temporary file in the same directory and atomically renamed into place, so an I/O error mid-write (e.g. disk full) never truncates or corrupts an existing file; existing file permissions are preserved, write permission is checked up front, and symlinked outputs resolve to the real target so the link stays intact. Renaming replaces the inode, so hard links are broken and ACLs/xattrs are not carried over (a deliberate trade-off for crash safety)
+- **Atomic File Writes** — output is written to a temporary file in the same directory and atomically renamed into place, so an I/O error mid-write (e.g. disk full) never truncates or corrupts an existing file; existing permissions are applied before content is written, write permission is checked up front, and symlinked outputs resolve to the real target so the link stays intact. Renaming replaces the inode, so hard links are broken and ACLs/xattrs are not carried over (a deliberate trade-off for crash safety)
 
 ## Requirements
 
@@ -193,6 +195,7 @@ Ignored E2E tests cover:
 - Fetching a real GitHub raw document
 - Resolving relative links and images from a local `file://` page, including `<base href>`
 - Joining multiple selectors with the documented `---` separator
+- Rejecting invalid CSS selectors with an explicit error
 - Skipping rewrites for `--ignore-date` when only timestamp text changes, while still overwriting non-date content changes
 - Rejecting a real HTTP 404 even when page scripts spoof browser performance APIs
 
