@@ -402,7 +402,7 @@ fn document_base_url(tab: &Tab) -> Option<String> {
 /// I/O エラー（ディスク容量不足など）が発生しても既存ファイルが中途半端な状態に
 /// ならない。既存ファイルがある場合はそのパーミッション（Unix のモードビット等）を
 /// 引き継ぎ、出力先がシンボリックリンクのときは実体パスへ解決してリンクを保ったまま
-/// 更新する。
+/// 更新する。リンク先が存在せず、その親ディレクトリも未作成の場合は必要な親を作成する。
 ///
 /// なお `rename` は新しい inode で既存ファイルを置き換えるため、出力先へのハードリンクは
 /// 切れ、ACL や拡張属性（xattr）は引き継がれない。データ損失を防ぐことを優先した仕様。
@@ -420,6 +420,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    // リンク先が存在しないシンボリックリンクに未作成の親ディレクトリがある場合も、
+    // 通常パスと同じく出力先まで作成できるよう、解決後の親も作成する。
+    fs::create_dir_all(write_parent).with_context(|| {
+        format!(
+            "Failed to create resolved output directory: {}",
+            write_parent.display()
+        )
+    })?;
 
     // 既存ファイルがあれば、書き込み権限を事前確認しつつパーミッションを保持する。
     let existing_permissions = match fs::metadata(&write_path) {
@@ -3217,6 +3225,33 @@ more code
         assert_eq!(
             std::fs::read(&target).unwrap(),
             b"created via dangling link"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_missing_parent_of_dangling_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = make_temp_dir("get-md-atomic-dangling-parent");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let target = dir.join("missing/subdir/real.md");
+        let link = dir.join("link.md");
+        symlink(&target, &link).expect("failed to create symlink");
+
+        atomic_write(&link, b"created with missing target parent")
+            .expect("atomic_write should create the dangling target parent");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"created with missing target parent"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
