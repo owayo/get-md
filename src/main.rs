@@ -908,25 +908,12 @@ fn strip_fence_blockquote_markers(line: &str) -> Option<&str> {
     Some(rest)
 }
 
-/// URL 解決の走査対象から外す CommonMark のインデントコード行か判定する。
-fn is_indented_code_line_for_link_scan(line: &str) -> bool {
-    strip_fence_indent(line).is_none() || strip_fence_blockquote_markers(line).is_none()
-}
-
 /// URL 解決時の段落境界となる空行か判定する。
 ///
 /// 通常の空行に加え、ブロッククォート記号だけの行も、そのクォート内では
 /// 空行として扱う。
 fn is_blank_line_for_link_scan(line: &str) -> bool {
     line.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '>'))
-}
-
-/// `fence_marker_after_blockquote` で得たマーカーが閉じフェンスとして妥当か判定する。
-fn is_closing_fence_after_blockquote(line: &str, marker: char, min_len: usize) -> bool {
-    let Some(rest) = strip_fence_blockquote_markers(line) else {
-        return false;
-    };
-    is_closing_fence_line(rest, marker, min_len)
 }
 
 fn compact_table_row(row: &str) -> String {
@@ -1031,6 +1018,8 @@ fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
         Err(_) => return md.to_string(),
     };
 
+    // ブロック構造（コード領域・空行）は走査のたびに作り直せないため先に 1 パスで求める。
+    let blocks = MarkdownBlockMap::build(md);
     let mut result = String::with_capacity(md.len());
     let mut cursor = 0usize;
     // ループをまたいで、cursor 以前のコード領域外で未閉鎖の `[` を引き継ぐ。
@@ -1039,7 +1028,7 @@ fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
     let mut pending_open_brackets: usize = 0;
 
     while let (Some(open), open_count_at_link) =
-        find_next_link_candidate(md, cursor, pending_open_brackets)
+        find_next_link_candidate(md, cursor, pending_open_brackets, &blocks)
     {
         let inside_start = open + 2;
 
@@ -1140,22 +1129,241 @@ fn unescape_markdown_destination(url: &str) -> String {
     result
 }
 
-/// フェンスコードブロックとインラインコードを除外しつつ、次の `](` を探す。
+/// URL 解決の走査における行の分類。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LinkScanLineKind {
+    /// 空行（段落境界）。ブロッククォート記号だけの行も含む。
+    Blank,
+    /// コード領域の行。フェンスコードブロックとインデントコードブロックの両方。
+    Code,
+    /// 通常の行。リンクの URL 解決対象。
+    Normal,
+}
+
+/// 1 行分の分類結果。
+struct LinkScanLine {
+    /// 行頭のバイトオフセット
+    start: usize,
+    /// 次の行頭のバイトオフセット（最終行では入力全体の長さ）
+    next_start: usize,
+    kind: LinkScanLineKind,
+}
+
+/// Markdown を行単位で分類したブロック構造マップ。
 ///
-/// コード領域外で開いている `[` を前方走査でカウントし、エスケープされた
-/// `\]` `\`` `\[` を正しくリテラルとして扱う。`initial_open_brackets` は
+/// URL 解決は `find_next_link_candidate` を何度も呼び直し、リンクを 1 つ処理する
+/// たびにカーソルが行をまたいで飛ぶ。走査のたびにブロック状態を組み立て直すと、
+/// 文書先頭からの累積でしか決まらないリストの入れ子状態を復元できないため、
+/// 文書全体を先に 1 パスで分類しておき、走査側は行頭オフセットで引くだけにする。
+///
+/// インデントコードブロックの判定基準は、CommonMark に従って
+/// 「その行を含むリスト項目の内容インデント + 4」とする。単純に
+/// 「行頭 4 スペース以上」で判定すると、htmd が出力するネストしたリスト
+/// （3 段目で 4 スペース以上になる）をコードと誤判定し、
+/// リスト内のリンクが絶対 URL に解決されなくなる。
+struct MarkdownBlockMap {
+    lines: Vec<LinkScanLine>,
+}
+
+impl MarkdownBlockMap {
+    fn build(md: &str) -> Self {
+        let mut lines = Vec::new();
+        // 開いているリスト項目の内容インデント（外側から内側の順）
+        let mut list_indents: Vec<usize> = Vec::new();
+        // 開いているフェンス: (マーカー文字, マーカー長, 開始行のインデント)
+        let mut open_fence: Option<(char, usize, usize)> = None;
+        let mut blockquote_depth = 0usize;
+        let mut start = 0usize;
+
+        loop {
+            let line_end = md[start..]
+                .find('\n')
+                .map(|offset| start + offset)
+                .unwrap_or(md.len());
+            let next_start = if line_end < md.len() {
+                line_end + 1
+            } else {
+                md.len()
+            };
+            // 行末の CR は line ending の一部なので、分類前に落とす
+            let raw_line = &md[start..line_end];
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+
+            let (body, depth) = strip_blockquote_prefix_for_scan(line);
+            let indented = split_leading_spaces(body);
+
+            let kind = if let Some((marker, marker_len, fence_indent)) = open_fence {
+                // フェンス内。閉じフェンスに当たればここで閉じるが、その行自体もコード。
+                if let Some((indent, content)) = indented
+                    && indent <= fence_indent + 3
+                    && is_closing_fence_line(content, marker, marker_len)
+                {
+                    open_fence = None;
+                }
+                LinkScanLineKind::Code
+            } else if is_blank_line_for_link_scan(line) {
+                // 空行ではリストを閉じない（loose list は項目の間に空行が入る）
+                LinkScanLineKind::Blank
+            } else {
+                if depth != blockquote_depth {
+                    // ブロッククォートの段数が変わったらリストの入れ子状態は引き継がない
+                    blockquote_depth = depth;
+                    list_indents.clear();
+                }
+                match indented {
+                    // タブはインデント幅の計算が必要なため、安全側でコード扱いにする
+                    None => LinkScanLineKind::Code,
+                    Some((indent, content)) => {
+                        // 内容インデントより浅い行に来たリスト項目は閉じている
+                        while list_indents.last().is_some_and(|top| indent < *top) {
+                            list_indents.pop();
+                        }
+                        let base = list_indents.last().copied().unwrap_or(0);
+                        if indent >= base + 4 {
+                            LinkScanLineKind::Code
+                        } else if let Some((fence_char, fence_len)) = fence_marker(content) {
+                            open_fence = Some((fence_char, fence_len, indent));
+                            LinkScanLineKind::Code
+                        } else {
+                            if let Some(content_indent) = list_item_content_indent(indent, content)
+                            {
+                                list_indents.push(content_indent);
+                            }
+                            LinkScanLineKind::Normal
+                        }
+                    }
+                }
+            };
+
+            lines.push(LinkScanLine {
+                start,
+                next_start,
+                kind,
+            });
+
+            if line_end >= md.len() {
+                break;
+            }
+            start = next_start;
+        }
+
+        Self { lines }
+    }
+
+    /// 指定した行頭オフセットの分類を返す。行頭以外のオフセットでは None。
+    fn line_starting_at(&self, offset: usize) -> Option<&LinkScanLine> {
+        self.lines
+            .binary_search_by_key(&offset, |line| line.start)
+            .ok()
+            .map(|index| &self.lines[index])
+    }
+}
+
+/// 行頭のブロッククォート記号 (`>`) を取り除き、(残りの本文, ネスト段数) を返す。
+///
+/// 記号の前のインデントは CommonMark に合わせて最大 3 スペースまで許容する。
+/// 4 スペース以上インデントされている場合はブロッククォートではなくインデント
+/// コードの領域なので、そこで打ち切って残りをそのまま返す。
+fn strip_blockquote_prefix_for_scan(line: &str) -> (&str, usize) {
+    let mut rest = line;
+    let mut depth = 0usize;
+
+    while let Some(after_indent) = strip_fence_indent(rest) {
+        let Some(after_marker) = after_indent.strip_prefix('>') else {
+            break;
+        };
+        depth += 1;
+        rest = after_marker.strip_prefix(' ').unwrap_or(after_marker);
+    }
+
+    (rest, depth)
+}
+
+/// 行頭の半角スペースを数え、(スペース数, 残りの本文) を返す。
+///
+/// タブが現れた場合はタブストップを考慮したインデント幅の計算が必要になるため
+/// None を返し、呼び出し側は安全側（コード扱い）にフォールバックする。
+fn split_leading_spaces(line: &str) -> Option<(usize, &str)> {
+    for (index, ch) in line.char_indices() {
+        match ch {
+            ' ' => continue,
+            '\t' => return None,
+            _ => return Some((index, &line[index..])),
+        }
+    }
+    Some((line.len(), ""))
+}
+
+/// 行がリスト項目の開始なら、その項目の内容インデントを返す。
+///
+/// `indent` はブロッククォート記号を除いた後の行頭スペース数、`content` は
+/// そのインデントより後ろの本文。
+/// CommonMark では、マーカー直後の空白が 1〜4 個ならその直後が内容の開始位置、
+/// 5 個以上（残りがインデントコードになる）や空のリスト項目では
+/// 「マーカー + 空白 1 個」の位置が内容の開始位置になる。
+fn list_item_content_indent(indent: usize, content: &str) -> Option<usize> {
+    let marker_len = list_marker_len(content)?;
+    let after_marker = &content[marker_len..];
+    let spaces = after_marker.chars().take_while(|c| *c == ' ').count();
+
+    let offset = if after_marker.is_empty() || after_marker.starts_with('\t') {
+        // 空のリスト項目、またはタブ区切り
+        marker_len + 1
+    } else if spaces == 0 {
+        // `*foo` や `1.foo` はリストマーカーではない
+        return None;
+    } else if spaces <= 4 && spaces < after_marker.len() {
+        marker_len + spaces
+    } else {
+        // 空白が 5 個以上、または空白だけで終わる行
+        marker_len + 1
+    };
+
+    Some(indent + offset)
+}
+
+/// リストマーカーの長さを返す（`-` `*` `+` は 1、`12.` のような順序付きは桁数 + 1）。
+///
+/// CommonMark の順序付きリスト番号は最大 9 桁。
+fn list_marker_len(content: &str) -> Option<usize> {
+    let mut chars = content.chars();
+    match chars.next()? {
+        '-' | '*' | '+' => Some(1),
+        first if first.is_ascii_digit() => {
+            let mut digits = 1usize;
+            for ch in chars {
+                match ch {
+                    '0'..='9' => {
+                        digits += 1;
+                        if digits > 9 {
+                            return None;
+                        }
+                    }
+                    '.' | ')' => return Some(digits + 1),
+                    _ => return None,
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// コード領域を除外しつつ、次の `](` を探す。
+///
+/// フェンス/インデントコードブロックと空行の位置は `blocks` から引き、
+/// コード領域外で開いている `[` を前方走査でカウントする。エスケープされた
+/// `\]` `\`` `\[` は正しくリテラルとして扱う。`initial_open_brackets` は
 /// `start` 位置より前から引き継いだ未閉鎖 `[` の数（外側リンク対応のため）。
 /// 戻り値は `(](`の位置, 検出時点の未閉鎖 `[` 数)`。
 fn find_next_link_candidate(
     md: &str,
     start: usize,
     initial_open_brackets: usize,
+    blocks: &MarkdownBlockMap,
 ) -> (Option<usize>, usize) {
     let mut cursor = start;
     let mut line_start = start == 0 || md[..start].ends_with('\n');
-    let mut in_fenced_code_block = false;
-    let mut fence_char = '\0';
-    let mut fence_len = 0usize;
     let mut inline_code_len = 0usize;
     // コード領域外で未閉鎖の `[` の数を追跡する。`]` で減算する。
     let mut open_bracket_count: usize = initial_open_brackets;
@@ -1172,71 +1380,25 @@ fn find_next_link_candidate(
 
     while cursor < md.len() {
         if line_start && inline_code_len == 0 {
-            let line_end = md[cursor..]
-                .find('\n')
-                .map(|offset| cursor + offset)
-                .unwrap_or(md.len());
-            let line = &md[cursor..line_end];
-
-            // 空行は段落境界なので、前段落で未閉鎖だった `[` を引き継がない。
-            // ブロッククォート記号だけの行も、そのクォート内では空行として扱う。
-            if is_blank_line_for_link_scan(line) {
-                open_bracket_count = 0;
-            }
-            if !in_fenced_code_block && is_indented_code_line_for_link_scan(line) {
-                // コードブロックも段落境界なので、その前後をリンクとして接続しない。
-                open_bracket_count = 0;
-                cursor = line_end;
-                if cursor < md.len() {
-                    cursor += 1;
+            if let Some(line) = blocks.line_starting_at(cursor) {
+                match line.kind {
+                    // 空行は段落境界なので、前段落で未閉鎖だった `[` を引き継がない。
+                    LinkScanLineKind::Blank => open_bracket_count = 0,
+                    // コードブロックも段落境界なので、その前後をリンクとして接続しない。
+                    LinkScanLineKind::Code => {
+                        open_bracket_count = 0;
+                        cursor = line.next_start;
+                        line_start = true;
+                        backslash_run = 0;
+                        continue;
+                    }
+                    LinkScanLineKind::Normal => {}
                 }
-                line_start = true;
-                backslash_run = 0;
-                continue;
-            }
-            let mut handled_as_fence = false;
-            if in_fenced_code_block {
-                // 閉じフェンスは marker 以降が空白/タブのみのときだけ閉じる。
-                if is_closing_fence_after_blockquote(line, fence_char, fence_len) {
-                    in_fenced_code_block = false;
-                    fence_char = '\0';
-                    fence_len = 0;
-                }
-                handled_as_fence = true;
-            } else if let Some((marker, marker_len)) = fence_marker_after_blockquote(line) {
-                in_fenced_code_block = true;
-                fence_char = marker;
-                fence_len = marker_len;
-                handled_as_fence = true;
-            }
-            if handled_as_fence {
-                // フェンスコードブロックの前後をまたぐリンクは成立しない。
-                open_bracket_count = 0;
-                cursor = line_end;
-                if cursor < md.len() {
-                    cursor += 1;
-                }
-                line_start = true;
-                backslash_run = 0;
-                continue;
             }
             line_start = false;
         }
 
         let rest = &md[cursor..];
-
-        // フェンスコード内は内容を解釈せずに 1 文字ずつ進める
-        if in_fenced_code_block {
-            let Some(ch) = rest.chars().next() else {
-                break;
-            };
-            cursor += ch.len_utf8();
-            if ch == '\n' {
-                line_start = true;
-            }
-            backslash_run = 0;
-            continue;
-        }
 
         // インラインコード内は同じ長さのバッククォート列で閉じる
         if inline_code_len > 0 {
@@ -1533,7 +1695,14 @@ mod tests {
     /// テスト用の `find_next_link_candidate` ラッパー。
     /// テストでは引き継ぎ状態を 0 で固定し、位置のみを返す。
     fn find_next_link_candidate(md: &str, start: usize) -> Option<usize> {
-        super::find_next_link_candidate(md, start, 0).0
+        super::find_next_link_candidate(md, start, 0, &MarkdownBlockMap::build(md)).0
+    }
+
+    /// テスト用に、指定行頭オフセットの分類を取り出す。
+    fn line_kind_at(md: &str, offset: usize) -> Option<LinkScanLineKind> {
+        MarkdownBlockMap::build(md)
+            .line_starting_at(offset)
+            .map(|line| line.kind)
     }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
@@ -5828,34 +5997,326 @@ code
         assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
+    // --- ネストしたリスト項目内のリンク解決（インデントコード誤判定の回帰） ---
+
     #[test]
-    fn TMP_nested_list_link_is_resolved() {
-        // 3 段ネストのリスト項目は 4 スペースインデントになるが、
-        // CommonMark ではリスト項目の内容でありインデントコードではない。
+    fn resolve_link_in_nested_unordered_list() {
+        // 3 段ネストの箇条書きは 4 スペースインデントになるが、CommonMark では
+        // リスト項目の内容でありインデントコードではない。
         let input = "* a\n  * b\n    * c [deep](./deep.html)";
         let expected = "* a\n  * b\n    * c [deep](https://example.com/docs/en/deep.html)";
         assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
     #[test]
-    fn TMP_nested_ol_link_is_resolved() {
+    fn resolve_link_in_nested_dash_and_plus_list() {
+        // `-` と `+` のマーカーも同様に扱う
+        let input = "- a\n  + b\n    - c [deep](./deep.html)";
+        let expected = "- a\n  + b\n    - c [deep](https://example.com/docs/en/deep.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_in_nested_ordered_list() {
+        // 順序付きリストは 1 段あたり 3 スペースなので 3 段目で 6 スペースになる
         let input = "1. a\n   1. b\n      1. c [deep](./deep.html)";
         let expected = "1. a\n   1. b\n      1. c [deep](https://example.com/docs/en/deep.html)";
         assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
     #[test]
-    fn TMP_loose_nested_list_link_is_resolved() {
+    fn resolve_link_in_nested_ordered_list_with_paren_marker() {
+        // `1)` 形式の順序付きマーカーも認識する
+        let input = "1) a\n   1) b\n      1) c [deep](./deep.html)";
+        let expected = "1) a\n   1) b\n      1) c [deep](https://example.com/docs/en/deep.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_in_mixed_nested_list() {
+        // 箇条書きと順序付きが混在するネストでも内容インデントを追跡する
+        let input = "* a\n  1. b\n     * c [deep](./deep.html)";
+        let expected = "* a\n  1. b\n     * c [deep](https://example.com/docs/en/deep.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_in_wide_ordered_marker_list() {
+        // 桁数の多い番号ではマーカー幅も広がる
+        let input = "100. a\n     200. b\n          300. c [deep](./deep.html)";
+        let expected =
+            "100. a\n     200. b\n          300. c [deep](https://example.com/docs/en/deep.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_in_list_item_with_four_spaces_after_marker() {
+        // マーカー直後の空白 4 個までは内容インデントに算入する
+        let input = "*    a\n     [next](./next.html)";
+        let expected = "*    a\n     [next](https://example.com/docs/en/next.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_in_empty_list_item_hierarchy() {
+        // マーカーだけの空リスト項目でも内容インデントは「マーカー + 空白 1 個」
+        let input = "*\n  * b\n    * c [deep](./deep.html)";
+        let expected = "*\n  * b\n    * c [deep](https://example.com/docs/en/deep.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_in_loose_nested_list() {
+        // loose list は項目の間に空行が入るが、空行でリストは閉じない
         let input = "* a\n\n  * b\n\n    * c [deep](./deep.html)";
         let expected = "* a\n\n  * b\n\n    * c [deep](https://example.com/docs/en/deep.html)";
         assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
     #[test]
-    fn TMP_blockquote_nested_list_link_is_resolved() {
+    fn resolve_link_in_list_item_continuation_paragraph() {
+        // リスト項目の 2 段落目（マーカーの無い継続行）もリスト内容として扱う
+        let input = "* a\n  * b\n    * c\n\n      second [p2](./p2.html)";
+        let expected =
+            "* a\n  * b\n    * c\n\n      second [p2](https://example.com/docs/en/p2.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_after_dedent_to_sibling_list_item() {
+        // 深い項目から浅い兄弟項目へ戻ったら、内側の内容インデントは破棄する
+        let input = "* a\n  * b\n    * c\n  * d [x](./x.html)\n    text [z](./z.html)";
+        let expected = "* a\n  * b\n    * c\n  * d [x](https://example.com/docs/en/x.html)\n    text [z](https://example.com/docs/en/z.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_in_blockquote_nested_list() {
+        // ブロッククォート内のネストしたリストも同様に解決する
         let input = "> * a\n>   * b\n>     * c [deep](./deep.html)";
         let expected = "> * a\n>   * b\n>     * c [deep](https://example.com/docs/en/deep.html)";
         assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_in_multi_level_blockquote_nested_list() {
+        // 多段ブロッククォート内のネストしたリスト
+        let input = ">> * a\n>>   * b\n>>     * c [deep](./deep.html)";
+        let expected = ">> * a\n>>   * b\n>>     * c [deep](https://example.com/docs/en/deep.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_in_blockquote_loose_nested_list() {
+        // ブロッククォート記号だけの行（クォート内の空行）を挟む loose list
+        let input = "> * a\n>\n>   * b\n>\n>     * c [deep](./deep.html)";
+        let expected =
+            "> * a\n>\n>   * b\n>\n>     * c [deep](https://example.com/docs/en/deep.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_in_table_inside_nested_list() {
+        // ネストしたリスト内のテーブル行に含まれるリンクも解決する
+        let input = "* a\n  * b\n    * | [x](./x.html) |\n      | - |";
+        let expected = "* a\n  * b\n    * | [x](https://example.com/docs/en/x.html) |\n      | - |";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_multiple_links_on_nested_list_line() {
+        // 同一のリスト行に複数のリンクがある場合
+        let input = "* a\n  * b\n    * c [x](./x.html) and [z](./z.html)";
+        let expected = "* a\n  * b\n    * c [x](https://example.com/docs/en/x.html) and [z](https://example.com/docs/en/z.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_nested_list_link_after_multiline_link() {
+        // 改行をまたぐリンクでカーソルが飛んだ後もリストの入れ子状態を失わない
+        let input = "[first](\n./first\n)\n* a\n  * b\n    * c [deep](./deep.html)";
+        // リンク先の前後の空白は URL 解決時に取り除かれる（既存の挙動）
+        let expected = "[first](https://example.com/docs/en/first\n)\n* a\n  * b\n    * c [deep](https://example.com/docs/en/deep.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_nested_list_link_after_broken_link_candidate() {
+        // 閉じ `)` の無い壊れたリンク候補の後でも、リスト内リンクは解決する
+        let input = "[broken](\n\n* a\n  * b\n    * c [deep](./deep.html)";
+        let expected =
+            "[broken](\n\n* a\n  * b\n    * c [deep](https://example.com/docs/en/deep.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    // --- リスト内でも真のインデント/フェンスコードは URL 解決しない ---
+
+    #[test]
+    fn resolve_link_inside_list_item_indented_code_unchanged() {
+        // `* ` の内容インデントは 2 なので、6 スペースは項目内のインデントコード
+        let input = "* item\n\n      [skip](./code)\n\n  [real](./page)";
+        let expected =
+            "* item\n\n      [skip](./code)\n\n  [real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_inside_ordered_list_item_indented_code_unchanged() {
+        // `1. ` の内容インデントは 3 なので、7 スペースは項目内のインデントコード
+        let input = "1. item\n\n       [skip](./code)\n\n   [real](./page)";
+        let expected =
+            "1. item\n\n       [skip](./code)\n\n   [real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_inside_wide_marker_gap_indented_code_unchanged() {
+        // マーカー直後の空白が 5 個以上のときは「マーカー + 空白 1 個」が内容インデント
+        let input = "*     a\n      [skip](./code)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_link_in_top_level_indented_code_after_list_unchanged() {
+        // リストが終わった後のトップレベル 4 スペースはインデントコードに戻る
+        let input = "* a\n\nplain\n\n    [skip](./code)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_link_inside_deep_list_fence_unchanged() {
+        // リスト内のフェンスはリスト内容インデント基準で認識する
+        let input = "* a\n  * b\n    ```rust\n    [skip](./code)\n    ```\n    [real](./page)";
+        let expected = "* a\n  * b\n    ```rust\n    [skip](./code)\n    ```\n    [real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_inside_deep_list_tilde_fence_unchanged() {
+        // チルダフェンスもリスト内容インデント基準で認識する
+        let input = "* a\n  * b\n    ~~~\n    [skip](./code)\n    ~~~\n    [real](./page)";
+        let expected = "* a\n  * b\n    ~~~\n    [skip](./code)\n    ~~~\n    [real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn resolve_link_inside_blockquote_list_fence_unchanged() {
+        // ブロッククォート内のリストにあるフェンスも同様
+        let input = "> * a\n>   ```\n>   [skip](./code)\n>   ```\n>   [real](./page)";
+        let expected = "> * a\n>   ```\n>   [skip](./code)\n>   ```\n>   [real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn list_like_line_inside_fence_does_not_change_list_state() {
+        // フェンス内のリスト風の行で内容インデントを積んではいけない。
+        // 積んでしまうと、フェンス後のインデントコードが通常行と誤判定される。
+        let input = "* a\n  ```\n  * fake\n  ```\n      [skip](./code)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    // --- リストマーカー判定のヘルパー直接テスト ---
+
+    #[test]
+    fn list_marker_len_bullet_markers() {
+        assert_eq!(list_marker_len("- a"), Some(1));
+        assert_eq!(list_marker_len("* a"), Some(1));
+        assert_eq!(list_marker_len("+ a"), Some(1));
+    }
+
+    #[test]
+    fn list_marker_len_ordered_markers() {
+        assert_eq!(list_marker_len("1. a"), Some(2));
+        assert_eq!(list_marker_len("12) a"), Some(3));
+        assert_eq!(list_marker_len("123456789. a"), Some(10));
+    }
+
+    #[test]
+    fn list_marker_len_rejects_invalid_markers() {
+        // 10 桁以上の番号は CommonMark のリストマーカーではない
+        assert_eq!(list_marker_len("1234567890. a"), None);
+        // 区切り記号が無い / 数字でも英字でもない
+        assert_eq!(list_marker_len("1 a"), None);
+        assert_eq!(list_marker_len("1"), None);
+        assert_eq!(list_marker_len("a. x"), None);
+        assert_eq!(list_marker_len(""), None);
+    }
+
+    #[test]
+    fn list_item_content_indent_basic_cases() {
+        assert_eq!(list_item_content_indent(0, "* a"), Some(2));
+        assert_eq!(list_item_content_indent(2, "- b"), Some(4));
+        assert_eq!(list_item_content_indent(0, "1. a"), Some(3));
+    }
+
+    #[test]
+    fn list_item_content_indent_marker_without_space_is_not_a_list() {
+        assert_eq!(list_item_content_indent(0, "*foo"), None);
+        assert_eq!(list_item_content_indent(0, "1.foo"), None);
+    }
+
+    #[test]
+    fn list_item_content_indent_wide_and_empty_markers() {
+        // 空白 4 個までは内容インデントに算入する
+        assert_eq!(list_item_content_indent(0, "*    a"), Some(5));
+        // 空白 5 個以上は「マーカー + 空白 1 個」
+        assert_eq!(list_item_content_indent(0, "*     a"), Some(2));
+        // マーカーのみ / 空白のみ / タブ区切りも「マーカー + 空白 1 個」
+        assert_eq!(list_item_content_indent(0, "*"), Some(2));
+        assert_eq!(list_item_content_indent(0, "*   "), Some(2));
+        assert_eq!(list_item_content_indent(0, "*\ta"), Some(2));
+    }
+
+    #[test]
+    fn split_leading_spaces_counts_spaces() {
+        assert_eq!(split_leading_spaces("abc"), Some((0, "abc")));
+        assert_eq!(split_leading_spaces("  ab"), Some((2, "ab")));
+        assert_eq!(split_leading_spaces("   "), Some((3, "")));
+        assert_eq!(split_leading_spaces(""), Some((0, "")));
+    }
+
+    #[test]
+    fn split_leading_spaces_rejects_tabs() {
+        // タブはインデント幅の計算が必要なので None（安全側でコード扱い）
+        assert_eq!(split_leading_spaces("\tab"), None);
+        assert_eq!(split_leading_spaces(" \tab"), None);
+    }
+
+    #[test]
+    fn strip_blockquote_prefix_for_scan_levels() {
+        assert_eq!(strip_blockquote_prefix_for_scan("a"), ("a", 0));
+        assert_eq!(strip_blockquote_prefix_for_scan("> a"), ("a", 1));
+        assert_eq!(strip_blockquote_prefix_for_scan(">a"), ("a", 1));
+        assert_eq!(strip_blockquote_prefix_for_scan(">> a"), ("a", 2));
+        assert_eq!(strip_blockquote_prefix_for_scan("   > a"), ("a", 1));
+        assert_eq!(strip_blockquote_prefix_for_scan(">"), ("", 1));
+        // 記号の直後に残った空白はインデントとして保持する
+        assert_eq!(strip_blockquote_prefix_for_scan(">     a"), ("    a", 1));
+        // 4 スペース以上インデントされた `>` はブロッククォートではない
+        assert_eq!(strip_blockquote_prefix_for_scan("    > a"), ("    > a", 0));
+    }
+
+    // --- MarkdownBlockMap の行分類 ---
+
+    #[test]
+    fn block_map_classifies_blank_code_and_normal_lines() {
+        let md = "text\n\n    code\n* a\n";
+        assert_eq!(line_kind_at(md, 0), Some(LinkScanLineKind::Normal));
+        assert_eq!(line_kind_at(md, 5), Some(LinkScanLineKind::Blank));
+        assert_eq!(line_kind_at(md, 6), Some(LinkScanLineKind::Code));
+        assert_eq!(line_kind_at(md, 15), Some(LinkScanLineKind::Normal));
+    }
+
+    #[test]
+    fn block_map_returns_none_for_non_line_start_offset() {
+        // 行頭以外のオフセットでは分類を返さない
+        assert_eq!(line_kind_at("text\nmore", 2), None);
+    }
+
+    #[test]
+    fn block_map_marks_tab_indented_line_as_code() {
+        // タブインデントは安全側でコード扱い
+        assert_eq!(line_kind_at("\t[x](./y)", 0), Some(LinkScanLineKind::Code));
     }
 
     #[test]
@@ -6258,7 +6719,7 @@ code
         // `[x\](./a)` の `]`(=index 3) から再開した場合、直前の `\` で
         // `]` がエスケープされている扱いになり、リンク候補ではない。
         let md = r"[x\](./a)";
-        let (pos, count) = super::find_next_link_candidate(md, 3, 1);
+        let (pos, count) = super::find_next_link_candidate(md, 3, 1, &MarkdownBlockMap::build(md));
         assert_eq!(pos, None);
         assert_eq!(count, 1);
     }
@@ -6270,7 +6731,7 @@ code
         // `[x\\](./a)` の `]`(=index 4) から再開すると、直前 2 個の `\` は
         // 打ち消し合うため、`](`はリンク候補となる。
         let md = r"[x\\](./a)";
-        let (pos, count) = super::find_next_link_candidate(md, 4, 1);
+        let (pos, count) = super::find_next_link_candidate(md, 4, 1, &MarkdownBlockMap::build(md));
         assert_eq!(pos, Some(4));
         assert_eq!(count, 1);
     }
@@ -6283,7 +6744,7 @@ code
         // エスケープされ、開き括弧は増えない。`](` の前に開き `[` がない
         // ためリンク候補にならない。
         let md = r"\[x](./a)";
-        let (pos, count) = super::find_next_link_candidate(md, 1, 0);
+        let (pos, count) = super::find_next_link_candidate(md, 1, 0, &MarkdownBlockMap::build(md));
         assert_eq!(pos, None);
         assert_eq!(count, 0);
     }
@@ -6295,7 +6756,7 @@ code
         // `\`` の `` ` ``(=index 1) から再開すると、直前の `\` でエスケープされ、
         // インラインコード扱いにならず、後続の `[link](./a)` は通常通り検出される。
         let md = r"\`[link](./a)";
-        let (pos, count) = super::find_next_link_candidate(md, 1, 0);
+        let (pos, count) = super::find_next_link_candidate(md, 1, 0, &MarkdownBlockMap::build(md));
         // `](` の位置は index 7。
         // `[` が index 2、link が index 3..6、`]` が index 7 にある。
         // 実際には `\` (1byte) + `` ` `` (1byte) + `[` (1byte) + `link` (4byte) = index 7 が `]`
@@ -6311,7 +6772,8 @@ code
         let md = "あ[x](./a)";
         // "あ" は UTF-8 で 3 バイト
         let start = "あ".len();
-        let (pos, count) = super::find_next_link_candidate(md, start, 0);
+        let (pos, count) =
+            super::find_next_link_candidate(md, start, 0, &MarkdownBlockMap::build(md));
         // `]` の位置は あ(3) + [(1) + x(1) = 5
         assert_eq!(pos, Some(5));
         assert_eq!(count, 1);
@@ -6404,20 +6866,28 @@ code
         assert!(is_closing_fence_line_after_indent("  ````", '`', 4));
     }
 
-    // --- is_closing_fence_after_blockquote の直接テスト ---
+    // --- ブロッククォート内の閉じフェンス判定（MarkdownBlockMap 経由） ---
+
+    /// ブロッククォート内のフェンスが `close_line` で閉じるかを、
+    /// その次の行が通常行（= リンク走査対象）に戻るかどうかで確かめる。
+    fn blockquote_fence_closes(open_line: &str, close_line: &str) -> bool {
+        let md = format!("{open_line}\n> body\n{close_line}\n> after");
+        let after_offset = md.len() - "> after".len();
+        line_kind_at(&md, after_offset) == Some(LinkScanLineKind::Normal)
+    }
 
     #[test]
     fn closing_fence_after_blockquote_with_marker_only() {
         // ブロッククォート記号 + マーカーのみは閉じフェンスとして妥当
-        assert!(is_closing_fence_after_blockquote("> ```", '`', 3));
-        assert!(is_closing_fence_after_blockquote(">> ~~~", '~', 3));
+        assert!(blockquote_fence_closes("> ```", "> ```"));
+        assert!(blockquote_fence_closes(">> ~~~", ">> ~~~"));
     }
 
     #[test]
     fn closing_fence_after_blockquote_rejects_info_string() {
         // ブロッククォート内でも info string 付きは閉じフェンスにしない
-        assert!(!is_closing_fence_after_blockquote("> ```rust", '`', 3));
-        assert!(!is_closing_fence_after_blockquote(">> ```py", '`', 3));
+        assert!(!blockquote_fence_closes("> ```", "> ```rust"));
+        assert!(!blockquote_fence_closes(">> ```", ">> ```py"));
     }
 
     // --- compact_markdown: info string 付きの行を閉じフェンスとして誤認しない回帰テスト ---
@@ -6721,36 +7191,36 @@ inside-of-fence
         assert_eq!(strip_fence_blockquote_markers(""), Some(""));
     }
 
-    // --- is_closing_fence_after_blockquote の追加境界テスト ---
+    // --- ブロッククォート内の閉じフェンス判定: 追加境界テスト ---
 
     #[test]
     fn closing_fence_after_blockquote_trailing_spaces_allowed() {
         // ブロッククォート内の閉じフェンス + 末尾空白
-        assert!(is_closing_fence_after_blockquote("> ```   ", '`', 3));
+        assert!(blockquote_fence_closes("> ```", "> ```   "));
     }
 
     #[test]
     fn closing_fence_after_blockquote_trailing_cr_allowed() {
         // ブロッククォート内でも末尾 CR は line ending として無視
-        assert!(is_closing_fence_after_blockquote("> ```\r", '`', 3));
+        assert!(blockquote_fence_closes("> ```", "> ```\r"));
     }
 
     #[test]
     fn closing_fence_after_blockquote_longer_marker() {
         // 開始フェンスより長い閉じマーカーも有効
-        assert!(is_closing_fence_after_blockquote(">> `````", '`', 3));
+        assert!(blockquote_fence_closes(">> ```", ">> `````"));
     }
 
     #[test]
     fn closing_fence_after_blockquote_shorter_marker_rejected() {
         // 開始フェンスより短いマーカーは閉じ扱いしない
-        assert!(!is_closing_fence_after_blockquote("> ```", '`', 5));
+        assert!(!blockquote_fence_closes("> `````", "> ```"));
     }
 
     #[test]
     fn closing_fence_after_blockquote_different_marker_rejected() {
         // 異なるマーカー文字は閉じ扱いしない
-        assert!(!is_closing_fence_after_blockquote("> ~~~", '`', 3));
+        assert!(!blockquote_fence_closes("> ```", "> ~~~"));
     }
 
     // --- resolve_markdown_urls: ブロッククォート内 CRLF フェンスの境界 ---
