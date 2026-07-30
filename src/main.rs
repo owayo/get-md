@@ -5829,6 +5829,36 @@ code
     }
 
     #[test]
+    fn TMP_nested_list_link_is_resolved() {
+        // 3 段ネストのリスト項目は 4 スペースインデントになるが、
+        // CommonMark ではリスト項目の内容でありインデントコードではない。
+        let input = "* a\n  * b\n    * c [deep](./deep.html)";
+        let expected = "* a\n  * b\n    * c [deep](https://example.com/docs/en/deep.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn TMP_nested_ol_link_is_resolved() {
+        let input = "1. a\n   1. b\n      1. c [deep](./deep.html)";
+        let expected = "1. a\n   1. b\n      1. c [deep](https://example.com/docs/en/deep.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn TMP_loose_nested_list_link_is_resolved() {
+        let input = "* a\n\n  * b\n\n    * c [deep](./deep.html)";
+        let expected = "* a\n\n  * b\n\n    * c [deep](https://example.com/docs/en/deep.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn TMP_blockquote_nested_list_link_is_resolved() {
+        let input = "> * a\n>   * b\n>     * c [deep](./deep.html)";
+        let expected = "> * a\n>   * b\n>     * c [deep](https://example.com/docs/en/deep.html)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
     fn resolve_link_inside_indented_code_unchanged() {
         // CommonMark のインデントコードブロック内は URL 解決対象から除外する
         let input = "    [skip](./code)\n[real](./page)";
