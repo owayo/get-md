@@ -157,6 +157,66 @@ fn fetch_local_html_and_resolve_relative_urls() {
 
 #[test]
 #[ignore] // システムに Chrome/Chromium が必要
+fn nested_list_relative_urls_are_resolved() {
+    // htmd はネストしたリストを 1 段 2 スペースで出力するため、3 段目以降は
+    // 行頭 4 スペース以上になる。これをインデントコードと誤判定すると、
+    // ナビゲーションや目次のリンクが相対 URL のまま残ってしまう。
+    let temp_dir = TempDir::new();
+    let page = temp_dir.path().join("page.html");
+    write_file(
+        &page,
+        r#"<!doctype html>
+<html>
+  <body>
+    <main>
+      <ul>
+        <li><pre><code>[NotALink](./skip.html)</code></pre></li>
+        <li>L1
+          <ul>
+            <li>L2
+              <ul>
+                <li>L3 <a href="./deep.html">Deep</a></li>
+              </ul>
+            </li>
+          </ul>
+        </li>
+      </ul>
+    </main>
+  </body>
+</html>"#,
+    );
+
+    let output = get_md_bin()
+        .args([
+            file_url(&page),
+            "-s".to_string(),
+            "main".to_string(),
+            "-q".to_string(),
+        ])
+        .output()
+        .expect("Failed to execute get-md");
+
+    assert!(
+        output.status.success(),
+        "get-md exited with error: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let deep_url = file_url(&temp_dir.path().join("deep.html"));
+    assert!(
+        stdout.contains(&format!("[Deep]({deep_url})")),
+        "Nested list link was not resolved: {stdout}",
+    );
+    // フェンスコードブロック内のリンクは書き換えない
+    assert!(
+        stdout.contains("[NotALink](./skip.html)"),
+        "Link inside a fenced code block must stay unchanged: {stdout}",
+    );
+}
+
+#[test]
+#[ignore] // システムに Chrome/Chromium が必要
 fn base_href_is_used_for_relative_url_resolution() {
     let temp_dir = TempDir::new();
     let page = temp_dir.path().join("page.html");

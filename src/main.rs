@@ -1165,14 +1165,101 @@ struct MarkdownBlockMap {
     lines: Vec<LinkScanLine>,
 }
 
+#[derive(Default)]
+struct MarkdownBlockState {
+    /// 開いているリスト項目の内容インデント（外側から内側の順）
+    list_indents: Vec<usize>,
+    /// 開いているフェンス: (マーカー文字, マーカー長, 属するコンテナの内容インデント)
+    open_fence: Option<(char, usize, usize)>,
+    blockquote_depth: usize,
+}
+
+impl MarkdownBlockState {
+    fn classify_line(&mut self, line: &str) -> LinkScanLineKind {
+        if is_blank_line_for_link_scan(line) {
+            // 空行ではリストもフェンスも閉じない
+            // （loose list は項目の間に空行が入り、フェンス内にも空行は現れる）
+            return if self.open_fence.is_some() {
+                LinkScanLineKind::Code
+            } else {
+                LinkScanLineKind::Blank
+            };
+        }
+
+        let (body, depth) = strip_blockquote_prefix_for_scan(line);
+        if depth != self.blockquote_depth {
+            // ブロッククォートの段数が変わったら、属していたコンテナの状態は引き継がない
+            self.blockquote_depth = depth;
+            self.list_indents.clear();
+            self.open_fence = None;
+        }
+
+        match split_leading_spaces(body) {
+            // タブはインデント幅の計算が必要なため、安全側でコード扱いにする
+            None => LinkScanLineKind::Code,
+            Some((indent, content)) => self.classify_indented_line(indent, content),
+        }
+    }
+
+    fn classify_indented_line(&mut self, indent: usize, content: &str) -> LinkScanLineKind {
+        // フェンスを含むコンテナ（リスト項目）より浅い行に来たら、
+        // そのコンテナごとフェンスも閉じる。
+        if self
+            .open_fence
+            .is_some_and(|(_, _, fence_base)| indent < fence_base)
+        {
+            self.open_fence = None;
+        }
+
+        if let Some((marker, marker_len, fence_base)) = self.open_fence {
+            // フェンス内。閉じフェンスに当たればここで閉じるが、その行自体もコード。
+            // 閉じフェンスの追加インデントはコンテナ基準で最大 3 スペースまで。
+            if indent <= fence_base + 3 && is_closing_fence_line(content, marker, marker_len) {
+                self.open_fence = None;
+            }
+            return LinkScanLineKind::Code;
+        }
+
+        self.classify_normal_line(indent, content)
+    }
+
+    fn classify_normal_line(&mut self, indent: usize, content: &str) -> LinkScanLineKind {
+        // 内容インデントより浅い行に来たリスト項目は閉じている
+        while self.list_indents.last().is_some_and(|top| indent < *top) {
+            self.list_indents.pop();
+        }
+        let base = self.list_indents.last().copied().unwrap_or(0);
+        if indent >= base + 4 {
+            return LinkScanLineKind::Code;
+        }
+        if let Some((fence_char, fence_len)) = fence_marker(content) {
+            self.open_fence = Some((fence_char, fence_len, base));
+            return LinkScanLineKind::Code;
+        }
+
+        // `* * *` のようなテーマ区切りはリスト項目ではない
+        if !is_thematic_break(content)
+            && let Some(content_indent) = list_item_content_indent(indent, content)
+        {
+            self.list_indents.push(content_indent);
+
+            // htmd はリスト項目先頭のコードブロックを
+            // `* ``` ` のようにマーカーと同じ行から出力する。
+            let item_content = content.get(content_indent - indent..);
+            if let Some((fence_char, fence_len)) = item_content.and_then(fence_marker) {
+                self.open_fence = Some((fence_char, fence_len, content_indent));
+                return LinkScanLineKind::Code;
+            }
+        }
+
+        LinkScanLineKind::Normal
+    }
+}
+
 impl MarkdownBlockMap {
     fn build(md: &str) -> Self {
         let mut lines = Vec::new();
-        // 開いているリスト項目の内容インデント（外側から内側の順）
-        let mut list_indents: Vec<usize> = Vec::new();
-        // 開いているフェンス: (マーカー文字, マーカー長, 開始行のインデント)
-        let mut open_fence: Option<(char, usize, usize)> = None;
-        let mut blockquote_depth = 0usize;
+        let mut state = MarkdownBlockState::default();
         let mut start = 0usize;
 
         loop {
@@ -1189,51 +1276,7 @@ impl MarkdownBlockMap {
             let raw_line = &md[start..line_end];
             let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
 
-            let (body, depth) = strip_blockquote_prefix_for_scan(line);
-            let indented = split_leading_spaces(body);
-
-            let kind = if let Some((marker, marker_len, fence_indent)) = open_fence {
-                // フェンス内。閉じフェンスに当たればここで閉じるが、その行自体もコード。
-                if let Some((indent, content)) = indented
-                    && indent <= fence_indent + 3
-                    && is_closing_fence_line(content, marker, marker_len)
-                {
-                    open_fence = None;
-                }
-                LinkScanLineKind::Code
-            } else if is_blank_line_for_link_scan(line) {
-                // 空行ではリストを閉じない（loose list は項目の間に空行が入る）
-                LinkScanLineKind::Blank
-            } else {
-                if depth != blockquote_depth {
-                    // ブロッククォートの段数が変わったらリストの入れ子状態は引き継がない
-                    blockquote_depth = depth;
-                    list_indents.clear();
-                }
-                match indented {
-                    // タブはインデント幅の計算が必要なため、安全側でコード扱いにする
-                    None => LinkScanLineKind::Code,
-                    Some((indent, content)) => {
-                        // 内容インデントより浅い行に来たリスト項目は閉じている
-                        while list_indents.last().is_some_and(|top| indent < *top) {
-                            list_indents.pop();
-                        }
-                        let base = list_indents.last().copied().unwrap_or(0);
-                        if indent >= base + 4 {
-                            LinkScanLineKind::Code
-                        } else if let Some((fence_char, fence_len)) = fence_marker(content) {
-                            open_fence = Some((fence_char, fence_len, indent));
-                            LinkScanLineKind::Code
-                        } else {
-                            if let Some(content_indent) = list_item_content_indent(indent, content)
-                            {
-                                list_indents.push(content_indent);
-                            }
-                            LinkScanLineKind::Normal
-                        }
-                    }
-                }
-            };
+            let kind = state.classify_line(line);
 
             lines.push(LinkScanLine {
                 start,
@@ -1320,6 +1363,31 @@ fn list_item_content_indent(indent: usize, content: &str) -> Option<usize> {
     };
 
     Some(indent + offset)
+}
+
+/// テーマ区切り（`***` `---` `___` を 3 個以上、間の空白は自由）か判定する。
+///
+/// `* * *` や `- - -` は行頭がリストマーカーと同じ文字で始まるが、CommonMark では
+/// テーマ区切りでありリスト項目ではない。リストの内容インデントを積んでしまうと、
+/// 後続の 4 スペース行をインデントコードと判定できなくなる。
+fn is_thematic_break(content: &str) -> bool {
+    let mut marker: Option<char> = None;
+    let mut count = 0usize;
+
+    for ch in content.chars() {
+        match ch {
+            ' ' | '\t' => continue,
+            '*' | '-' | '_' => {
+                if *marker.get_or_insert(ch) != ch {
+                    return false;
+                }
+                count += 1;
+            }
+            _ => return false,
+        }
+    }
+
+    count >= 3
 }
 
 /// リストマーカーの長さを返す（`-` `*` `+` は 1、`12.` のような順序付きは桁数 + 1）。
@@ -4784,7 +4852,7 @@ code
     #[test]
     fn find_close_paren_multiple_nested_levels() {
         // 3段階のネストで最外の閉じ括弧を検出
-        // depth: 1→2→3→2→1→0 (index 9)
+        // 深さ: 1→2→3→2→1→0（インデックス 9）
         assert_eq!(find_link_close_paren("a(b(c)d)e)"), Some(9));
     }
 
@@ -5908,10 +5976,10 @@ code
 
     #[test]
     fn find_close_paren_depth_two_quote_with_close_paren_inside() {
-        // depth=2 では引用符はタイトルにならないため、中の ')' は通常のネスト閉じ
+        // 深さ 2 では引用符はタイトルにならないため、中の ')' は通常のネスト閉じ
         let input = r#"a("b)c)"#;
-        // depth=1: 'a', '(' → depth=2, '"' は depth>1 でタイトルにならない,
-        // 'b', ')' → depth=1, 'c', ')' → depth=0
+        // 深さ 1: 'a', '(' で深さ 2、'"' は深さ 2 以上なのでタイトルにならない
+        // 'b', ')' で深さ 1、'c', ')' で深さ 0
         assert_eq!(find_link_close_paren(input), Some(input.len() - 1));
     }
 
@@ -6213,6 +6281,82 @@ code
         // 積んでしまうと、フェンス後のインデントコードが通常行と誤判定される。
         let input = "* a\n  ```\n  * fake\n  ```\n      [skip](./code)";
         assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_link_after_list_fence_container_ends() {
+        // リスト内で開いたフェンスは、そのリスト項目より浅い行でコンテナごと閉じる。
+        // 閉じないままだと後続のトップレベル行がコード扱いになり URL 解決されない。
+        let input = "* a\n    ```\n[real](./page)";
+        let expected = "* a\n    ```\n[real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn closing_fence_indent_is_relative_to_container_not_opening_line() {
+        // 閉じフェンスの追加インデントはコンテナ基準で最大 3 スペース。
+        // 開始行のインデント基準にすると 6 スペースの行を閉じフェンスと誤認する。
+        let input = "   ```\n      ```\n[inside](./code)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn thematic_break_is_not_treated_as_list_item() {
+        // `* * *` はテーマ区切りなのでリストの内容インデントを積まない。
+        // 積んでしまうと後続の 4 スペース行がインデントコードと判定されなくなる。
+        let input = "* * *\n\n    [skip](./code)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+        let input = "- - -\n\n    [skip](./code)";
+        assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn is_thematic_break_boundaries() {
+        assert!(is_thematic_break("***"));
+        assert!(is_thematic_break("* * *"));
+        assert!(is_thematic_break("---"));
+        assert!(is_thematic_break("- - -"));
+        assert!(is_thematic_break("___"));
+        assert!(is_thematic_break("_ _ _ _"));
+        // マーカーが 3 個未満、文字が混在、他の文字を含む場合はテーマ区切りではない
+        assert!(!is_thematic_break("**"));
+        assert!(!is_thematic_break("*-*"));
+        assert!(!is_thematic_break("* item"));
+        assert!(!is_thematic_break("1. a"));
+        assert!(!is_thematic_break(""));
+    }
+
+    #[test]
+    fn blank_line_inside_list_fence_stays_code() {
+        // フェンス内の空行はコード扱いのままで、フェンスも閉じない
+        let input = "* a\n  ```\n\n  [skip](./code)\n  ```\n  [real](./page)";
+        let expected =
+            "* a\n  ```\n\n  [skip](./code)\n  ```\n  [real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn blockquote_container_end_closes_unclosed_fence() {
+        // ブロッククォートが終われば、その中で開いた未閉鎖フェンスも終了する。
+        // 状態を引き継ぐと後続のトップレベルリンクまでコード扱いになる。
+        let input = "> ```\n> [skip](./code)\n[real](./page)";
+        let expected = "> ```\n> [skip](./code)\n[real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
+    fn fence_on_list_marker_line_stays_code() {
+        // htmd が出力する `* ``` ` 形式でも、コード内リンクは書き換えず、
+        // リスト項目より浅い後続行ではフェンスを終了する。
+        let input = "* ```\n  [skip](./code)\n[real](./page)";
+        let expected = "* ```\n  [skip](./code)\n[real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+
+        // 順序付きリストではマーカー幅が異なり、閉じフェンス後も項目が続く。
+        let input = "1. ```rust\n   [skip](./code)\n   ```\n   [real](./page)";
+        let expected =
+            "1. ```rust\n   [skip](./code)\n   ```\n   [real](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
     // --- リストマーカー判定のヘルパー直接テスト ---
@@ -6871,8 +7015,13 @@ code
     /// ブロッククォート内のフェンスが `close_line` で閉じるかを、
     /// その次の行が通常行（= リンク走査対象）に戻るかどうかで確かめる。
     fn blockquote_fence_closes(open_line: &str, close_line: &str) -> bool {
-        let md = format!("{open_line}\n> body\n{close_line}\n> after");
-        let after_offset = md.len() - "> after".len();
+        let marker_start = open_line
+            .char_indices()
+            .find_map(|(index, ch)| matches!(ch, '`' | '~').then_some(index))
+            .expect("opening fence marker must exist");
+        let prefix = &open_line[..marker_start];
+        let md = format!("{open_line}\n{prefix}body\n{close_line}\n{prefix}after");
+        let after_offset = md.len() - prefix.len() - "after".len();
         line_kind_at(&md, after_offset) == Some(LinkScanLineKind::Normal)
     }
 
