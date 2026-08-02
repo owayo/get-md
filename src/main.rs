@@ -745,37 +745,19 @@ fn escape_js_string(s: &str) -> String {
 /// - セルの前後余白を削る
 /// - セパレータ行のダッシュを最小化する（配置指定 `:` は保持）
 fn compact_markdown(md: &str) -> String {
-    let mut in_fenced_code_block = false;
-    let mut fence_char = '\0';
-    let mut fence_len = 0usize;
+    // URL 解決と同じブロック構造マップを使い、リスト項目と同じ行で始まる
+    // フェンスを含めてコード領域を一貫して保護する。
+    let blocks = MarkdownBlockMap::build(md);
     let mut table_state = TableState::Outside;
 
     md.lines()
-        .map(|line| {
-            if in_fenced_code_block {
-                // フェンス内では info string 付きのマーカーを閉じ扱いしない。
-                // 閉じフェンスはマーカー以降が空白/タブのみでなければならない。
-                if is_closing_fence_line_after_indent(line, fence_char, fence_len) {
-                    in_fenced_code_block = false;
-                    fence_char = '\0';
-                    fence_len = 0;
-                    table_state = TableState::Outside;
-                    return line.to_string();
-                }
-                return line.to_string();
-            }
-            if let Some((marker, marker_len)) = fence_marker_after_indent(line) {
-                table_state = TableState::Outside;
-                in_fenced_code_block = true;
-                fence_char = marker;
-                fence_len = marker_len;
-                return line.to_string();
-            }
-
-            // 4 スペース以上のインデント行は CommonMark のインデントコードブロックなので
-            // テーブル扱いせずに行をそのまま保持する。`line.trim()` で先頭空白を落として
-            // しまうとコード内容が壊れる。
-            if strip_fence_indent(line).is_none() {
+        .enumerate()
+        .map(|(line_index, line)| {
+            if blocks
+                .lines
+                .get(line_index)
+                .is_some_and(|line| line.kind != LinkScanLineKind::Normal)
+            {
                 table_state = TableState::Outside;
                 return line.to_string();
             }
@@ -847,10 +829,12 @@ fn strip_fence_indent(line: &str) -> Option<&str> {
     Some("")
 }
 
+#[cfg(test)]
 fn fence_marker_after_indent(line: &str) -> Option<(char, usize)> {
     strip_fence_indent(line).and_then(fence_marker)
 }
 
+#[cfg(test)]
 fn is_closing_fence_line_after_indent(line: &str, marker: char, min_len: usize) -> bool {
     let Some(rest) = strip_fence_indent(line) else {
         return false;
@@ -879,8 +863,23 @@ fn is_closing_fence_line(line: &str, marker: char, min_len: usize) -> bool {
 }
 
 /// ブロッククォート記号を取り除いた位置にあるフェンスマーカーを検出する。
+#[cfg(test)]
 fn fence_marker_after_blockquote(line: &str) -> Option<(char, usize)> {
     strip_fence_blockquote_markers(line).and_then(fence_marker)
+}
+
+/// ブロッククォートとリストマーカーを取り除いた位置にあるフェンスを検出する。
+///
+/// htmd はリスト項目先頭のコードブロックを `* ``` ` のようにリストマーカーと
+/// 同じ行へ出力するため、インラインコード探索の境界判定でもこの形式を扱う。
+fn fence_marker_after_container_prefix(line: &str) -> Option<(char, usize)> {
+    let content = strip_fence_blockquote_markers(line)?;
+    if let Some(marker) = fence_marker(content) {
+        return Some(marker);
+    }
+
+    let item_content_start = list_item_content_indent(0, content)?;
+    content.get(item_content_start..).and_then(fence_marker)
 }
 
 /// 行頭のインデントとブロッククォート記号 (`>`) を取り除いた残りを返す。
@@ -1564,7 +1563,7 @@ fn has_matching_inline_code_closer(md: &str, start: usize, tick_len: usize) -> b
             }
             // フェンス開始行に到達したら、ここでインラインコード探索を打ち切る。
             // ブロッククォート内のフェンスも対象にする。
-            if fence_marker_after_blockquote(line).is_some() {
+            if fence_marker_after_container_prefix(line).is_some() {
                 return false;
             }
             line_start = false;
@@ -1683,7 +1682,7 @@ fn find_link_close_paren(s: &str) -> Option<usize> {
                 return None;
             }
             blank_line_pending = true;
-        } else if blank_line_pending && !matches!(c, ' ' | '\t' | '\r') {
+        } else if blank_line_pending && !matches!(c, ' ' | '\t' | '\r' | '>') {
             blank_line_pending = false;
         }
 
@@ -3148,6 +3147,15 @@ more code
     }
 
     #[test]
+    fn resolve_url_when_unclosed_inline_code_meets_list_marker_fence() {
+        // リストマーカーと同じ行で始まるフェンスもインラインコード探索の境界になる。
+        // フェンス内の単一バッククォートを閉じ列と誤認せず、手前のリンクを解決する。
+        let input = "` literal [link](./page)\n* ```\n  `code`\n  ```";
+        let expected = "` literal [link](https://example.com/docs/en/page)\n* ```\n  `code`\n  ```";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
+    }
+
+    #[test]
     fn resolve_non_link_bracket_paren_sequence_unchanged() {
         let input = "text ](./not-a-link) and [link](./page)";
         let expected = "text ](./not-a-link) and [link](https://example.com/docs/en/page)";
@@ -3614,7 +3622,7 @@ more code
                 path: path.clone(),
                 persisted: false,
             };
-        } // Drop here
+        } // ここで Drop が実行される
         assert!(!path.exists(), "persisted=false の Drop で削除されるべき");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4321,6 +4329,14 @@ code
     fn inline_code_closer_stops_at_fence_start_in_blockquote() {
         // ブロッククォート内のフェンス開始も境界として扱う
         let md = "alpha\n> ```\n`\n> ```";
+        assert!(!has_matching_inline_code_closer(md, 0, 1));
+    }
+
+    #[test]
+    fn inline_code_closer_stops_at_fence_on_list_marker_line() {
+        // htmd の `* ``` ` 形式も境界として扱い、フェンス内の単一バッククォートを
+        // 未閉鎖インラインコードの閉じ列として使わない。
+        let md = "alpha\n* ```\n  `code`\n  ```";
         assert!(!has_matching_inline_code_closer(md, 0, 1));
     }
 
@@ -6707,6 +6723,23 @@ code
         assert_eq!(fence_marker_after_blockquote(""), None);
     }
 
+    #[test]
+    fn fence_marker_after_container_prefix_list_markers() {
+        assert_eq!(
+            fence_marker_after_container_prefix("* ```rust"),
+            Some(('`', 3))
+        );
+        assert_eq!(
+            fence_marker_after_container_prefix("1. ~~~"),
+            Some(('~', 3))
+        );
+        assert_eq!(
+            fence_marker_after_container_prefix("> * ````"),
+            Some(('`', 4))
+        );
+        assert_eq!(fence_marker_after_container_prefix("* text"), None);
+    }
+
     // --- unescape_markdown_destination の直接テスト ---
 
     #[test]
@@ -7546,6 +7579,32 @@ inside-of-fence
         // 通常通り圧縮される。
         let input = "   | a   | b   |";
         assert_eq!(compact_markdown(input), "| a | b |");
+    }
+
+    #[test]
+    fn compact_markdown_preserves_fence_on_list_marker_line() {
+        // htmd が出力する `* ``` ` 形式でも、フェンス内のテーブル風コードは保持する。
+        // 閉じフェンス後はコード状態を引き継がず、通常のテーブル圧縮を再開する。
+        let input = "* ```\n  | code   | stays   |\n  | ---    | ---     |\n  ```\n\n| a   | b   |";
+        let expected = "* ```\n  | code   | stays   |\n  | ---    | ---     |\n  ```\n\n| a | b |";
+        assert_eq!(compact_markdown(input), expected);
+    }
+
+    #[test]
+    fn find_close_paren_stops_at_blockquote_blank_line() {
+        // `>` だけの行もブロッククォート内の空行なので、リンクの閉じ括弧を
+        // その先まで探索してはならない。多段クォートでも同じ境界になる。
+        assert_eq!(find_link_close_paren("./bad\n>\n)"), None);
+        assert_eq!(find_link_close_paren("./bad\n> >\n)"), None);
+    }
+
+    #[test]
+    fn resolve_broken_link_does_not_cross_blockquote_blank_line() {
+        // 壊れたリンク候補はそのまま保持し、ブロッククォート空行後の正常なリンクは
+        // 独立した候補として引き続き解決する。
+        let input = "[broken](./bad\n>\n) [ok](./page)";
+        let expected = "[broken](./bad\n>\n) [ok](https://example.com/docs/en/page)";
+        assert_eq!(resolve_markdown_urls(input, BASE), expected);
     }
 
     // --- インラインコード内の `|` はセル区切りにならない ---
