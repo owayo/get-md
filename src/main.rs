@@ -2112,6 +2112,28 @@ mod tests {
     }
 
     #[test]
+    fn cli_help_flags_follow_standard_conventions() {
+        for flag in ["--help", "-h"] {
+            let error = Cli::try_parse_from(["get-md", flag])
+                .err()
+                .expect("ヘルプ表示は正常終了値ではなく clap の表示結果を返す");
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+            assert!(error.to_string().contains("Usage: get-md"));
+        }
+    }
+
+    #[test]
+    fn cli_version_flags_follow_standard_conventions() {
+        for flag in ["--version", "-V"] {
+            let error = Cli::try_parse_from(["get-md", flag])
+                .err()
+                .expect("バージョン表示は正常終了値ではなく clap の表示結果を返す");
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+        }
+    }
+
+    #[test]
     fn cli_all_options() {
         let cli = Cli::try_parse_from([
             "get-md",

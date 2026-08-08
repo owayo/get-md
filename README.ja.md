@@ -191,6 +191,8 @@ make test
 cargo test --test e2e -- --ignored
 ```
 
+ユニットテストでは、標準的な `-h` / `--help` と `-V` / `--version` の CLI 契約も確認します。
+
 ignored の E2E テストでは次を確認します。
 
 - GitHub Raw 上の実ドキュメント取得

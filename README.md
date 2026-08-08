@@ -191,6 +191,8 @@ make test
 cargo test --test e2e -- --ignored
 ```
 
+Unit tests also verify the conventional `-h` / `--help` and `-V` / `--version` CLI contracts.
+
 Ignored E2E tests cover:
 
 - Fetching a real GitHub raw document
