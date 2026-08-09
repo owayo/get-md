@@ -1,5 +1,6 @@
 mod progress;
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
@@ -955,6 +956,7 @@ fn split_unescaped_table_cells(inner: &str) -> Vec<&str> {
     let mut cells = Vec::new();
     let mut start = 0usize;
     let mut backslash_run = 0usize;
+    let inline_code_index = InlineCodeIndex::build(inner);
     // 開いているインラインコードスパンのバッククォート列の長さ。0 ならコード外。
     // コードスパン内の `|` はセル区切りとして扱わない（CommonMark/GFM 仕様）。
     let mut inline_code_len = 0usize;
@@ -968,7 +970,7 @@ fn split_unescaped_table_cells(inner: &str) -> Vec<&str> {
             if inline_code_len == 0 {
                 let escaped = backslash_run % 2 == 1;
                 // 同じ長さの閉じバッククォート列が後続にあるときだけインラインコードとして開く。
-                if !escaped && has_matching_inline_code_closer(inner, i + tick_len, tick_len) {
+                if !escaped && inline_code_index.has_closer(i) {
                     inline_code_len = tick_len;
                 }
             } else if tick_len == inline_code_len {
@@ -1019,6 +1021,7 @@ fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
 
     // ブロック構造（コード領域・空行）は走査のたびに作り直せないため先に 1 パスで求める。
     let blocks = MarkdownBlockMap::build(md);
+    let inline_code_index = InlineCodeIndex::build(md);
     let mut result = String::with_capacity(md.len());
     let mut cursor = 0usize;
     // ループをまたいで、cursor 以前のコード領域外で未閉鎖の `[` を引き継ぐ。
@@ -1026,9 +1029,13 @@ fn resolve_markdown_urls(md: &str, base_url: &str) -> String {
     // ある場合でも、後続走査で外側リンクを認識できる。
     let mut pending_open_brackets: usize = 0;
 
-    while let (Some(open), open_count_at_link) =
-        find_next_link_candidate(md, cursor, pending_open_brackets, &blocks)
-    {
+    while let (Some(open), open_count_at_link) = find_next_link_candidate(
+        md,
+        cursor,
+        pending_open_brackets,
+        &blocks,
+        &inline_code_index,
+    ) {
         let inside_start = open + 2;
 
         result.push_str(&md[cursor..inside_start]);
@@ -1428,6 +1435,7 @@ fn find_next_link_candidate(
     start: usize,
     initial_open_brackets: usize,
     blocks: &MarkdownBlockMap,
+    inline_code_index: &InlineCodeIndex,
 ) -> (Option<usize>, usize) {
     let mut cursor = start;
     let mut line_start = start == 0 || md[..start].ends_with('\n');
@@ -1503,7 +1511,7 @@ fn find_next_link_candidate(
         // バッククォート: エスケープされていない場合のみインラインコード開始候補
         if rest.starts_with('`') && !escaped {
             let tick_len = rest.chars().take_while(|c| *c == '`').count();
-            if has_matching_inline_code_closer(md, cursor + tick_len, tick_len) {
+            if inline_code_index.has_closer(cursor) {
                 inline_code_len = tick_len;
             }
             cursor += tick_len;
@@ -1536,15 +1544,87 @@ fn find_next_link_candidate(
     (None, open_bracket_count)
 }
 
+/// インラインコード開始候補と、同じ長さの閉じバッククォート列の対応を保持する。
+///
+/// 候補ごとに文書末尾まで探索すると、閉じ列のない異なる長さの候補が連続した入力で
+/// 最悪 O(n²) になる。物理行を 1 パスで走査し、空行・フェンス開始行で区切られた
+/// 各段落を後ろから確認することで、閉じ列を持つ候補位置を O(n) で索引化する。
+struct InlineCodeIndex {
+    openers_with_closer: HashSet<usize>,
+}
+
+impl InlineCodeIndex {
+    fn build(md: &str) -> Self {
+        let mut openers_with_closer = HashSet::new();
+        let mut segment_runs = Vec::new();
+        let mut line_start = 0usize;
+
+        loop {
+            let line_end = md[line_start..]
+                .find('\n')
+                .map(|offset| line_start + offset)
+                .unwrap_or(md.len());
+            let raw_line = &md[line_start..line_end];
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+
+            if is_blank_line_for_link_scan(line)
+                || fence_marker_after_container_prefix(line).is_some()
+            {
+                Self::finish_segment(&mut segment_runs, &mut openers_with_closer);
+            } else {
+                let mut offset = 0usize;
+                while offset < line.len() {
+                    let rest = &line[offset..];
+                    if rest.starts_with('`') {
+                        let tick_len = rest.chars().take_while(|c| *c == '`').count();
+                        segment_runs.push((line_start + offset, tick_len));
+                        offset += tick_len;
+                    } else {
+                        offset += rest
+                            .chars()
+                            .next()
+                            .expect("cursor は文字境界上にある")
+                            .len_utf8();
+                    }
+                }
+            }
+
+            if line_end >= md.len() {
+                break;
+            }
+            line_start = line_end + 1;
+        }
+
+        Self::finish_segment(&mut segment_runs, &mut openers_with_closer);
+        Self {
+            openers_with_closer,
+        }
+    }
+
+    fn finish_segment(
+        segment_runs: &mut Vec<(usize, usize)>,
+        openers_with_closer: &mut HashSet<usize>,
+    ) {
+        let mut later_lengths = HashSet::new();
+        for &(position, tick_len) in segment_runs.iter().rev() {
+            if later_lengths.contains(&tick_len) {
+                openers_with_closer.insert(position);
+            }
+            later_lengths.insert(tick_len);
+        }
+        segment_runs.clear();
+    }
+
+    fn has_closer(&self, opener_position: usize) -> bool {
+        self.openers_with_closer.contains(&opener_position)
+    }
+}
+
 /// 開始位置より後ろに、同じ長さのバッククォート列が存在するかを調べる。
 ///
-/// CommonMark では未閉鎖のバッククォート列はリテラルとして扱われるため、
-/// 対応する閉じ列が見つかる場合だけインラインコードとして扱う。
-///
-/// インラインコードは段落をまたいで延びることが無いため、フェンスコードブロック
-/// の開始行、または空行(段落境界)に到達した時点で「閉じ列なし」と判定する。
-/// これを行わないと、未閉鎖の `` ` `` のあとに現れたフェンス内・別段落の `` ` `` を
-/// 閉じと誤認してしまう。
+/// 本体は文書全体で共有する `InlineCodeIndex` を使う。この関数は、段落・フェンス境界を
+/// 含む従来の探索契約を直接テストするために残している。
+#[cfg(test)]
 fn has_matching_inline_code_closer(md: &str, start: usize, tick_len: usize) -> bool {
     let mut cursor = start;
     let mut line_start = start == 0 || md[..start].ends_with('\n');
@@ -1556,14 +1636,9 @@ fn has_matching_inline_code_closer(md: &str, start: usize, tick_len: usize) -> b
                 .map(|offset| cursor + offset)
                 .unwrap_or(md.len());
             let line = &md[cursor..line_end];
-            // 空行（ブロッククォート記号だけの行を含む）は段落境界なので、
-            // ここで探索を打ち切る。
-            if is_blank_line_for_link_scan(line) {
-                return false;
-            }
-            // フェンス開始行に到達したら、ここでインラインコード探索を打ち切る。
-            // ブロッククォート内のフェンスも対象にする。
-            if fence_marker_after_container_prefix(line).is_some() {
+            if is_blank_line_for_link_scan(line)
+                || fence_marker_after_container_prefix(line).is_some()
+            {
                 return false;
             }
             line_start = false;
@@ -1762,7 +1837,22 @@ mod tests {
     /// テスト用の `find_next_link_candidate` ラッパー。
     /// テストでは引き継ぎ状態を 0 で固定し、位置のみを返す。
     fn find_next_link_candidate(md: &str, start: usize) -> Option<usize> {
-        super::find_next_link_candidate(md, start, 0, &MarkdownBlockMap::build(md)).0
+        find_next_link_candidate_with_state(md, start, 0).0
+    }
+
+    /// ブロック構造とインラインコード索引を組み立てて候補探索を呼び出す。
+    fn find_next_link_candidate_with_state(
+        md: &str,
+        start: usize,
+        initial_open_brackets: usize,
+    ) -> (Option<usize>, usize) {
+        super::find_next_link_candidate(
+            md,
+            start,
+            initial_open_brackets,
+            &MarkdownBlockMap::build(md),
+            &InlineCodeIndex::build(md),
+        )
     }
 
     /// テスト用に、指定行頭オフセットの分類を取り出す。
@@ -4397,6 +4487,40 @@ code
         assert!(has_matching_inline_code_closer(md, 0, 1));
     }
 
+    #[test]
+    fn inline_code_index_marks_only_runs_with_later_same_length() {
+        let md = "`a` ``b`` ```c";
+        let index = InlineCodeIndex::build(md);
+
+        assert!(index.has_closer(0));
+        assert!(!index.has_closer(2));
+        assert!(index.has_closer(4));
+        assert!(!index.has_closer(7));
+        assert!(!index.has_closer(10));
+    }
+
+    #[test]
+    fn inline_code_index_does_not_cross_blank_or_fence_boundaries() {
+        let blank = "`open\n\n`later";
+        assert!(!InlineCodeIndex::build(blank).has_closer(0));
+
+        let fence = "`open\n```\n`inside`\n```\n`after";
+        assert!(!InlineCodeIndex::build(fence).has_closer(0));
+    }
+
+    #[test]
+    fn resolve_many_unmatched_backtick_lengths_keeps_later_link() {
+        let mut md = String::new();
+        for tick_len in 1..=256 {
+            md.push_str(&"`".repeat(tick_len));
+            md.push('x');
+        }
+        md.push_str("[link](./a)");
+
+        let resolved = resolve_markdown_urls(&md, BASE);
+        assert!(resolved.ends_with("[link](https://example.com/docs/en/a)"));
+    }
+
     // --- マルチバイト文字を含むテーブル圧縮テスト ---
 
     #[test]
@@ -6918,7 +7042,7 @@ code
         // `[x\](./a)` の `]`(=index 3) から再開した場合、直前の `\` で
         // `]` がエスケープされている扱いになり、リンク候補ではない。
         let md = r"[x\](./a)";
-        let (pos, count) = super::find_next_link_candidate(md, 3, 1, &MarkdownBlockMap::build(md));
+        let (pos, count) = find_next_link_candidate_with_state(md, 3, 1);
         assert_eq!(pos, None);
         assert_eq!(count, 1);
     }
@@ -6930,7 +7054,7 @@ code
         // `[x\\](./a)` の `]`(=index 4) から再開すると、直前 2 個の `\` は
         // 打ち消し合うため、`](`はリンク候補となる。
         let md = r"[x\\](./a)";
-        let (pos, count) = super::find_next_link_candidate(md, 4, 1, &MarkdownBlockMap::build(md));
+        let (pos, count) = find_next_link_candidate_with_state(md, 4, 1);
         assert_eq!(pos, Some(4));
         assert_eq!(count, 1);
     }
@@ -6943,7 +7067,7 @@ code
         // エスケープされ、開き括弧は増えない。`](` の前に開き `[` がない
         // ためリンク候補にならない。
         let md = r"\[x](./a)";
-        let (pos, count) = super::find_next_link_candidate(md, 1, 0, &MarkdownBlockMap::build(md));
+        let (pos, count) = find_next_link_candidate_with_state(md, 1, 0);
         assert_eq!(pos, None);
         assert_eq!(count, 0);
     }
@@ -6955,7 +7079,7 @@ code
         // `\`` の `` ` ``(=index 1) から再開すると、直前の `\` でエスケープされ、
         // インラインコード扱いにならず、後続の `[link](./a)` は通常通り検出される。
         let md = r"\`[link](./a)";
-        let (pos, count) = super::find_next_link_candidate(md, 1, 0, &MarkdownBlockMap::build(md));
+        let (pos, count) = find_next_link_candidate_with_state(md, 1, 0);
         // `](` の位置は index 7。
         // `[` が index 2、link が index 3..6、`]` が index 7 にある。
         // 実際には `\` (1byte) + `` ` `` (1byte) + `[` (1byte) + `link` (4byte) = index 7 が `]`
@@ -6971,8 +7095,7 @@ code
         let md = "あ[x](./a)";
         // "あ" は UTF-8 で 3 バイト
         let start = "あ".len();
-        let (pos, count) =
-            super::find_next_link_candidate(md, start, 0, &MarkdownBlockMap::build(md));
+        let (pos, count) = find_next_link_candidate_with_state(md, start, 0);
         // `]` の位置は あ(3) + [(1) + x(1) = 5
         assert_eq!(pos, Some(5));
         assert_eq!(count, 1);

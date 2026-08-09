@@ -36,6 +36,7 @@
 - **Broken Link Tolerance** — a malformed link candidate without a closing `)` or a malformed `<...>` destination without a closing `>` no longer prevents later valid links, including nested links, from being resolved
 - **Paragraph-boundary Link Safety** — does not combine unmatched `[` or inline backticks with delimiters beyond blank lines (including blockquote-only blank lines) or code-block boundaries, while preserving valid link text across a single soft line break. Closing-delimiter searches for malformed links stop at the same blockquote-only blank-line boundary
 - **Literal Backtick Safety** — treats unmatched inline backticks as literal text, so later Markdown links are still resolved; closer lookahead also stops at fences opened on a list-marker line
+- **Linear-time Backtick Matching** — pre-indexes equal-length backtick runs within paragraph and fence boundaries, avoiding repeated suffix scans on documents with many unmatched runs
 - **Multiline Inline-code Scanning** — keeps physical line-start tracking accurate after multiline inline code closes, so fence-like or indented text later on that line cannot hide subsequent links
 - **Angle Destination Parentheses Support** — does not treat `)` inside `<...>` link destinations as the closing delimiter
 - **Angle Bracket Escape Support** — correctly handles `\>` inside `<...>` link destinations and resolves it as a literal `>` instead of corrupting the path

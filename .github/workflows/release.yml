@@ -51,7 +51,7 @@ jobs:
             OLD_MONTH=$(echo "${CURRENT}" | cut -d. -f2)
             OLD_COUNTER=$(echo "${CURRENT}" | cut -d. -f3)
             # 2 桁年と 4 桁年の両方を扱う
-            OLD_YEAR_2DIGIT=$(echo "${OLD_YEAR}" | sed 's/^20//')
+            OLD_YEAR_2DIGIT="${OLD_YEAR#20}"
             if [ "${OLD_YEAR_2DIGIT}" = "${YEAR}" ] && [ "${OLD_MONTH}" = "${MONTH}" ]; then
               NEW_COUNTER=$((OLD_COUNTER + 1))
             else
@@ -68,11 +68,12 @@ jobs:
           sed -i "0,/^version = \"[^\"]*\"/s//version = \"${NEW_VERSION}\"/" Cargo.toml
 
           if [ -f "Cargo.lock" ]; then
-            cargo generate-lockfile 2>/dev/null || true
+            # ロックファイル更新に失敗した状態でリリースコミットを作らない
+            cargo generate-lockfile
           fi
 
-          echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=v${NEW_VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${NEW_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Commit and tag
         if: ${{ !inputs.dry_run }}
@@ -225,18 +226,21 @@ jobs:
       - name: Download and Calculate SHA256
         id: sha256
         run: |
-          VERSION="${{ needs.prepare-release.outputs.version }}"
           TAG="${{ needs.prepare-release.outputs.tag }}"
 
           # tarball を取得して SHA256 を計算する
-          curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/get-md-aarch64-apple-darwin.tar.gz" -o arm64.tar.gz
-          curl -sL "https://github.com/${{ github.repository }}/releases/download/${TAG}/get-md-x86_64-apple-darwin.tar.gz" -o x86_64.tar.gz
+          curl --fail --show-error --location --retry 3 "https://github.com/${{ github.repository }}/releases/download/${TAG}/get-md-aarch64-apple-darwin.tar.gz" --output arm64.tar.gz
+          curl --fail --show-error --location --retry 3 "https://github.com/${{ github.repository }}/releases/download/${TAG}/get-md-x86_64-apple-darwin.tar.gz" --output x86_64.tar.gz
+
+          # HTTP 200 のエラーページ等をハッシュ化しないようアーカイブ形式も検証する
+          tar -tzf arm64.tar.gz >/dev/null
+          tar -tzf x86_64.tar.gz >/dev/null
 
           SHA256_ARM64=$(sha256sum arm64.tar.gz | cut -d' ' -f1)
           SHA256_X86_64=$(sha256sum x86_64.tar.gz | cut -d' ' -f1)
 
-          echo "sha256_arm64=${SHA256_ARM64}" >> $GITHUB_OUTPUT
-          echo "sha256_x86_64=${SHA256_X86_64}" >> $GITHUB_OUTPUT
+          echo "sha256_arm64=${SHA256_ARM64}" >> "$GITHUB_OUTPUT"
+          echo "sha256_x86_64=${SHA256_X86_64}" >> "$GITHUB_OUTPUT"
 
       - name: Update Homebrew Formula
         env:
