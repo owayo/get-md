@@ -193,6 +193,7 @@ cargo test --test e2e -- --ignored
 ```
 
 ユニットテストでは、標準的な `-h` / `--help` と `-V` / `--version` の CLI 契約も確認します。
+また、長いコードフェンス、空白を含む URL と title を持つ画像、ヘッダーより列数が多いテーブル行について、HTML 変換から Markdown 後処理までの一連の処理を確認します。
 
 ignored の E2E テストでは次を確認します。
 

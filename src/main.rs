@@ -271,6 +271,16 @@ fn convert_html_fragments(
 ) -> Result<String> {
     // HTML を Markdown に変換する
     progress.spinner("Converting to Markdown...");
+
+    let markdown = convert_html_fragments_to_markdown(html_fragments)?;
+    let base_url = document_base_url(tab).unwrap_or_else(|| fallback_base_url.to_string());
+    let markdown = resolve_markdown_urls(&markdown, &base_url);
+    progress.finish("Converted to Markdown");
+
+    Ok(markdown)
+}
+
+fn convert_html_fragments_to_markdown(html_fragments: &[String]) -> Result<String> {
     let converter = htmd::HtmlToMarkdown::builder()
         .skip_tags(vec!["script", "style", "noscript", "svg"])
         .options(htmd::options::Options {
@@ -287,12 +297,7 @@ fn convert_html_fragments(
         md_parts.push(md);
     }
 
-    let base_url = document_base_url(tab).unwrap_or_else(|| fallback_base_url.to_string());
-    let markdown = compact_markdown(&md_parts.join("\n\n---\n\n"));
-    let markdown = resolve_markdown_urls(&markdown, &base_url);
-    progress.finish("Converted to Markdown");
-
-    Ok(markdown)
+    Ok(compact_markdown(&md_parts.join("\n\n---\n\n")))
 }
 
 fn finalize_output_text(markdown: String, file_output: bool) -> String {
@@ -7792,5 +7797,48 @@ inside-of-fence
         let input = "| `a | b` | x |";
         // 2 セル (`code`, `x`) として圧縮される
         assert_eq!(compact_markdown(input), "| `a | b` | x |");
+    }
+
+    #[test]
+    fn html_conversion_resolves_spaced_image_url_and_preserves_title() {
+        let fragments =
+            vec![r#"<img src="asset name.png" alt="diagram" title="A title">"#.to_string()];
+
+        let markdown =
+            convert_html_fragments_to_markdown(&fragments).expect("HTML 変換が成功すること");
+
+        assert_eq!(
+            resolve_markdown_urls(&markdown, "https://example.com/docs/page.html"),
+            r#"![diagram](<https://example.com/docs/asset%20name.png> "A title")"#
+        );
+    }
+
+    #[test]
+    fn html_conversion_preserves_table_cells_beyond_header_width() {
+        let fragments = vec![
+            r#"
+            <table>
+                <thead><tr><th>First</th><th>Second</th></tr></thead>
+                <tbody><tr><td>Alpha</td><td>Beta</td><td>Must survive</td></tr></tbody>
+            </table>
+        "#
+            .to_string(),
+        ];
+
+        assert_eq!(
+            convert_html_fragments_to_markdown(&fragments).expect("HTML 変換が成功すること"),
+            "| First | Second |  |\n| - | - | - |\n| Alpha | Beta | Must survive |"
+        );
+    }
+
+    #[test]
+    fn html_conversion_preserves_fence_longer_than_content_run() {
+        let fragments =
+            vec!["<pre><code>`````\nlet parsed = true;\n`````</code></pre>".to_string()];
+
+        assert_eq!(
+            convert_html_fragments_to_markdown(&fragments).expect("HTML 変換が成功すること"),
+            "``````\n`````\nlet parsed = true;\n`````\n``````"
+        );
     }
 }

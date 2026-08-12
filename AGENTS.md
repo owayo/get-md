@@ -4,7 +4,7 @@ URL をブラウザで取得し、指定要素を Markdown に変換する CLI �
 
 ## Tech Stack
 
-- Rust (Edition 2024、MSRV 1.88 — let-chain を使用。依存 htmd 0.5.4 も let-chain により 1.88 以上を要求)
+- Rust (Edition 2024、MSRV 1.88 — let-chain を使用。依存 htmd 0.5.5 も let-chain により 1.88 以上を要求)
 - headless_chrome (CDP 経由のブラウザ制御)
 - htmd (HTML -> Markdown 変換、skip_tags/spacing オプション使用)
 - clap (CLI 引数解析、derive feature)
@@ -69,6 +69,7 @@ make install  # /usr/local/bin にインストール
 - E2E テストは実際の Chrome/Chromium が必要（`#[ignore]` 付き）。GitHub Raw の実取得、ローカル `file://` ページでの相対 URL 解決、`<base href>` による基準URL解決、複数セレクタの `---` 結合、3 段ネストしたリスト内の相対 URL 解決とフェンスコード内リンクの非変換、`--ignore-date` の日時差分のみの書き込み抑止と日時以外の差分の上書き、ページスクリプトが Performance API を偽装しても実 HTTP 404 を拒否することを確認する。一時ディレクトリは時刻・プロセス ID・プロセス内連番で一意化し、並列実行時の衝突を防ぐ
 - 回帰テストでは、空行・ブロッククォート内空行・フェンスコード境界を未閉鎖 `[` が越えないこと、単一改行を含む正規リンクは引き続き解決すること、glob メタ文字を含む出力パスを Git pathspec が展開しないことを確認する。E2E では無効な CSS セレクタが明示的なエラーになることも確認する
 - 改行をまたぐインラインコードの回帰テストでは、閉じバッククォート列の直後にフェンス風テキストが続く場合、4 スペースインデント風テキストが続く場合、閉じ列が物理行頭にある場合の 3 境界を固定する
+- htmd 0.5.5 の統合回帰テストでは、空白を含む画像 URL と title の保持・絶対 URL 化、ヘッダー幅を超えるテーブルセルの保持、内容中の最長バッククォート列より長いコードフェンスの保持を、テーブル圧縮と URL 解決を含む実際の変換パイプラインで固定する
 - `make test` または `cargo test` で実行
 
 ## Key Design Decisions

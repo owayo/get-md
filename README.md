@@ -193,6 +193,7 @@ cargo test --test e2e -- --ignored
 ```
 
 Unit tests also verify the conventional `-h` / `--help` and `-V` / `--version` CLI contracts.
+They also cover the complete HTML-to-Markdown post-processing pipeline for long code fences, images with spaced URLs and titles, and table rows wider than their headers.
 
 Ignored E2E tests cover:
 
