@@ -371,10 +371,15 @@ fn write_or_print_output(
                 );
             }
             None => {
-                io::stdout()
-                    .lock()
+                let mut stdout = io::stdout().lock();
+                stdout
                     .write_all(output_text.as_bytes())
                     .context("Failed to write output")?;
+                // 標準出力は行バッファ（LineWriter）なので、最後の改行より後ろは
+                // write_all だけではバッファに残る。stdout 出力時は末尾改行を付けない
+                // ため必ず残り、明示的に flush しないと書き込み失敗（パイプ切断や
+                // ディスク満杯）を握りつぶして成功表示のまま終了してしまう。
+                stdout.flush().context("Failed to flush output")?;
                 progress.complete("✔", &cli.url);
             }
         }
@@ -769,7 +774,7 @@ fn compact_markdown(md: &str) -> String {
             }
 
             let trimmed = line.trim();
-            if trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 1 {
+            if trimmed.starts_with('|') && ends_with_unescaped_pipe(trimmed) && trimmed.len() > 1 {
                 let is_separator = is_table_separator_row(trimmed);
                 let normalize_separator = table_state != TableState::Body && is_separator;
                 table_state = if normalize_separator || table_state == TableState::Body {
@@ -789,6 +794,17 @@ fn compact_markdown(md: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 行末の `|` がセル区切りとしての閉じパイプか判定する。
+///
+/// `\|` はセル内容としてのリテラルなパイプであり、区切りではない
+/// （`split_unescaped_table_cells` と同じ契約）。直前のバックスラッシュが
+/// 奇数個ならエスケープ済みなので、閉じパイプとして扱わない。これを見ないと
+/// `| a \|` の末尾 1 バイトを区切りとして削り、セル内容を `a \` に壊してしまう。
+fn ends_with_unescaped_pipe(row: &str) -> bool {
+    row.strip_suffix('|')
+        .is_some_and(|rest| rest.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 0)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2424,6 +2440,60 @@ mod tests {
     #[test]
     fn compact_table_splits_on_even_backslashes_before_pipe() {
         assert_eq!(compact_markdown(r"| a\\| b | c |"), r"| a\\ | b | c |");
+    }
+
+    #[test]
+    fn compact_table_keeps_escaped_pipe_at_row_end() {
+        // GFM では行末の `|` を省略できるため `| a \|` はセル 1 個（内容 `a |`）。
+        // 末尾の `\|` を区切りと誤認して 1 バイト削ると `a \` に壊れる。
+        let input = "| h |\n| - |\n| a \\|";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    #[test]
+    fn compact_table_keeps_escaped_pipe_at_row_end_without_leading_cell() {
+        let input = "| h |\n| - |\n|\\|";
+        assert_eq!(compact_markdown(input), input);
+    }
+
+    #[test]
+    fn ends_with_unescaped_pipe_plain() {
+        assert!(ends_with_unescaped_pipe("| a |"));
+        assert!(ends_with_unescaped_pipe("|"));
+    }
+
+    #[test]
+    fn ends_with_unescaped_pipe_rejects_escaped() {
+        assert!(!ends_with_unescaped_pipe(r"| a \|"));
+        assert!(!ends_with_unescaped_pipe(r"|\|"));
+    }
+
+    #[test]
+    fn ends_with_unescaped_pipe_even_backslashes_are_not_escapes() {
+        // `\\` はバックスラッシュ 1 個のリテラルなので、その後ろの `|` は区切り。
+        assert!(ends_with_unescaped_pipe(r"| a \\|"));
+        assert!(ends_with_unescaped_pipe(r"| a \\\\|"));
+    }
+
+    #[test]
+    fn ends_with_unescaped_pipe_odd_backslashes_are_escapes() {
+        assert!(!ends_with_unescaped_pipe(r"| a \\\|"));
+        assert!(!ends_with_unescaped_pipe(r"| a \\\\\|"));
+    }
+
+    #[test]
+    fn ends_with_unescaped_pipe_without_trailing_pipe() {
+        assert!(!ends_with_unescaped_pipe("| a"));
+        assert!(!ends_with_unescaped_pipe(""));
+        assert!(!ends_with_unescaped_pipe("|a b"));
+    }
+
+    #[test]
+    fn ends_with_unescaped_pipe_multibyte_before_pipe() {
+        // バックスラッシュ列の逆走査はバイト単位だが、UTF-8 継続バイト(0x80-0xBF)は
+        // 0x5C(`\`) と衝突しないため、マルチバイト直後でも誤判定しない。
+        assert!(ends_with_unescaped_pipe("| 日本語 |"));
+        assert!(!ends_with_unescaped_pipe(r"| 日本語 \|"));
     }
 
     #[test]
