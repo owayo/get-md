@@ -15,6 +15,9 @@ target
 mise.local.toml
 .mise.local.toml
 
+# Claude Code のエージェントが作る作業用の worktree (誤って gitlink として追跡しない)
+.claude/worktrees/
+
 # RustRover
 #  JetBrains 用テンプレートは別の JetBrains.gitignore として管理されている。
 #  https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore を参照し、
