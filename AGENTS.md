@@ -4,7 +4,7 @@ URL をブラウザで取得し、指定要素を Markdown に変換する CLI �
 
 ## Tech Stack
 
-- Rust (Edition 2024、MSRV 1.88 — let-chain を使用。依存 htmd 0.5.5 も let-chain により 1.88 以上を要求)
+- Rust (Edition 2024。ツールチェーンの版は `mise.toml` が正で、Cargo.toml の `rust-version` をその major.minor にそろえる。コードは let-chain を使い、依存の htmd 0.5.5 も let-chain のため Rust 1.88 以上を要求する)
 - headless_chrome (CDP 経由のブラウザ制御)
 - htmd (HTML -> Markdown 変換、skip_tags/spacing オプション使用)
 - clap (CLI 引数解析、derive feature)
@@ -38,26 +38,35 @@ URL をブラウザで取得し、指定要素を Markdown に変換する CLI �
 
 ## Project Structure
 
-```
+```text
 src/
   main.rs       # CLI 定義、メインフロー、HTML 取得、Markdown 変換、出力処理
   progress.rs   # indicatif ベースのプログレス表示
-Makefile        # build, release, test, fmt, check, install ターゲット
+tests/
+  e2e.rs        # Chrome/Chromium を使う E2E テスト (#[ignore]。make test-e2e で実行)
+docs/           # README から分けた文書 (使い方、Markdown 変換の詳細、開発)。英語の x.md と日本語の x.ja.md の対
+Makefile        # 開発タスクの入口 (make help で一覧)
+mise.toml       # ツールチェーン (Rust) の版の正
 .github/
   workflows/
-    ci.yml      # CI (test, clippy, fmt, MSRV 1.88, build)
-    release.yml # リリース (バージョンバンプ、ビルド、GitHub Release、Homebrew更新)
+    ci.yml      # CI (quality: Linux / macOS で make setup と make ci、build: 配布する target のビルドと Windows のテスト)
+    release.yml # リリース (版の更新、ビルド、SHA256SUMS 付きの GitHub Release、Homebrew tap の更新)
 ```
 
 ## Development
 
+開発コマンドの一覧は `make help` を参照する。ツールの版は `mise.toml` が正で、make は `mise exec` 経由でその版を使う (mise が無い環境では `SYSTEM_TOOLS=1` で PATH のツールを使える)。
+
 ```bash
-make build    # デバッグビルド
-make release  # リリースビルド
-make test     # テスト
-make check    # フォーマット確認 + clippy + check
-make fmt      # フォーマット
-make install  # /usr/local/bin にインストール
+make setup     # mise でツールチェーンを入れ、依存を取得する (初回と依存の更新後)
+make build     # デバッグビルド
+make release   # リリースビルド
+make test      # テスト (E2E はビルドだけして実行しない)
+make test-e2e  # Chrome/Chromium を使う E2E テスト
+make check     # fmt-check + clippy (書き換えない)
+make ci        # CI の quality と同じ検査 (check + test)
+make fmt       # フォーマット (書き換える)
+make install   # /usr/local/bin にインストール (INSTALL_PATH で変更できる)
 ```
 
 ## Testing
@@ -70,7 +79,7 @@ make install  # /usr/local/bin にインストール
 - 回帰テストでは、空行・ブロッククォート内空行・フェンスコード境界を未閉鎖 `[` が越えないこと、単一改行を含む正規リンクは引き続き解決すること、glob メタ文字を含む出力パスを Git pathspec が展開しないことを確認する。E2E では無効な CSS セレクタが明示的なエラーになることも確認する
 - 改行をまたぐインラインコードの回帰テストでは、閉じバッククォート列の直後にフェンス風テキストが続く場合、4 スペースインデント風テキストが続く場合、閉じ列が物理行頭にある場合の 3 境界を固定する
 - htmd 0.5.5 の統合回帰テストでは、空白を含む画像 URL と title の保持・絶対 URL 化、ヘッダー幅を超えるテーブルセルの保持、内容中の最長バッククォート列より長いコードフェンスの保持を、テーブル圧縮と URL 解決を含む実際の変換パイプラインで固定する
-- `make test` または `cargo test` で実行
+- ユニットテストは `make test`、E2E テストは `make test-e2e` で実行する (個別のテストに絞るときは `cargo test <名前>`)
 
 ## Key Design Decisions
 
@@ -87,4 +96,4 @@ make install  # /usr/local/bin にインストール
 - `--ignore-date`: 日時パターン（`YYYY-MM-DD HH:MM(:SS)?`、スラッシュ区切り、`Z`・小数秒・タイムゾーン付き ISO 8601）を無視してファイル比較し、日時だけの差分なら上書きせず unchanged 扱いにする。双方に日時パターンを含む場合のみ比較し、非 UTF-8 や日時パターンを含まない場合は安全のため通常比較にフォールバックする。git 管理下の未ステージ変更がある場合は `file_status` と同じ契約で updated 扱い
 - `idle_browser_timeout` は `timeout + 30s` のバッファを saturating 加算で設定する
 - バージョニングは CalVer (YY.M.counter) 形式
-- リリースワークフローは `Cargo.lock` 再生成に失敗した場合にコミット・タグ作成前で停止する。Homebrew 用 SHA256 の計算前に成果物取得の HTTP エラーと gzip/tar 形式を検証し、エラーページや壊れたアーカイブを Formula に登録しない
+- リリースワークフローは版を JST の YY.M.counter で決め、同じタグが既にあれば止める。Cargo.lock は `cargo update --workspace` で自パッケージの版だけを合わせ、失敗した場合はコミット・タグ作成前で停止する。Homebrew の formula の sha256 は、Release に添付した `SHA256SUMS` から読む
