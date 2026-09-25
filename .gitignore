@@ -11,6 +11,10 @@ target
 # cargo mutants が生成するミューテーションテスト用データ
 **/mutants.out*/
 
+# mise の個人用の上書き (版の正は mise.toml)
+mise.local.toml
+.mise.local.toml
+
 # RustRover
 #  JetBrains 用テンプレートは別の JetBrains.gitignore として管理されている。
 #  https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore を参照し、
