@@ -371,15 +371,7 @@ fn write_or_print_output(
                 );
             }
             None => {
-                let mut stdout = io::stdout().lock();
-                stdout
-                    .write_all(output_text.as_bytes())
-                    .context("Failed to write output")?;
-                // 標準出力は行バッファ（LineWriter）なので、最後の改行より後ろは
-                // write_all だけではバッファに残る。stdout 出力時は末尾改行を付けない
-                // ため必ず残り、明示的に flush しないと書き込み失敗（パイプ切断や
-                // ディスク満杯）を握りつぶして成功表示のまま終了してしまう。
-                stdout.flush().context("Failed to flush output")?;
+                write_all_and_flush(io::stdout().lock(), output_text.as_bytes())?;
                 progress.complete("✔", &cli.url);
             }
         }
@@ -388,11 +380,24 @@ fn write_or_print_output(
     Ok(())
 }
 
+/// 出力を書き込み、明示的に flush してから成功を返す。
+///
+/// `io::stdout()` は行バッファ（`LineWriter`）なので、最後の改行より後ろは
+/// `write_all` だけでは実際に書き出されずバッファに残る。標準出力へ出すときは
+/// `finalize_output_text` が末尾改行を付けないため必ず残り、flush しないと
+/// 書き込み失敗（パイプ切断やディスク満杯）を握りつぶして「成功」表示のまま
+/// 終了コード 0 で終わってしまう。プロセス終了時の暗黙の flush は結果を捨てる。
+fn write_all_and_flush(mut writer: impl Write, bytes: &[u8]) -> Result<()> {
+    writer.write_all(bytes).context("Failed to write output")?;
+    writer.flush().context("Failed to flush output")?;
+    Ok(())
+}
+
 fn build_launch_options(cli: &Cli) -> LaunchOptions<'static> {
     LaunchOptions {
         headless: !cli.no_headless,
         path: cli.chrome_path.clone(),
-        idle_browser_timeout: idle_browser_timeout(cli.timeout),
+        idle_browser_timeout: idle_browser_timeout(cli.timeout, cli.wait),
         ignore_certificate_errors: cli.ignore_certificate_errors,
         ..LaunchOptions::default()
     }
@@ -718,8 +723,14 @@ fn strip_dates(s: &str) -> String {
     DATE_RE.replace_all(s, "").into_owned()
 }
 
-fn idle_browser_timeout(timeout_secs: u64) -> Duration {
-    Duration::from_secs(timeout_secs.saturating_add(30))
+/// CDP 接続のアイドルタイムアウトを求める。
+///
+/// headless_chrome は「CDP メッセージが 1 通も来ない時間」がこの値を超えると
+/// WebSocket を閉じ、以後の `call_method` をすべて失敗させる。`--wait` の待機は
+/// `thread::sleep` でブロックし、静的ページはその間 CDP イベントを一切出さないため、
+/// 待機時間を算入しないと `--wait` が `--timeout + 30` を超えた指定で必ず切断される。
+fn idle_browser_timeout(timeout_secs: u64, wait_secs: u64) -> Duration {
+    Duration::from_secs(timeout_secs.saturating_add(wait_secs).saturating_add(30))
 }
 
 /// CSS セレクタ文字列を JavaScript 文字列リテラルとしてエスケープする。
@@ -774,7 +785,7 @@ fn compact_markdown(md: &str) -> String {
             }
 
             let trimmed = line.trim();
-            if trimmed.starts_with('|') && ends_with_unescaped_pipe(trimmed) && trimmed.len() > 1 {
+            if trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 1 {
                 let is_separator = is_table_separator_row(trimmed);
                 let normalize_separator = table_state != TableState::Body && is_separator;
                 table_state = if normalize_separator || table_state == TableState::Body {
@@ -800,11 +811,24 @@ fn compact_markdown(md: &str) -> String {
 ///
 /// `\|` はセル内容としてのリテラルなパイプであり、区切りではない
 /// （`split_unescaped_table_cells` と同じ契約）。直前のバックスラッシュが
-/// 奇数個ならエスケープ済みなので、閉じパイプとして扱わない。これを見ないと
-/// `| a \|` の末尾 1 バイトを区切りとして削り、セル内容を `a \` に壊してしまう。
+/// 奇数個ならエスケープ済みなので、閉じパイプとして扱わない。
 fn ends_with_unescaped_pipe(row: &str) -> bool {
     row.strip_suffix('|')
         .is_some_and(|rest| rest.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 0)
+}
+
+/// テーブル行から前後の区切りパイプを取り除いた内側を返す。
+///
+/// 末尾の `|` がエスケープ済み（`\|`）ならそれは区切りではなく最後のセルの内容な
+/// ので削らない。GFM では行末の区切りパイプを省略できるため `| a \|` はセル 1 個
+/// （内容 `a |`）の正当な行であり、末尾 1 バイトを無条件に削ると `a \` に壊れる。
+fn table_row_inner(row: &str) -> &str {
+    let after_open = &row[1..];
+    if ends_with_unescaped_pipe(row) {
+        after_open.strip_suffix('|').unwrap_or(after_open)
+    } else {
+        after_open
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -942,7 +966,7 @@ fn compact_table_row(row: &str) -> String {
 }
 
 fn compact_table_row_with_separator(row: &str, normalize_separator: bool) -> String {
-    let inner = &row[1..row.len() - 1];
+    let inner = table_row_inner(row);
     let cells: Vec<String> = split_unescaped_table_cells(inner)
         .into_iter()
         .map(|cell| {
@@ -961,7 +985,7 @@ fn compact_table_row_with_separator(row: &str, normalize_separator: bool) -> Str
 }
 
 fn is_table_separator_row(row: &str) -> bool {
-    let inner = &row[1..row.len() - 1];
+    let inner = table_row_inner(row);
     let cells = split_unescaped_table_cells(inner);
     !cells.is_empty()
         && cells
@@ -2015,6 +2039,90 @@ mod tests {
         );
     }
 
+    /// 書き込み・flush の成否を個別に制御できるテスト用ライタ。
+    struct FlakyWriter {
+        buffer: Vec<u8>,
+        write_error: Option<ErrorKind>,
+        flush_error: Option<ErrorKind>,
+    }
+
+    impl FlakyWriter {
+        fn ok() -> Self {
+            Self {
+                buffer: Vec::new(),
+                write_error: None,
+                flush_error: None,
+            }
+        }
+
+        fn failing_flush(kind: ErrorKind) -> Self {
+            Self {
+                buffer: Vec::new(),
+                write_error: None,
+                flush_error: Some(kind),
+            }
+        }
+
+        fn failing_write(kind: ErrorKind) -> Self {
+            Self {
+                buffer: Vec::new(),
+                write_error: Some(kind),
+                flush_error: None,
+            }
+        }
+    }
+
+    impl Write for FlakyWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            match self.write_error {
+                Some(kind) => Err(io::Error::new(kind, "write failed")),
+                None => {
+                    self.buffer.extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            match self.flush_error {
+                Some(kind) => Err(io::Error::new(kind, "flush failed")),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn write_all_and_flush_writes_all_bytes() {
+        let mut writer = FlakyWriter::ok();
+        write_all_and_flush(&mut writer, b"no trailing newline").unwrap();
+        assert_eq!(writer.buffer, b"no trailing newline");
+    }
+
+    #[test]
+    fn write_all_and_flush_propagates_flush_error() {
+        // 行バッファのままだと最終行が書き出されないので、flush の失敗は
+        // 握りつぶさずに呼び出し元へ伝える必要がある。
+        let err = write_all_and_flush(FlakyWriter::failing_flush(ErrorKind::BrokenPipe), b"body")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to flush output"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn write_all_and_flush_propagates_write_error() {
+        let err = write_all_and_flush(
+            FlakyWriter::failing_write(ErrorKind::PermissionDenied),
+            b"body",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to write output"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn capture_output_write_state_none_is_empty() {
         let state = capture_output_write_state(None);
@@ -2294,8 +2402,27 @@ mod tests {
         let options = build_launch_options(&cli);
         assert!(!options.headless);
         assert_eq!(options.path, Some(PathBuf::from("/usr/bin/chromium")));
-        assert_eq!(options.idle_browser_timeout, Duration::from_secs(75));
+        // timeout 45 + wait 2（既定） + バッファ 30
+        assert_eq!(options.idle_browser_timeout, Duration::from_secs(77));
         assert!(options.ignore_certificate_errors);
+    }
+
+    #[test]
+    fn launch_options_include_wait_in_idle_timeout() {
+        // --wait は thread::sleep で CDP 無通信の時間を作るため、
+        // idle_browser_timeout に算入しないと待機中に接続が切れる。
+        let cli = Cli::try_parse_from([
+            "get-md",
+            "https://example.com",
+            "--wait",
+            "45",
+            "--timeout",
+            "5",
+        ])
+        .unwrap();
+
+        let options = build_launch_options(&cli);
+        assert_eq!(options.idle_browser_timeout, Duration::from_secs(80));
     }
 
     #[test]
@@ -2326,13 +2453,26 @@ mod tests {
 
     #[test]
     fn idle_browser_timeout_adds_buffer() {
-        assert_eq!(idle_browser_timeout(60), Duration::from_secs(90));
+        assert_eq!(idle_browser_timeout(60, 0), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn idle_browser_timeout_adds_wait_seconds() {
+        assert_eq!(idle_browser_timeout(60, 45), Duration::from_secs(135));
     }
 
     #[test]
     fn idle_browser_timeout_saturates_on_overflow() {
         assert_eq!(
-            idle_browser_timeout(u64::MAX),
+            idle_browser_timeout(u64::MAX, 0),
+            Duration::from_secs(u64::MAX),
+        );
+    }
+
+    #[test]
+    fn idle_browser_timeout_saturates_on_wait_overflow() {
+        assert_eq!(
+            idle_browser_timeout(u64::MAX, u64::MAX),
             Duration::from_secs(u64::MAX),
         );
     }
@@ -2446,14 +2586,69 @@ mod tests {
     fn compact_table_keeps_escaped_pipe_at_row_end() {
         // GFM では行末の `|` を省略できるため `| a \|` はセル 1 個（内容 `a |`）。
         // 末尾の `\|` を区切りと誤認して 1 バイト削ると `a \` に壊れる。
-        let input = "| h |\n| - |\n| a \\|";
-        assert_eq!(compact_markdown(input), input);
+        // 圧縮結果は閉じパイプを補った標準形式になるが、セル内容は保持する。
+        assert_eq!(
+            compact_markdown("| h |\n| - |\n| a \\|"),
+            "| h |\n| - |\n| a \\| |"
+        );
     }
 
     #[test]
     fn compact_table_keeps_escaped_pipe_at_row_end_without_leading_cell() {
-        let input = "| h |\n| - |\n|\\|";
-        assert_eq!(compact_markdown(input), input);
+        assert_eq!(
+            compact_markdown("| h |\n| - |\n|\\|"),
+            "| h |\n| - |\n| \\| |"
+        );
+    }
+
+    #[test]
+    fn compact_table_escaped_terminal_pipe_keeps_body_state() {
+        // 末尾 `\|` の行でテーブル本文の状態を捨てると、後続のセパレータ風データ行が
+        // セパレータとして正規化され、`| -------------- |` が `| - |` に壊れる。
+        assert_eq!(
+            compact_markdown("| h |\n| - |\n| a \\|\n| -------------- |"),
+            "| h |\n| - |\n| a \\| |\n| -------------- |"
+        );
+    }
+
+    #[test]
+    fn compact_table_escaped_terminal_pipe_with_trailing_spaces() {
+        assert_eq!(compact_markdown("| a \\|   "), "| a \\| |");
+    }
+
+    #[test]
+    fn compact_table_even_backslashes_before_terminal_pipe_still_split() {
+        // `\\` はバックスラッシュ 1 個のリテラルなので、末尾 `|` は閉じ区切り。
+        assert_eq!(compact_markdown(r"| a \\|   "), r"| a \\ |");
+    }
+
+    #[test]
+    fn table_row_inner_keeps_escaped_terminal_pipe() {
+        assert_eq!(table_row_inner(r"| a \|"), r" a \|");
+    }
+
+    #[test]
+    fn table_row_inner_strips_unescaped_terminal_pipe() {
+        assert_eq!(table_row_inner("| a |"), " a ");
+        assert_eq!(table_row_inner(r"| a \\|"), r" a \\");
+    }
+
+    #[test]
+    fn table_row_inner_single_pipe_does_not_panic() {
+        // 開きパイプと閉じパイプが同じ 1 文字のとき、内側は空。
+        assert_eq!(table_row_inner("|"), "");
+    }
+
+    #[test]
+    fn table_row_inner_without_terminal_pipe() {
+        assert_eq!(table_row_inner("| a"), " a");
+    }
+
+    #[test]
+    fn is_table_separator_row_ignores_escaped_terminal_pipe() {
+        // 末尾 `\|` を削ってしまうと `| -\|` が `| -` = セパレータと誤判定される。
+        assert!(!is_table_separator_row(r"| -\|"));
+        assert!(is_table_separator_row("| - |"));
     }
 
     #[test]
@@ -4350,7 +4545,7 @@ code
 
     #[test]
     fn idle_browser_timeout_zero() {
-        assert_eq!(idle_browser_timeout(0), Duration::from_secs(30));
+        assert_eq!(idle_browser_timeout(0, 0), Duration::from_secs(30));
     }
 
     // resolve_markdown_urls: リファレンスリンクスタイルは変換しない
@@ -5439,7 +5634,7 @@ code
     #[test]
     fn idle_browser_timeout_typical_value() {
         // 一般的な 60 秒タイムアウトのバッファ確認
-        assert_eq!(idle_browser_timeout(60), Duration::from_secs(90));
+        assert_eq!(idle_browser_timeout(60, 0), Duration::from_secs(90));
     }
 
     // --- split_link_destination の追加テスト ---
@@ -5859,14 +6054,21 @@ code
     #[test]
     fn idle_browser_timeout_large_value() {
         // 大きいが溢れない値
-        let d = idle_browser_timeout(1000);
+        let d = idle_browser_timeout(1000, 0);
         assert_eq!(d, Duration::from_secs(1030));
     }
 
     #[test]
     fn idle_browser_timeout_max_minus_30() {
         // u64::MAX - 30 は加算後にちょうど u64::MAX
-        let d = idle_browser_timeout(u64::MAX - 30);
+        let d = idle_browser_timeout(u64::MAX - 30, 0);
+        assert_eq!(d, Duration::from_secs(u64::MAX));
+    }
+
+    #[test]
+    fn idle_browser_timeout_wait_pushes_to_saturation() {
+        // timeout と wait の合算がちょうど u64::MAX を超える境界
+        let d = idle_browser_timeout(u64::MAX - 30, 1);
         assert_eq!(d, Duration::from_secs(u64::MAX));
     }
 

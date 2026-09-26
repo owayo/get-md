@@ -157,6 +157,40 @@ fn fetch_local_html_and_resolve_relative_urls() {
 
 #[test]
 #[ignore] // システムに Chrome/Chromium が必要
+fn wait_longer_than_previous_idle_timeout_keeps_cdp_connected() {
+    let temp_dir = TempDir::new();
+    let page = temp_dir.path().join("static.html");
+    write_file(
+        &page,
+        "<html><body><main>Static content</main></body></html>",
+    );
+
+    // 旧設定のアイドルタイムアウトは timeout 5 秒 + 30 秒だった。
+    // 静的ページを 36 秒待つと CDP が切断され、続く HTML 抽出が失敗していた。
+    let output = get_md_bin()
+        .args([
+            file_url(&page),
+            "-s".into(),
+            "main".into(),
+            "-t".into(),
+            "5".into(),
+            "-w".into(),
+            "36".into(),
+            "-q".into(),
+        ])
+        .output()
+        .expect("get-md を実行できること");
+
+    assert!(
+        output.status.success(),
+        "待機後の CDP 接続が切れた: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "Static content");
+}
+
+#[test]
+#[ignore] // システムに Chrome/Chromium が必要
 fn nested_list_relative_urls_are_resolved() {
     // htmd はネストしたリストを 1 段 2 スペースで出力するため、3 段目以降は
     // 行頭 4 スペース以上になる。これをインデントコードと誤判定すると、

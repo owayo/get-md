@@ -34,6 +34,6 @@ get-md converts the extracted HTML to Markdown with [htmd](https://crates.io/cra
 ## Tables
 
 - **Table compaction**: Removes unnecessary padding in Markdown tables while preserving fenced code blocks and separator-like data cells such as `--` or `:`
-- **Escaped pipes**: Keeps escaped cell pipes (`\|`) intact during table compaction
+- **Escaped pipes**: Keeps escaped cell pipes (`\|`) intact during table compaction, including a final escaped pipe when the optional closing cell delimiter is absent
 - **Pipes in inline code**: Keeps pipes inside inline code spans in table cells from being treated as cell separators, preserving the code during compaction
 - **Indented code blocks**: Lines indented with four or more spaces (CommonMark indented code blocks) are not treated as table rows, so their leading indentation and inner spacing are preserved

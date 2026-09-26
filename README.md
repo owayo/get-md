@@ -32,16 +32,16 @@ Convert the whole page, or pick the parts you need with CSS selectors. Relative 
 
 ## Features
 
-- **JavaScript rendering**: Drives your installed Chrome or Chromium over the Chrome DevTools Protocol, so single-page apps and dynamic content are converted after they render; `-w` sets the extra wait
+- **JavaScript rendering**: Drives your installed Chrome or Chromium over the Chrome DevTools Protocol, so single-page apps and dynamic content are converted after they render; `-w` sets the extra wait, which is included in the browser connection's idle timeout
 - **No WebDriver**: Needs no ChromeDriver or Selenium; Chrome is found automatically, or set with `--chrome-path`
 - **CSS selector extraction**: Converts only the elements you need; repeat `-s` to join several selectors with `---` in the order given, and an invalid selector fails with an explicit error instead of matching nothing
-- **Clean Markdown**: Drops scripts, styles, `noscript`, and SVG, and removes the padding from Markdown tables
+- **Clean Markdown**: Drops scripts, styles, `noscript`, and SVG, and removes the padding from Markdown tables while preserving escaped pipes in cells
 - **Absolute URLs**: Resolves relative links and images against the rendered document's base URL, including `<base href>`, and leaves inline code and code blocks untouched
 - **HTTP error detection**: Rejects HTTP error responses using Chrome DevTools Protocol network events, even when page scripts tamper with browser performance APIs
 - **Certificate checks by default**: Validates HTTPS certificates; `--ignore-certificate-errors` is an explicit opt-out for trusted debugging
 - **Safe file output**: Writes through a temporary file and an atomic rename, keeps existing permissions and symlinks, and reports whether the file was created, updated, or unchanged
 - **Timestamp-only change detection**: With `--ignore-date`, leaves the file as it is when only dates and times changed
-- **Progress display**: Shows each step while fetching and converting; `-q` turns it off
+- **Progress display**: Shows each step while fetching and converting; `-q` turns it off. Standard output is flushed before success is reported
 
 How links, code blocks, and tables are handled in detail: [docs/markdown-conversion.md](docs/markdown-conversion.md)
 

@@ -27,7 +27,7 @@ get-md [OPTIONS] <URL>
 | `--help` | `-h` | Show help |
 | `--version` | `-V` | Show version |
 
-The browser's own idle timeout is `--timeout` plus 30 seconds. The sum saturates instead of overflowing, so even an extreme `--timeout` value is safe.
+The browser's own idle timeout is `--timeout` plus `--wait` plus 30 seconds. This keeps the Chrome DevTools Protocol connection open while a quiet page waits for JavaScript rendering. The sum saturates instead of overflowing, so even extreme values are safe.
 
 ## Examples
 
@@ -90,4 +90,4 @@ With `-o`, get-md writes the Markdown to the file and reports what happened to i
 - **Git-aware status**: If the file is tracked by Git and has unstaged changes, the status is `updated`. The check runs in the repository that contains the output file and matches its literal path (glob characters such as `[` or `*` in the name are not expanded), so it also holds when you write to a tracked file that was deleted and when get-md runs from outside that repository. If the existing file cannot be read, the status falls back to `updated`
 - **`--ignore-date`**: Skips the rewrite when only date and time strings changed, including common ISO 8601 forms with fractional seconds and timezone suffixes. Both the old and the new content must contain a date for this to apply, and non-UTF-8 files fall back to the normal comparison
 - **Atomic writes**: The output is written to a temporary file in the same directory and renamed into place, so an I/O error in the middle of writing (a full disk, for example) never truncates or corrupts an existing file. Existing permissions are applied before the content is written, write permission is checked up front, and a symlinked output resolves to the real target so the link stays intact, even when a dangling target has missing parent directories. The rename replaces the inode, so hard links are broken and ACLs and extended attributes are not carried over (a deliberate trade-off for crash safety)
-- **Progress**: Progress is shown on standard error, so it never mixes into Markdown written to standard output. The completion line appears only after the output was written successfully
+- **Progress**: Progress is shown on standard error, so it never mixes into Markdown written to standard output. The completion line appears only after the output was written and flushed successfully
