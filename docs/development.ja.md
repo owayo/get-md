@@ -8,6 +8,8 @@
 
 ユニットテストでは、標準的な `-h` / `--help` と `-V` / `--version` の CLI の契約も確認します。また、長いコードフェンス、空白を含む URL と title を持つ画像、ヘッダーより列の多い表の行について、HTML を変換してから Markdown を後処理するまでの流れを通して確認します。
 
+front matter については、`--meta` の決まり、特殊な文字ごとのエスケープ、項目の順序、既存のファイルとの比較を確かめます。生成した front matter は YAML のパーサ ([yaml-rust2](https://crates.io/crates/yaml-rust2)。dev-dependency) で読み直し、どの値も元の文字列に戻ることも確かめます。
+
 ## E2E テスト
 
 `tests/e2e.rs` の E2E テストは実際の Chrome / Chromium を操作するため、`#[ignore]` を付けてあり、`make ci` には含まれません。次のコマンドで実行します。
@@ -24,4 +26,5 @@ E2E テストでは次を確認します。
 - 複数のセレクタを指定したときの `---` 区切りの結合
 - 無効な CSS セレクタを明示的なエラーとして拒否すること
 - `--ignore-date` を付けたとき、日時の差分だけなら既存のファイルを書き換えず、日時以外の差分は上書きすること
+- `--front-matter` と `--meta` で front matter を書くこと。取り直して `retrieved_at` しか変わらないならファイルを書き換えず、`--meta` の値が変わったら書き換えること
 - ページのスクリプトが Performance API を偽装しても、実際の HTTP 404 を拒否すること

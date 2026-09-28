@@ -12,6 +12,8 @@ URL をブラウザで取得し、指定要素を Markdown に変換する CLI �
 - regex (日時パターンマッチング)
 - url (相対URL -> 絶対URL 変換)
 - anyhow (エラーハンドリング)
+- time (front matter の retrieved_at を UTC の RFC 3339 で書く。日時の計算は自作しない。features は formatting だけ)
+- yaml-rust2 (dev-dependency。生成した front matter をテストで YAML として読み直す。純 Rust で YAML 1.2 のテストスイートに準拠し、API を安定させたまま保守されている。入力は &str だけなので default-features = false で encoding_rs を入れない)
 
 ## Architecture
 
@@ -21,7 +23,7 @@ URL をブラウザで取得し、指定要素を Markdown に変換する CLI �
 - HTTPS 証明書は既定で検証し、信頼済みデバッグ用途のみ `--ignore-certificate-errors` で無視可能
 - HTTP ステータスはページ内 JS ではなく CDP の Network response event から取得し、ページスクリプトによる偽装を防ぐ
 - CDP のアイドルタイムアウトは `--timeout + --wait + 30 秒`（飽和加算）とし、静的ページでの追加待機中に接続が切れないようにする
-- メインフローはセレクタ決定、ブラウザ起動/ページ読み込み、HTTP ステータス検証、HTML 抽出、Markdown 変換、出力処理の小さな関数に分割し、`BrowserPage` と `OutputWriteState` でブラウザ寿命と書き込み前状態を明示する
+- メインフローは `--meta` の検証 (ブラウザの起動より前)、セレクタ決定、ブラウザ起動/ページ読み込み、HTTP ステータス検証、HTML 抽出、front matter の組み立て (`--front-matter` のときだけ)、Markdown 変換、出力処理の小さな関数に分割し、`BrowserPage` と `OutputWriteState` でブラウザ寿命と書き込み前状態を明示する
 - CSS セレクタはブラウザ内 JS 実行により要素の outerHTML を取得する。セレクタ文字列を JS 文字列リテラルへ埋め込む際は `escape_js_string` で、改行/CR/タブは短縮エスケープ(`\n`/`\r`/`\t`)、NUL を含む U+0000〜U+001F の制御文字は `\uXXXX`、行区切り(U+2028)/段落区切り(U+2029)・引用符/バックスラッシュも個別エスケープしてから渡す。これにより制御文字を素通しすることによる CSS パーサ/CDP プロトコル層の予期しない挙動を防ぐ
 - セレクタ評価中の JavaScript 例外は NUL を含む衝突不能な番兵付き文字列として Rust 側へ返し、不正な CSS セレクタを「一致 0 件」と区別して明示的なエラーにする
 - htmd で HTML -> Markdown 変換（script, style, noscript, svg は skip_tags で除去）
@@ -79,6 +81,7 @@ make install   # /usr/local/bin にインストール (INSTALL_PATH で変更で
 - バッククォート索引の回帰テストでは、後続の同長列だけを閉じ候補として記録すること、空行・フェンス境界を越えないこと、異なる長さの未閉鎖列が大量に続いても後続リンクを解決することを固定する
 - E2E テストは実際の Chrome/Chromium が必要（`#[ignore]` 付き）。GitHub Raw の実取得、ローカル `file://` ページでの相対 URL 解決、`<base href>` による基準URL解決、複数セレクタの `---` 結合、3 段ネストしたリスト内の相対 URL 解決とフェンスコード内リンクの非変換、`--ignore-date` の日時差分のみの書き込み抑止と日時以外の差分の上書き、ページスクリプトが Performance API を偽装しても実 HTTP 404 を拒否することを確認する。一時ディレクトリは時刻・プロセス ID・プロセス内連番で一意化し、並列実行時の衝突を防ぐ
 - 静的な `file://` ページで旧 CDP アイドルタイムアウトを超える `--wait` を指定し、待機後も HTML を抽出できることを E2E で確認する
+- front matter のユニットテストでは、`--meta` の解析 (正常・空の値・`=` なし・空のキー・不正なキー・重複・組み込みのキー・YAML で真偽値や null と読まれる語、`--meta` だけで front matter が有効になること)、`yaml_string` のエスケープ (`"`・`\`・改行・復帰・タブ・U+2028・U+2029・そのほかの制御文字・U+FEFF・U+FFFE・U+FFFF と、そのまま残す絵文字とコロン)、項目の順序と final_url・title の省略、selectors の既定 `["body"]` と複数、`---\n\n` で終わることと本文が `---` で始まる場合の分割、yaml-rust2 で読み直した値が元の文字列に戻ること、変更の判定 (retrieved_at だけの差分は書き換えない、title・url・selectors・--meta・本文の差分は書き換える、--ignore-date なら本文の日時だけの差分は書き換えないが front matter は文字列どおりに比べる、既存のファイルに front matter がなければ従来の比較)、標準出力にも front matter が付くこととファイル出力の末尾改行を固定する。E2E では、`file://` のページで `--front-matter --meta` の front matter の中身と、2 回目の実行で retrieved_at だけが違うならファイルを書き換えないこと、`--meta` の値が変わったら書き換えることを確認する
 - 回帰テストでは、空行・ブロッククォート内空行・フェンスコード境界を未閉鎖 `[` が越えないこと、単一改行を含む正規リンクは引き続き解決すること、glob メタ文字を含む出力パスを Git pathspec が展開しないことを確認する。E2E では無効な CSS セレクタが明示的なエラーになることも確認する
 - 改行をまたぐインラインコードの回帰テストでは、閉じバッククォート列の直後にフェンス風テキストが続く場合、4 スペースインデント風テキストが続く場合、閉じ列が物理行頭にある場合の 3 境界を固定する
 - htmd 0.5.5 の統合回帰テストでは、空白を含む画像 URL と title の保持・絶対 URL 化、ヘッダー幅を超えるテーブルセルの保持、内容中の最長バッククォート列より長いコードフェンスの保持を、テーブル圧縮と URL 解決を含む実際の変換パイプラインで固定する
@@ -97,6 +100,11 @@ make install   # /usr/local/bin にインストール (INSTALL_PATH で変更で
 - ファイルステータス判定: 新規→created、内容変更→updated、同一内容→unchanged。git管理下で未ステージ変更がある場合は常にupdated。既存ファイルの読み取りに失敗した場合はupdated。ファイルの存在状態と書き込み前の未ステージ状態は書き込み（`atomic_write`）前に記録し、書き込み後の `path.exists()` や diff 消失に依存しない。git 判定は対象パスに最も近い既存ディレクトリを起点に行い、削除済みの tracked ファイルや repo 外 cwd からの実行でも契約を守る
 - git の対象パスには `:(literal)` pathspec magic を付け、`*`・`?`・`[...]` を含む実ファイル名が別ファイルへ glob 展開される誤判定を防ぐ
 - `--ignore-date`: 日時パターン（`YYYY-MM-DD HH:MM(:SS)?`、スラッシュ区切り、`Z`・小数秒・タイムゾーン付き ISO 8601）を無視してファイル比較し、日時だけの差分なら上書きせず unchanged 扱いにする。双方に日時パターンを含む場合のみ比較し、非 UTF-8 や日時パターンを含まない場合は安全のため通常比較にフォールバックする。git 管理下の未ステージ変更がある場合は `file_status` と同じ契約で updated 扱い
+- `--front-matter`: 出力 (標準出力とファイル) の先頭に YAML の front matter を付ける。書式は `---\n` + 項目ごとの `key: value\n` + `---\n\n` + 本文で、閉じの `---` の後に空行を置くので本文が `---` で始まっても区別できる。項目の順序は固定で、url (引数のまま)・final_url (`tab.get_url()` が url と違うときだけ。WHATWG の URL の正規化だけの違いは同じとみなす)・title (`document.title` の前後の空白を削ったもの。取れない・空なら出さない)・selectors (`prepare_selectors` の結果。既定の body も `["body"]`。ダブルクォートの文字列のフロー形式)・retrieved_at (HTML を取り出した直後の時刻。UTC の RFC 3339 で秒の精度、秒未満は切り捨て)・`--meta` の項目 (指定した順)。get-md の版は入れない (版を上げるたびに保存したすべてのファイルが updated になるため)
+- front matter の値はすべてダブルクォートの文字列にし、エスケープは `yaml_string` に集める。`"` → `\"`、`\` → `\\`、改行・復帰・タブは `\n`・`\r`・`\t`、そのほかの制御文字 (`char::is_control`) と U+2028・U+2029 (YAML 1.1 のパーサが改行とみなす)・U+FFFE・U+FFFF (YAML の印字可能な文字でなく libyaml が拒否する)・U+FEFF (文書の途中に置けない) は `\uXXXX`。値は必ず 1 行に収まるので、front matter の中に `---` だけの行は現れない
+- `--meta KEY=VALUE` (繰り返し可、短縮形なし): 1 つでも指定すると `--front-matter` を有効にする (clap の `default_value_if` で `cli.front_matter` 自体を true にする)。最初の `=` で分け、値は空でもよい。キーは `^[A-Za-z_][A-Za-z0-9_-]*$`。`=` がない・キーが空・書式違い・組み込みのキー (`BUILTIN_FRONT_MATTER_KEYS`) との衝突・YAML で真偽値や null と読まれる語 (`true`・`false`・`null`・`yes`・`no`・`on`・`off`・`y`・`n`。大文字小文字を問わない)・同じキーの重複はエラー。検証 (`parse_meta_entries`) はブラウザを起動する前に行い、日本語のメッセージで anyhow の bail にする
+- front matter 付きの変更の判定 (`keeps_existing_output`): 既存のファイルにも front matter があれば、retrieved_at の値を除いた front matter を文字列どおりに、本文を完全一致で比べ、同じなら書き換えずに unchanged (未ステージ変更があれば updated) にする。retrieved_at は `--ignore-date` の有無によらず常に比較から外す。`--ignore-date` も付けたときは本文にだけ `is_date_only_change` を当て、front matter (title・url・selectors・--meta) の変化は見逃さない。既存のファイルに front matter がない (初回、形式違い、UTF-8 でない) なら従来の比較。`--front-matter` がないときの動作は変えない
+- 既存のファイルの front matter にしかない項目は引き継がない (出力は引数だけで決まる)。残したい値は毎回 `--meta` で渡す。retrieved_at は「ファイルに保存している本文を取得した時刻」で、内容が変わらず書き換えなかったときは古い値が残る
 - `idle_browser_timeout` は `timeout + 30s` のバッファを saturating 加算で設定する
 - バージョニングは CalVer (YY.M.counter) 形式
 - リリースワークフローは版を JST の YY.M.counter で決め、同じタグが既にあれば止める。Cargo.lock は `cargo update --workspace` で自パッケージの版だけを合わせ、失敗した場合はコミット・タグ作成前で停止する。Homebrew の formula の sha256 は、Release に添付した `SHA256SUMS` から読む

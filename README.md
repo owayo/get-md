@@ -41,6 +41,7 @@ Convert the whole page, or pick the parts you need with CSS selectors. Relative 
 - **Certificate checks by default**: Validates HTTPS certificates; `--ignore-certificate-errors` is an explicit opt-out for trusted debugging
 - **Safe file output**: Writes through a temporary file and an atomic rename, keeps existing permissions and symlinks, and reports whether the file was created, updated, or unchanged
 - **Timestamp-only change detection**: With `--ignore-date`, leaves the file as it is when only dates and times changed
+- **Source front matter**: With `--front-matter`, prepends YAML front matter that records the source URL, the page title, the selectors, and the retrieval time; `--meta KEY=VALUE` adds your own fields. The retrieval time is left out when comparing with an existing file, so re-fetching an unchanged page does not rewrite it
 - **Progress display**: Shows each step while fetching and converting; `-q` turns it off. Standard output is flushed before success is reported
 
 How links, code blocks, and tables are handled in detail: [docs/markdown-conversion.md](docs/markdown-conversion.md)
@@ -103,6 +104,9 @@ get-md https://example.com
 
 # Convert only the h1 and p elements and save them to a file
 get-md https://example.com -s "h1" -s "p" -o example.md
+
+# Save the page with YAML front matter that records its source and your own fields
+get-md https://example.com -o example.md --front-matter --meta topic=example
 ```
 
 The first command prints:
@@ -115,7 +119,21 @@ This domain is for use in documentation examples without needing permission. Avo
 [Learn more](https://iana.org/domains/example)
 ```
 
-Every option, more examples, and how selectors and file output behave: [docs/usage.md](docs/usage.md). `get-md --help` prints the option list in your terminal.
+With `--front-matter`, the output starts with the source information:
+
+```markdown
+---
+url: "https://example.com"
+title: "Example Domain"
+selectors: ["body"]
+retrieved_at: "2026-09-29T03:10:00Z"
+topic: "example"
+---
+
+# Example Domain
+```
+
+Every option, more examples, how selectors and file output behave, and the front matter rules: [docs/usage.md](docs/usage.md). `get-md --help` prints the option list in your terminal.
 
 ## Development
 

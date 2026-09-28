@@ -2,6 +2,7 @@ mod progress;
 
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -11,9 +12,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use clap::builder::ArgPredicate;
 use headless_chrome::protocol::cdp::{Network, Page};
 use headless_chrome::{Browser, LaunchOptions, Tab};
 use regex::Regex;
+use time::format_description::well_known::Rfc3339;
+use time::{OffsetDateTime, UtcOffset};
 use url::Url;
 
 use crate::progress::Progress;
@@ -68,6 +72,18 @@ struct Cli {
     /// 日時だけが変わった場合は上書きせず unchanged 扱いにする。
     #[arg(long)]
     ignore_date: bool,
+
+    /// 出力の先頭に、取得元の情報を YAML の front matter として付ける。
+    /// 項目は url・final_url・title・selectors・retrieved_at（取得した時刻、UTC）と --meta の項目。
+    /// 既存のファイルとは retrieved_at を除いて比べ、取得した時刻だけの違いでは書き換えない。
+    /// 既存のファイルの front matter にしかない項目は引き継がないので、残したい値は毎回 --meta で渡す。
+    #[arg(long, default_value_if("meta", ArgPredicate::IsPresent, "true"))]
+    front_matter: bool,
+
+    /// front matter に足す項目（複数指定可）。指定すると --front-matter も有効になる。
+    /// 最初の = で分け、値は空でもよい。キーは英字か _ で始め、英数字・_・- だけで書く。
+    #[arg(long, value_name = "KEY=VALUE")]
+    meta: Vec<String>,
 }
 
 type MainResponseStatus = Arc<Mutex<Option<u32>>>;
@@ -86,6 +102,8 @@ struct OutputWriteState {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // --meta の誤りは、ブラウザを起動する前に知らせる
+    let meta = parse_meta_entries(&cli.meta)?;
     let mut progress = Progress::new(!cli.quiet);
     let selectors = prepare_selectors(&cli.selector);
 
@@ -98,8 +116,15 @@ fn main() -> Result<()> {
     validate_http_status(&main_response_status, &cli.url)?;
 
     let html_fragments = extract_html_fragments(&tab, &selectors, &mut progress)?;
+    // 取得した時刻は、本文の HTML を取り出した直後に記録する
+    let front_matter = if cli.front_matter {
+        let metadata = read_source_metadata(&tab, &cli.url, &selectors, meta)?;
+        Some(render_front_matter(&metadata))
+    } else {
+        None
+    };
     let markdown = convert_html_fragments(&tab, &html_fragments, &cli.url, &mut progress)?;
-    let output_text = finalize_output_text(markdown, cli.output.is_some());
+    let output_text = build_output_text(markdown, front_matter.as_deref(), cli.output.is_some());
     let output_state = capture_output_write_state(cli.output.as_deref());
     write_or_print_output(&cli, &output_text, output_state, &progress)?;
 
@@ -300,6 +325,18 @@ fn convert_html_fragments_to_markdown(html_fragments: &[String]) -> Result<Strin
     Ok(compact_markdown(&md_parts.join("\n\n---\n\n")))
 }
 
+/// 出力する内容を組み立てる。
+///
+/// front matter を付けるときは本文の前に置く。標準出力にもファイルにも同じ内容を出し、
+/// ファイルへ出すときだけ末尾の改行を保証する (`finalize_output_text`)。
+fn build_output_text(markdown: String, front_matter: Option<&str>, file_output: bool) -> String {
+    let text = match front_matter {
+        Some(header) => format!("{header}{markdown}"),
+        None => markdown,
+    };
+    finalize_output_text(text, file_output)
+}
+
 fn finalize_output_text(markdown: String, file_output: bool) -> String {
     // 出力内容を確定する（末尾改行を保証）
     if file_output && !markdown.ends_with('\n') {
@@ -329,23 +366,16 @@ fn write_or_print_output(
     output_state: OutputWriteState,
     progress: &Progress,
 ) -> Result<()> {
-    // --ignore-date: 日時だけの差分なら書き込みをスキップ
-    let date_only_change = cli.ignore_date
-        && cli.output.is_some()
-        && output_state
-            .old_content
-            .as_ref()
-            .is_some_and(|old| is_date_only_change(old, output_text.as_bytes()));
+    // 既存のファイルと実質的に同じなら書き込みをスキップする
+    // (--ignore-date の日時だけの差分と、--front-matter の retrieved_at だけの差分)
+    let keep_existing = cli.output.is_some()
+        && output_state.old_content.as_ref().is_some_and(|old| {
+            keeps_existing_output(old, output_text, cli.front_matter, cli.ignore_date)
+        });
 
-    if date_only_change {
+    if keep_existing {
         let path = cli.output.as_ref().unwrap();
-        // 未ステージ変更があれば updated 扱い（file_status と同じ契約）
-        let (icon, status) =
-            if output_state.had_unstaged_changes_before || has_unstaged_changes(path) {
-                ("📝", "updated")
-            } else {
-                ("✔", "unchanged")
-            };
+        let (icon, status) = kept_file_status(path, output_state.had_unstaged_changes_before);
         progress.complete(
             icon,
             &format!("{} → {} ({})", cli.url, path.display(), status),
@@ -409,6 +439,296 @@ fn document_base_url(tab: &Tab) -> Option<String> {
         .and_then(|result| result.value)
         .and_then(|value| value.as_str().map(str::to_owned))
         .filter(|base| Url::parse(base).is_ok())
+}
+
+/// 取得した時刻の項目の名前。既存のファイルと比べるときは、この項目の値を比べない。
+const RETRIEVED_AT_KEY: &str = "retrieved_at";
+
+/// front matter の組み込みの項目の名前 (書く順)。`--meta` のキーには使えない。
+const BUILTIN_FRONT_MATTER_KEYS: [&str; 5] =
+    ["url", "final_url", "title", "selectors", RETRIEVED_AT_KEY];
+
+/// YAML で文字列ではなく真偽値や null と読まれる語 (大文字小文字を問わない)。
+///
+/// YAML 1.2 の core schema の `true`・`false`・`null` に、YAML 1.1 のパーサが真偽値と読む
+/// `yes`・`no`・`on`・`off`・`y`・`n` を足す。キーにすると、読む側で文字列のキーにならない。
+const YAML_NON_STRING_WORDS: [&str; 9] =
+    ["true", "false", "null", "yes", "no", "on", "off", "y", "n"];
+
+/// `--meta` で足す front matter の項目。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetaEntry {
+    key: String,
+    value: String,
+}
+
+/// front matter に書く、取得元の情報。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceMetadata {
+    /// 引数の URL (そのまま)
+    url: String,
+    /// 読み込み後のページの URL。`url` と同じなら None
+    final_url: Option<String>,
+    /// `document.title` の前後の空白を削ったもの。取れない・空なら None
+    title: Option<String>,
+    /// 実際に使ったセレクタ (既定の body を含む)
+    selectors: Vec<String>,
+    /// 取得した時刻 (UTC の RFC 3339、秒の精度)
+    retrieved_at: String,
+    /// `--meta` の項目 (指定した順)
+    meta: Vec<MetaEntry>,
+}
+
+/// `--meta KEY=VALUE` の並びを解析して検証する。
+///
+/// 最初の `=` で分け、値は空でもよい。キーは英字か `_` で始め、英数字・`_`・`-` だけで書く。
+/// `=` がない・キーが空・キーの書式の誤り・組み込みの項目との衝突・YAML で文字列と
+/// 読まれない語・同じキーの重複はエラーにする。ブラウザを起動する前に呼ぶ。
+fn parse_meta_entries(args: &[String]) -> Result<Vec<MetaEntry>> {
+    let mut entries: Vec<MetaEntry> = Vec::with_capacity(args.len());
+    for arg in args {
+        let Some((key, value)) = arg.split_once('=') else {
+            bail!("--meta {arg:?} に = がありません。KEY=VALUE の形で指定してください");
+        };
+        if key.is_empty() {
+            bail!("--meta {arg:?} のキーが空です。KEY=VALUE の形で指定してください");
+        }
+        if !is_valid_meta_key(key) {
+            bail!(
+                "--meta のキー {key:?} は使えません。キーは英字か _ で始め、英数字・_・- だけで書いてください"
+            );
+        }
+        if BUILTIN_FRONT_MATTER_KEYS.contains(&key) {
+            bail!(
+                "--meta のキー {key:?} は組み込みの項目 ({}) と重なるため使えません",
+                BUILTIN_FRONT_MATTER_KEYS.join("・")
+            );
+        }
+        if YAML_NON_STRING_WORDS
+            .iter()
+            .any(|word| word.eq_ignore_ascii_case(key))
+        {
+            bail!(
+                "--meta のキー {key:?} は YAML で文字列ではなく真偽値や null と読まれるため使えません"
+            );
+        }
+        if entries.iter().any(|entry| entry.key == key) {
+            bail!("--meta のキー {key:?} が 2 回以上指定されています");
+        }
+        entries.push(MetaEntry {
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+/// `--meta` のキーの書式 (`^[A-Za-z_][A-Za-z0-9_-]*$`) を満たすかを判定する。
+fn is_valid_meta_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+/// front matter に書く取得元の情報を、読み込んだページから集める。
+///
+/// 取得した時刻はこの関数を呼んだ時点で記録する。
+fn read_source_metadata(
+    tab: &Tab,
+    url: &str,
+    selectors: &[String],
+    meta: Vec<MetaEntry>,
+) -> Result<SourceMetadata> {
+    let retrieved_at = format_retrieved_at(OffsetDateTime::now_utc())?;
+    Ok(SourceMetadata {
+        url: url.to_string(),
+        final_url: distinct_final_url(url, &tab.get_url()),
+        title: document_title(tab),
+        selectors: selectors.to_vec(),
+        retrieved_at,
+        meta,
+    })
+}
+
+/// 取得した時刻を、UTC の RFC 3339 (秒の精度) で書く。例: `2026-09-29T03:10:00Z`
+///
+/// 秒未満は四捨五入せずに切り捨てる。
+fn format_retrieved_at(time: OffsetDateTime) -> Result<String> {
+    time.to_offset(UtcOffset::UTC)
+        .truncate_to_second()
+        .format(&Rfc3339)
+        .context("Failed to format the retrieval time")
+}
+
+/// 読み込み後の URL が、引数の URL と違うときだけ返す。
+///
+/// 引数の `https://example.com` がブラウザでは `https://example.com/` になるような、
+/// URL の標準 (WHATWG) の正規化だけの違いは同じとみなす。リダイレクトや
+/// `history.pushState` で URL が変わったときに返す。
+fn distinct_final_url(requested: &str, loaded: &str) -> Option<String> {
+    if loaded.is_empty() || loaded == requested {
+        return None;
+    }
+    if let (Ok(requested_url), Ok(loaded_url)) = (Url::parse(requested), Url::parse(loaded))
+        && requested_url == loaded_url
+    {
+        return None;
+    }
+    Some(loaded.to_string())
+}
+
+/// ページの `document.title` を読む。取れない・空なら None。
+fn document_title(tab: &Tab) -> Option<String> {
+    tab.evaluate("document.title", false)
+        .ok()
+        .and_then(|result| result.value)
+        .and_then(|value| value.as_str().and_then(normalize_title))
+}
+
+/// タイトルの前後の空白を削る。空になれば None。
+fn normalize_title(title: &str) -> Option<String> {
+    let trimmed = title.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// 取得元の情報を YAML の front matter にする。
+///
+/// `---` の行で挟み、閉じの `---` の後に空行を 1 つ置く。本文が `---` で始まっても、
+/// 閉じの `---` の直後が空行なので区別できる。項目の順序は固定で、値はすべて
+/// ダブルクォートの文字列 (selectors は文字列のフロー形式の列) にする。
+fn render_front_matter(metadata: &SourceMetadata) -> String {
+    let mut out = String::from("---\n");
+    push_front_matter_item(&mut out, "url", &yaml_string(&metadata.url));
+    if let Some(final_url) = &metadata.final_url {
+        push_front_matter_item(&mut out, "final_url", &yaml_string(final_url));
+    }
+    if let Some(title) = &metadata.title {
+        push_front_matter_item(&mut out, "title", &yaml_string(title));
+    }
+    let selectors = metadata
+        .selectors
+        .iter()
+        .map(|selector| yaml_string(selector))
+        .collect::<Vec<_>>()
+        .join(", ");
+    push_front_matter_item(&mut out, "selectors", &format!("[{selectors}]"));
+    push_front_matter_item(
+        &mut out,
+        RETRIEVED_AT_KEY,
+        &yaml_string(&metadata.retrieved_at),
+    );
+    for entry in &metadata.meta {
+        push_front_matter_item(&mut out, &entry.key, &yaml_string(&entry.value));
+    }
+    out.push_str("---\n\n");
+    out
+}
+
+fn push_front_matter_item(out: &mut String, key: &str, value: &str) {
+    out.push_str(key);
+    out.push_str(": ");
+    out.push_str(value);
+    out.push('\n');
+}
+
+/// 文字列を YAML のダブルクォートの文字列として書く。
+///
+/// `"` と `\` をエスケープし、改行・復帰・タブは短縮形 (`\n`・`\r`・`\t`)、そのほかの制御文字
+/// (`char::is_control`。C0・DEL・C1) は `\uXXXX` にする。YAML 1.1 のパーサが改行とみなす
+/// U+2028・U+2029 と、YAML の印字可能な文字に含まれない U+FFFE・U+FFFF、文書の途中に
+/// 置けない U+FEFF (BOM) も `\uXXXX` にする。どんな値も 1 行に収まり、YAML のパーサで
+/// 元の文字列に戻る。
+fn yaml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' | '\u{2029}' | '\u{FEFF}' | '\u{FFFE}' | '\u{FFFF}' => {
+                push_unicode_escape(&mut out, ch);
+            }
+            ch if ch.is_control() => push_unicode_escape(&mut out, ch),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// 基本多言語面の文字を `\uXXXX` (16 進数 4 桁、大文字) で書く。
+fn push_unicode_escape(out: &mut String, ch: char) {
+    // String への書き込みは失敗しない
+    let _ = write!(out, "\\u{:04X}", u32::from(ch));
+}
+
+/// front matter 付きの内容を、front matter (開きと閉じの `---` の間の行) と、
+/// 閉じの `---` の行より後ろ (区切りの空行と本文) に分ける。
+///
+/// 先頭が `---\n` でない、または閉じの `---` の行がなければ None。get-md が書く値は
+/// すべてクォートした 1 行なので、front matter の中に `---` だけの行は現れない。
+fn split_front_matter(content: &str) -> Option<(&str, &str)> {
+    let rest = content.strip_prefix("---\n")?;
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if line == "---\n" {
+            return Some((&rest[..offset], &rest[offset + line.len()..]));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// 既存のファイルを書き換えずに残すか (内容が実質的に同じか) を判定する。
+///
+/// `front_matter` のとき、既存のファイルにも front matter があれば、retrieved_at の値を除いた
+/// front matter と本文で比べる (`front_matter_output_matches`)。そうでなければ従来どおり、
+/// `ignore_date` のときだけ日時だけの差分を同じとみなす。
+fn keeps_existing_output(old: &[u8], new: &str, front_matter: bool, ignore_date: bool) -> bool {
+    if front_matter && let Some(matches) = front_matter_output_matches(old, new, ignore_date) {
+        return matches;
+    }
+    ignore_date && is_date_only_change(old, new.as_bytes())
+}
+
+/// front matter 付きの新しい出力を、既存のファイルと比べる。
+///
+/// front matter は retrieved_at の値だけを除いて文字列どおりに比べる (title・url・selectors・
+/// --meta の変化は見逃さない)。本文は `ignore_date` なら日時だけの差分を同じとみなし
+/// (`is_date_only_change`)、そうでなければ完全に一致したときだけ同じとみなす。
+/// 既存のファイルが UTF-8 でないか front matter がなければ None を返す (従来の比較に戻す)。
+fn front_matter_output_matches(old: &[u8], new: &str, ignore_date: bool) -> Option<bool> {
+    let old = std::str::from_utf8(old).ok()?;
+    let (old_header, old_body) = split_front_matter(old)?;
+    let (new_header, new_body) = split_front_matter(new)?;
+
+    let headers_match = old_header
+        .split_inclusive('\n')
+        .map(mask_retrieved_at)
+        .eq(new_header.split_inclusive('\n').map(mask_retrieved_at));
+    if !headers_match {
+        return Some(false);
+    }
+
+    Some(
+        old_body == new_body
+            || (ignore_date && is_date_only_change(old_body.as_bytes(), new_body.as_bytes())),
+    )
+}
+
+/// front matter の 1 行が retrieved_at の項目なら、値を除いた項目名だけにする。
+///
+/// 行の位置と数は比べたまま、取得した時刻の違いだけを比較から外す。
+fn mask_retrieved_at(line: &str) -> &str {
+    match line.strip_prefix(RETRIEVED_AT_KEY) {
+        Some(rest) if rest.starts_with(':') => RETRIEVED_AT_KEY,
+        _ => line,
+    }
 }
 
 /// 出力内容を一時ファイル経由でアトミックに書き込む。
@@ -645,6 +965,18 @@ fn file_status<'a>(
         None => ("✨", "created"),
         Some(old) if old != new => ("📝", "updated"),
         Some(_) => ("✔", "unchanged"),
+    }
+}
+
+/// 書き換えずに残したファイルのステータスを判定する。
+///
+/// 内容は実質的に同じなので unchanged。ただし git 管理下で未ステージの変更があれば、
+/// `file_status` と同じ契約で updated 扱いにする。
+fn kept_file_status<'a>(path: &Path, had_unstaged_changes_before: bool) -> (&'a str, &'a str) {
+    if had_unstaged_changes_before || has_unstaged_changes(path) {
+        ("📝", "updated")
+    } else {
+        ("✔", "unchanged")
     }
 }
 
@@ -1878,6 +2210,7 @@ fn find_link_close_paren(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     /// テスト用の `find_next_link_candidate` ラッパー。
     /// テストでは引き継ぎ状態を 0 で固定し、位置のみを返す。
@@ -1946,6 +2279,16 @@ mod tests {
             ignore_certificate_errors: false,
             quiet: true,
             ignore_date,
+            front_matter: false,
+            meta: Vec::new(),
+        }
+    }
+
+    /// front matter を付けるファイル出力の CLI 設定。
+    fn cli_with_front_matter_output(output: PathBuf, ignore_date: bool) -> Cli {
+        Cli {
+            front_matter: true,
+            ..cli_with_output(output, ignore_date)
         }
     }
 
@@ -2248,6 +2591,836 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- front matter のテスト ---
+
+    /// 項目の順序と省略を確かめやすい、テスト用の取得元の情報。
+    fn sample_metadata() -> SourceMetadata {
+        SourceMetadata {
+            url: "https://example.com/docs".to_string(),
+            final_url: Some("https://example.com/docs/intro".to_string()),
+            title: Some("Example Docs".to_string()),
+            selectors: vec!["article".to_string(), "main".to_string()],
+            retrieved_at: "2026-09-29T03:10:00Z".to_string(),
+            meta: vec![meta_entry("source", "manual"), meta_entry("note", "")],
+        }
+    }
+
+    /// `sample_metadata` より後に取得した時刻。
+    const LATER_RETRIEVED_AT: &str = "2026-10-01T12:34:56Z";
+
+    /// `sample_metadata` を後で取り直したときの情報 (取得した時刻だけが違う)。
+    fn refetched_metadata() -> SourceMetadata {
+        SourceMetadata {
+            retrieved_at: LATER_RETRIEVED_AT.to_string(),
+            ..sample_metadata()
+        }
+    }
+
+    fn meta_entry(key: &str, value: &str) -> MetaEntry {
+        MetaEntry {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    fn meta_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    /// front matter 付きのファイル出力の内容を組み立てる。
+    fn front_matter_document(metadata: &SourceMetadata, body: &str) -> String {
+        build_output_text(body.to_string(), Some(&render_front_matter(metadata)), true)
+    }
+
+    /// 既存のファイル (front matter 付き) を書き換えずに残すかを判定する。
+    fn keeps_front_matter_file(
+        old: (&SourceMetadata, &str),
+        new: (&SourceMetadata, &str),
+        ignore_date: bool,
+    ) -> bool {
+        let old = front_matter_document(old.0, old.1);
+        let new = front_matter_document(new.0, new.1);
+        keeps_existing_output(old.as_bytes(), &new, true, ignore_date)
+    }
+
+    #[test]
+    fn cli_front_matter_flag_enables_front_matter() {
+        let cli = Cli::try_parse_from(["get-md", "https://example.com", "--front-matter"]).unwrap();
+        assert!(cli.front_matter);
+        assert!(cli.meta.is_empty());
+    }
+
+    #[test]
+    fn cli_meta_alone_enables_front_matter() {
+        let cli = Cli::try_parse_from([
+            "get-md",
+            "https://example.com",
+            "--meta",
+            "source=manual",
+            "--meta",
+            "note=",
+        ])
+        .unwrap();
+        assert!(
+            cli.front_matter,
+            "--meta だけで front matter が有効になること"
+        );
+        assert_eq!(cli.meta, vec!["source=manual", "note="]);
+    }
+
+    #[test]
+    fn cli_help_lists_front_matter_options() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--front-matter"), "{help}");
+        assert!(help.contains("--meta <KEY=VALUE>"), "{help}");
+    }
+
+    #[test]
+    fn parse_meta_entries_splits_on_first_equals_and_keeps_order() {
+        let entries = parse_meta_entries(&meta_args(&[
+            "source=manual",
+            "query=a=b",
+            "_id=42",
+            "Topic-2=x y",
+        ]))
+        .unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                meta_entry("source", "manual"),
+                meta_entry("query", "a=b"),
+                meta_entry("_id", "42"),
+                meta_entry("Topic-2", "x y"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_meta_entries_accepts_empty_value() {
+        let entries = parse_meta_entries(&meta_args(&["note="])).unwrap();
+        assert_eq!(entries, vec![meta_entry("note", "")]);
+    }
+
+    #[test]
+    fn parse_meta_entries_accepts_no_entries() {
+        assert!(parse_meta_entries(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_meta_entries_rejects_missing_equals() {
+        let err = parse_meta_entries(&meta_args(&["source"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"source\""), "{err}");
+        assert!(err.contains("KEY=VALUE"), "{err}");
+    }
+
+    #[test]
+    fn parse_meta_entries_rejects_empty_key() {
+        let err = parse_meta_entries(&meta_args(&["=value"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("キーが空"), "{err}");
+    }
+
+    #[test]
+    fn parse_meta_entries_rejects_invalid_keys() {
+        for arg in [
+            "1st=x", "-key=x", "a.b=x", "a b=x", "a:b=x", "キー=x", "a/b=x",
+        ] {
+            let err = parse_meta_entries(&meta_args(&[arg]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("英字か _ で始め"), "{arg}: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_meta_entries_rejects_duplicate_keys() {
+        let err = parse_meta_entries(&meta_args(&["source=a", "note=x", "source=b"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"source\""), "{err}");
+        assert!(err.contains("2 回以上"), "{err}");
+    }
+
+    #[test]
+    fn parse_meta_entries_rejects_builtin_keys() {
+        for key in BUILTIN_FRONT_MATTER_KEYS {
+            let err = parse_meta_entries(&[format!("{key}=x")])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("組み込みの項目"), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_meta_entries_rejects_yaml_boolean_and_null_words() {
+        for key in ["true", "False", "NULL", "yes", "No", "on", "OFF", "y", "N"] {
+            let err = parse_meta_entries(&[format!("{key}=x")])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("真偽値や null"), "{key}: {err}");
+        }
+        // 語を一部に含むだけのキーは文字列として読まれるので使える
+        assert!(parse_meta_entries(&meta_args(&["yes_no=x", "null-ish=x", "online=x"])).is_ok());
+    }
+
+    #[test]
+    fn is_valid_meta_key_follows_documented_pattern() {
+        for key in ["a", "Z", "_", "_a", "source", "source-id", "A_b-9", "x--"] {
+            assert!(is_valid_meta_key(key), "{key:?} は使えるキー");
+        }
+        for key in ["", "9a", "-a", "a.b", "a b", "a:b", "é", "キー", "a\n"] {
+            assert!(!is_valid_meta_key(key), "{key:?} は使えないキー");
+        }
+    }
+
+    #[test]
+    fn yaml_string_quotes_plain_text() {
+        assert_eq!(yaml_string("Example"), r#""Example""#);
+        assert_eq!(yaml_string(""), r#""""#);
+    }
+
+    #[test]
+    fn yaml_string_escapes_double_quote_and_backslash() {
+        assert_eq!(yaml_string(r#"say "hi" \o/"#), r#""say \"hi\" \\o/""#);
+    }
+
+    #[test]
+    fn yaml_string_uses_short_escapes_for_newline_carriage_return_and_tab() {
+        assert_eq!(yaml_string("a\nb\rc\td"), r#""a\nb\rc\td""#);
+    }
+
+    #[test]
+    fn yaml_string_escapes_line_and_paragraph_separators() {
+        assert_eq!(yaml_string("a\u{2028}b\u{2029}c"), r#""a\u2028b\u2029c""#);
+    }
+
+    #[test]
+    fn yaml_string_escapes_other_control_characters() {
+        // C0 (NUL・ESC)・DEL・C1 (NEL を含む)
+        assert_eq!(
+            yaml_string("\u{0}\u{1b}\u{7f}\u{85}\u{9f}"),
+            r#""\u0000\u001B\u007F\u0085\u009F""#
+        );
+    }
+
+    #[test]
+    fn yaml_string_escapes_characters_yaml_does_not_allow_unescaped() {
+        // U+FFFE・U+FFFF は YAML の印字可能な文字でなく、U+FEFF (BOM) は文書の途中に置けない
+        assert_eq!(
+            yaml_string("\u{feff}\u{fffe}\u{ffff}"),
+            r#""\uFEFF\uFFFE\uFFFF""#
+        );
+    }
+
+    #[test]
+    fn yaml_string_keeps_emoji_colon_and_other_text() {
+        let value = "注意: 😀 #tag - [x] {y} 'z' --- & * ! | > % @ `";
+        assert_eq!(yaml_string(value), format!("\"{value}\""));
+    }
+
+    #[test]
+    fn render_front_matter_writes_items_in_fixed_order() {
+        assert_eq!(
+            render_front_matter(&sample_metadata()),
+            concat!(
+                "---\n",
+                "url: \"https://example.com/docs\"\n",
+                "final_url: \"https://example.com/docs/intro\"\n",
+                "title: \"Example Docs\"\n",
+                "selectors: [\"article\", \"main\"]\n",
+                "retrieved_at: \"2026-09-29T03:10:00Z\"\n",
+                "source: \"manual\"\n",
+                "note: \"\"\n",
+                "---\n",
+                "\n",
+            )
+        );
+    }
+
+    #[test]
+    fn render_front_matter_omits_missing_final_url_and_title() {
+        let metadata = SourceMetadata {
+            final_url: None,
+            title: None,
+            meta: Vec::new(),
+            ..sample_metadata()
+        };
+        assert_eq!(
+            render_front_matter(&metadata),
+            concat!(
+                "---\n",
+                "url: \"https://example.com/docs\"\n",
+                "selectors: [\"article\", \"main\"]\n",
+                "retrieved_at: \"2026-09-29T03:10:00Z\"\n",
+                "---\n",
+                "\n",
+            )
+        );
+    }
+
+    #[test]
+    fn render_front_matter_lists_default_body_selector() {
+        let metadata = SourceMetadata {
+            selectors: prepare_selectors(&[]),
+            ..sample_metadata()
+        };
+        assert!(
+            render_front_matter(&metadata).contains("\nselectors: [\"body\"]\n"),
+            "{}",
+            render_front_matter(&metadata)
+        );
+    }
+
+    #[test]
+    fn render_front_matter_escapes_selectors_and_values() {
+        let metadata = SourceMetadata {
+            title: Some("A \"quoted\"\ntitle".to_string()),
+            selectors: vec![r#"a[href="x"]"#.to_string(), "div\\:hover".to_string()],
+            meta: vec![meta_entry("note", "line1\nline2")],
+            ..sample_metadata()
+        };
+        let rendered = render_front_matter(&metadata);
+        assert!(
+            rendered.contains("\ntitle: \"A \\\"quoted\\\"\\ntitle\"\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("\nselectors: [\"a[href=\\\"x\\\"]\", \"div\\\\:hover\"]\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("\nnote: \"line1\\nline2\"\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_front_matter_ends_with_closing_line_and_blank_line() {
+        let rendered = render_front_matter(&sample_metadata());
+        assert!(rendered.ends_with("\n---\n\n"), "{rendered}");
+        assert_eq!(
+            front_matter_document(&sample_metadata(), "Body"),
+            format!("{rendered}Body\n")
+        );
+    }
+
+    #[test]
+    fn front_matter_is_separable_when_body_starts_with_thematic_break() {
+        let body = "---\n\nAfter a rule\n\n---\n\nMore\n";
+        let document = front_matter_document(&sample_metadata(), body);
+        let (header, rest) = split_front_matter(&document).expect("front matter is found");
+
+        assert_eq!(
+            format!("---\n{header}---\n\n"),
+            render_front_matter(&sample_metadata())
+        );
+        // 閉じの `---` の後の空行を挟んで、本文の `---` がそのまま続く
+        assert_eq!(rest, format!("\n{body}"));
+    }
+
+    #[test]
+    fn split_front_matter_requires_opening_and_closing_lines() {
+        assert_eq!(
+            split_front_matter("---\nurl: \"x\"\n---\n\nBody"),
+            Some(("url: \"x\"\n", "\nBody"))
+        );
+        // 先頭が区切りでない・閉じの行がない・CRLF の区切りは front matter とみなさない
+        assert_eq!(split_front_matter("# Title\n\n---\n"), None);
+        assert_eq!(split_front_matter("---\nurl: \"x\"\n"), None);
+        assert_eq!(split_front_matter("---\nurl: \"x\"\n---"), None);
+        assert_eq!(
+            split_front_matter("---\r\nurl: \"x\"\r\n---\r\n\r\nBody"),
+            None
+        );
+    }
+
+    #[test]
+    fn front_matter_round_trips_through_yaml_parser() {
+        use yaml_rust2::YamlLoader;
+
+        let values = [
+            "",
+            "plain text",
+            "quote \" backslash \\ and a literal \\n",
+            "line\nbreak\r\nand\ttab",
+            "separators \u{2028} \u{2029}",
+            "controls \u{0}\u{7}\u{1b}\u{7f}\u{85}\u{9f}",
+            "bom \u{feff} and noncharacters \u{fffe}\u{ffff}",
+            "emoji 😀 and colon: value # not a comment",
+            "  leading and trailing spaces  ",
+            "---",
+            "- not a list",
+            "{not: a map}",
+            "[not, a, list]",
+            "'single quoted'",
+            "&anchor *alias !tag %directive @reserved `backtick`",
+            "true",
+            "null",
+            "~",
+            "123",
+            "1e3",
+            "0x1F",
+            "2026-09-29",
+            "日本語のタイトル｜サイト名",
+        ];
+        let metadata = SourceMetadata {
+            url: "https://example.com/a?b=c&d=\"e\"#f".to_string(),
+            final_url: Some("https://example.com/b?x=1#frag".to_string()),
+            title: Some(values.join(" / ")),
+            selectors: values.iter().map(|value| value.to_string()).collect(),
+            retrieved_at: "2026-09-29T03:10:00Z".to_string(),
+            meta: values
+                .iter()
+                .enumerate()
+                .map(|(i, value)| meta_entry(&format!("v{i}"), value))
+                .collect(),
+        };
+
+        let rendered = render_front_matter(&metadata);
+        let (header, _) = split_front_matter(&rendered).expect("front matter is found");
+        let docs = YamlLoader::load_from_str(header).expect("front matter is valid YAML");
+        assert_eq!(docs.len(), 1);
+        let doc = &docs[0];
+
+        let keys: Vec<&str> = doc
+            .as_hash()
+            .expect("front matter is a mapping")
+            .keys()
+            .map(|key| key.as_str().expect("keys are strings"))
+            .collect();
+        let mut expected_keys = BUILTIN_FRONT_MATTER_KEYS.to_vec();
+        let meta_keys: Vec<String> = (0..values.len()).map(|i| format!("v{i}")).collect();
+        expected_keys.extend(meta_keys.iter().map(String::as_str));
+        assert_eq!(keys, expected_keys);
+
+        assert_eq!(doc["url"].as_str(), Some(metadata.url.as_str()));
+        assert_eq!(doc["final_url"].as_str(), metadata.final_url.as_deref());
+        assert_eq!(doc["title"].as_str(), metadata.title.as_deref());
+        assert_eq!(
+            doc["retrieved_at"].as_str(),
+            Some(metadata.retrieved_at.as_str())
+        );
+        let selectors: Vec<&str> = doc["selectors"]
+            .as_vec()
+            .expect("selectors is a sequence")
+            .iter()
+            .map(|selector| selector.as_str().expect("selectors are strings"))
+            .collect();
+        assert_eq!(selectors, values);
+        for (key, value) in meta_keys.iter().zip(values) {
+            assert_eq!(doc[key.as_str()].as_str(), Some(value), "{key}");
+        }
+    }
+
+    #[test]
+    fn build_output_text_puts_front_matter_on_stdout_output() {
+        let header = render_front_matter(&sample_metadata());
+        // 標準出力でも本文の前に front matter を付け、末尾の改行は従来どおり足さない
+        assert_eq!(
+            build_output_text("Body".to_string(), Some(&header), false),
+            format!("{header}Body")
+        );
+    }
+
+    #[test]
+    fn build_output_text_adds_trailing_newline_for_file_output_with_front_matter() {
+        let header = render_front_matter(&sample_metadata());
+        assert_eq!(
+            build_output_text("Body".to_string(), Some(&header), true),
+            format!("{header}Body\n")
+        );
+        assert_eq!(
+            build_output_text("Body\n".to_string(), Some(&header), true),
+            format!("{header}Body\n")
+        );
+    }
+
+    #[test]
+    fn build_output_text_without_front_matter_is_unchanged() {
+        assert_eq!(build_output_text("Body".to_string(), None, false), "Body");
+        assert_eq!(build_output_text("Body".to_string(), None, true), "Body\n");
+    }
+
+    #[test]
+    fn format_retrieved_at_truncates_to_seconds_in_utc() {
+        let date = time::Date::from_calendar_date(2026, time::Month::September, 29).unwrap();
+        let utc = date
+            .with_hms_nano(3, 10, 0, 999_999_999)
+            .unwrap()
+            .assume_utc();
+        assert_eq!(format_retrieved_at(utc).unwrap(), "2026-09-29T03:10:00Z");
+
+        // UTC 以外の時刻は UTC に直す
+        let jst = date
+            .with_hms_nano(12, 10, 0, 500_000_000)
+            .unwrap()
+            .assume_offset(UtcOffset::from_hms(9, 0, 0).unwrap());
+        assert_eq!(format_retrieved_at(jst).unwrap(), "2026-09-29T03:10:00Z");
+    }
+
+    #[test]
+    fn format_retrieved_at_writes_current_time_as_rfc3339_seconds() {
+        let formatted = format_retrieved_at(OffsetDateTime::now_utc()).unwrap();
+        let pattern = Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$").unwrap();
+        assert!(pattern.is_match(&formatted), "{formatted}");
+    }
+
+    #[test]
+    fn distinct_final_url_omits_same_url() {
+        assert_eq!(
+            distinct_final_url("https://example.com/a", "https://example.com/a"),
+            None
+        );
+        // URL の標準の正規化だけの違い (末尾の /・スキームとホストの大文字) は同じとみなす
+        assert_eq!(
+            distinct_final_url("https://example.com", "https://example.com/"),
+            None
+        );
+        assert_eq!(
+            distinct_final_url("HTTPS://EXAMPLE.com/a", "https://example.com/a"),
+            None
+        );
+        // 読み込み後の URL が取れなかったときは出さない
+        assert_eq!(distinct_final_url("https://example.com/a", ""), None);
+    }
+
+    #[test]
+    fn distinct_final_url_returns_redirected_url() {
+        assert_eq!(
+            distinct_final_url("http://example.com/a", "https://example.com/a"),
+            Some("https://example.com/a".to_string())
+        );
+        assert_eq!(
+            distinct_final_url("https://example.com/old", "https://example.com/new#top"),
+            Some("https://example.com/new#top".to_string())
+        );
+        // 引数を URL として読めなければ文字列で比べる
+        assert_eq!(
+            distinct_final_url("example.com", "https://example.com/"),
+            Some("https://example.com/".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_title_trims_whitespace() {
+        assert_eq!(
+            normalize_title("  Example Docs \n"),
+            Some("Example Docs".to_string())
+        );
+        assert_eq!(
+            normalize_title("\u{3000}全角の空白\u{3000}"),
+            Some("全角の空白".to_string())
+        );
+        assert_eq!(normalize_title(""), None);
+        assert_eq!(normalize_title(" \t\n\u{3000}"), None);
+    }
+
+    #[test]
+    fn mask_retrieved_at_hides_only_retrieved_at_value() {
+        assert_eq!(
+            mask_retrieved_at("retrieved_at: \"2026-09-29T03:10:00Z\"\n"),
+            "retrieved_at"
+        );
+        assert_eq!(
+            mask_retrieved_at("retrieved_at_note: \"x\"\n"),
+            "retrieved_at_note: \"x\"\n"
+        );
+        assert_eq!(
+            mask_retrieved_at("title: \"retrieved_at: x\"\n"),
+            "title: \"retrieved_at: x\"\n"
+        );
+    }
+
+    #[test]
+    fn front_matter_comparison_ignores_retrieved_at() {
+        for ignore_date in [false, true] {
+            assert!(
+                keeps_front_matter_file(
+                    (&sample_metadata(), "Body"),
+                    (&refetched_metadata(), "Body"),
+                    ignore_date,
+                ),
+                "ignore_date={ignore_date}"
+            );
+        }
+    }
+
+    #[test]
+    fn front_matter_comparison_detects_changed_items() {
+        let changed = [
+            SourceMetadata {
+                title: Some("Renamed".to_string()),
+                ..refetched_metadata()
+            },
+            SourceMetadata {
+                title: None,
+                ..refetched_metadata()
+            },
+            SourceMetadata {
+                url: "https://example.com/other".to_string(),
+                ..refetched_metadata()
+            },
+            SourceMetadata {
+                final_url: None,
+                ..refetched_metadata()
+            },
+            SourceMetadata {
+                selectors: vec!["main".to_string()],
+                ..refetched_metadata()
+            },
+            SourceMetadata {
+                meta: vec![meta_entry("source", "changed"), meta_entry("note", "")],
+                ..refetched_metadata()
+            },
+            SourceMetadata {
+                meta: vec![meta_entry("source", "manual")],
+                ..refetched_metadata()
+            },
+            SourceMetadata {
+                meta: vec![
+                    meta_entry("source", "manual"),
+                    meta_entry("note", ""),
+                    meta_entry("retrieved_at_note", "added"),
+                ],
+                ..refetched_metadata()
+            },
+        ];
+        for new in &changed {
+            for ignore_date in [false, true] {
+                assert!(
+                    !keeps_front_matter_file(
+                        (&sample_metadata(), "Body"),
+                        (new, "Body"),
+                        ignore_date,
+                    ),
+                    "{new:?} ignore_date={ignore_date}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn front_matter_comparison_detects_body_change() {
+        for ignore_date in [false, true] {
+            assert!(
+                !keeps_front_matter_file(
+                    (&sample_metadata(), "Body"),
+                    (&refetched_metadata(), "Changed body"),
+                    ignore_date,
+                ),
+                "ignore_date={ignore_date}"
+            );
+        }
+    }
+
+    #[test]
+    fn front_matter_comparison_with_ignore_date_skips_date_only_body_change() {
+        assert!(keeps_front_matter_file(
+            (&sample_metadata(), "Updated: 2026-04-12 09:00"),
+            (&refetched_metadata(), "Updated: 2026-04-13 10:00"),
+            true,
+        ));
+    }
+
+    #[test]
+    fn front_matter_comparison_without_ignore_date_detects_date_only_body_change() {
+        assert!(!keeps_front_matter_file(
+            (&sample_metadata(), "Updated: 2026-04-12 09:00"),
+            (&refetched_metadata(), "Updated: 2026-04-13 10:00"),
+            false,
+        ));
+    }
+
+    #[test]
+    fn front_matter_comparison_with_ignore_date_compares_front_matter_strictly() {
+        // --ignore-date は本文にだけ当てる。front matter の日時に見える値の変化は見逃さない
+        let old = SourceMetadata {
+            meta: vec![meta_entry("published", "2026-04-12")],
+            ..sample_metadata()
+        };
+        let new = SourceMetadata {
+            meta: vec![meta_entry("published", "2026-04-13")],
+            ..refetched_metadata()
+        };
+        assert!(!keeps_front_matter_file(
+            (&old, "Updated: 2026-04-12 09:00"),
+            (&new, "Updated: 2026-04-13 10:00"),
+            true,
+        ));
+    }
+
+    #[test]
+    fn front_matter_comparison_requires_retrieved_at_line_in_existing_file() {
+        let new = front_matter_document(&refetched_metadata(), "Body");
+        let old = front_matter_document(&sample_metadata(), "Body")
+            .replace("retrieved_at: \"2026-09-29T03:10:00Z\"\n", "");
+        assert!(!keeps_existing_output(old.as_bytes(), &new, true, false));
+    }
+
+    #[test]
+    fn front_matter_comparison_falls_back_when_existing_file_has_no_front_matter() {
+        let new = front_matter_document(&sample_metadata(), "Updated: 2026-04-13 10:00");
+        // 初回 (本文だけのファイル)・閉じの行がない・UTF-8 でないファイルは、従来の比較に任せる
+        let old_files: [&[u8]; 3] = [
+            b"Updated: 2026-04-12 09:00\n",
+            b"---\ntitle: x\n",
+            &[0xff, 0xfe, 0x00],
+        ];
+        for old in old_files {
+            for ignore_date in [false, true] {
+                assert_eq!(front_matter_output_matches(old, &new, ignore_date), None);
+                assert_eq!(
+                    keeps_existing_output(old, &new, true, ignore_date),
+                    ignore_date && is_date_only_change(old, new.as_bytes()),
+                );
+                assert!(!keeps_existing_output(old, &new, true, ignore_date));
+            }
+        }
+    }
+
+    #[test]
+    fn keeps_existing_output_without_front_matter_follows_previous_rules() {
+        let old = b"Updated: 2026-04-12 09:00\n";
+        assert!(keeps_existing_output(
+            old,
+            "Updated: 2026-04-13 10:00\n",
+            false,
+            true
+        ));
+        assert!(!keeps_existing_output(
+            old,
+            "Updated: 2026-04-13 10:00\n",
+            false,
+            false
+        ));
+        // 同じ内容は従来どおり書き込みへ進む (日時だけの差分とはみなさない)
+        assert!(!keeps_existing_output(
+            old,
+            "Updated: 2026-04-12 09:00\n",
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn write_or_print_output_front_matter_keeps_file_when_only_retrieved_at_differs() {
+        let dir = make_temp_dir("get-md-front-matter-keep");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("output.md");
+        let old = front_matter_document(&sample_metadata(), "Body");
+        std::fs::write(&path, &old).expect("failed to write fixture file");
+
+        let cli = cli_with_front_matter_output(path.clone(), false);
+        let output_state = capture_output_write_state(Some(&path));
+        let new = front_matter_document(&refetched_metadata(), "Body");
+        write_or_print_output(&cli, &new, output_state, &Progress::new(false))
+            .expect("failed to handle output");
+
+        // 書き換えないので、retrieved_at は前に取得した時刻のまま
+        let saved = std::fs::read_to_string(&path).expect("failed to read output file");
+        assert_eq!(saved, old);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_or_print_output_front_matter_rewrites_file_when_title_changes() {
+        let dir = make_temp_dir("get-md-front-matter-title");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("output.md");
+        std::fs::write(&path, front_matter_document(&sample_metadata(), "Body"))
+            .expect("failed to write fixture file");
+
+        let cli = cli_with_front_matter_output(path.clone(), true);
+        let output_state = capture_output_write_state(Some(&path));
+        let renamed = SourceMetadata {
+            title: Some("Renamed".to_string()),
+            ..refetched_metadata()
+        };
+        let new = front_matter_document(&renamed, "Body");
+        write_or_print_output(&cli, &new, output_state, &Progress::new(false))
+            .expect("failed to handle output");
+
+        let saved = std::fs::read_to_string(&path).expect("failed to read output file");
+        assert_eq!(saved, new);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_or_print_output_front_matter_with_ignore_date_skips_date_only_body_change() {
+        let dir = make_temp_dir("get-md-front-matter-ignore-date");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("output.md");
+        let old = front_matter_document(&sample_metadata(), "Updated: 2026-04-12 09:00");
+        std::fs::write(&path, &old).expect("failed to write fixture file");
+
+        let cli = cli_with_front_matter_output(path.clone(), true);
+        let output_state = capture_output_write_state(Some(&path));
+        let new = front_matter_document(&refetched_metadata(), "Updated: 2026-04-13 10:00");
+        write_or_print_output(&cli, &new, output_state, &Progress::new(false))
+            .expect("failed to handle output");
+
+        let saved = std::fs::read_to_string(&path).expect("failed to read output file");
+        assert_eq!(saved, old);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_or_print_output_front_matter_adds_header_to_file_without_front_matter() {
+        let dir = make_temp_dir("get-md-front-matter-add");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("output.md");
+        std::fs::write(&path, "Body\n").expect("failed to write fixture file");
+
+        let cli = cli_with_front_matter_output(path.clone(), false);
+        let output_state = capture_output_write_state(Some(&path));
+        let new = front_matter_document(&sample_metadata(), "Body");
+        write_or_print_output(&cli, &new, output_state, &Progress::new(false))
+            .expect("failed to handle output");
+
+        let saved = std::fs::read_to_string(&path).expect("failed to read output file");
+        assert_eq!(saved, new);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kept_file_status_is_unchanged_outside_git() {
+        let dir = make_temp_dir("get-md-kept-status");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("output.md");
+        std::fs::write(&path, b"content").expect("failed to write fixture file");
+
+        assert_eq!(kept_file_status(&path, false), ("✔", "unchanged"));
+        assert_eq!(kept_file_status(&path, true), ("📝", "updated"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kept_file_status_is_updated_with_unstaged_changes() {
+        let dir = make_temp_dir("get-md-kept-status-git");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("tracked.md");
+
+        git(&dir, &["init"]);
+        git(&dir, &["config", "user.name", "Test User"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        std::fs::write(&path, b"old").expect("failed to write tracked file");
+        git(&dir, &["add", "tracked.md"]);
+        git(&dir, &["commit", "-m", "init"]);
+        std::fs::write(&path, b"new").expect("failed to update tracked file");
+
+        assert_eq!(kept_file_status(&path, false), ("📝", "updated"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn escape_simple_selector() {
         assert_eq!(escape_js_string("body"), r#""body""#);
@@ -2327,6 +3500,8 @@ mod tests {
         assert!(!cli.no_headless);
         assert!(!cli.ignore_certificate_errors);
         assert!(!cli.quiet);
+        assert!(!cli.front_matter);
+        assert!(cli.meta.is_empty());
         assert!(!build_launch_options(&cli).ignore_certificate_errors);
     }
 

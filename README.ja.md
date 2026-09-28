@@ -41,6 +41,7 @@ get-md は、手元にある Chrome か Chromium で URL を開き、JavaScript 
 - **証明書を既定で検証**: HTTPS の証明書を検証します。信頼できるサイトのデバッグに限り、`--ignore-certificate-errors` で明示的に無視できます
 - **安全なファイル出力**: 一時ファイルに書いてからアトミックな rename で置き換え、既存のパーミッションとシンボリックリンクを保ちます。ファイルを新しく作ったか、更新したか、変更しなかったかも表示します
 - **日時だけの変更を無視**: `--ignore-date` を付けると、日時だけが変わった場合はファイルを書き換えません
+- **取得元を front matter に記録**: `--front-matter` を付けると、取得元の URL・ページのタイトル・セレクタ・取得した時刻を YAML の front matter として先頭に付けます。`--meta KEY=VALUE` で自分で決めた項目も足せます。既存のファイルとは取得した時刻を除いて比べるので、変わっていないページを取り直してもファイルは書き換わりません
 - **進捗の表示**: 取得と変換の各段階を表示します。`-q` で表示を止められます。標準出力への書き込みは flush に成功してから完了を表示します
 
 リンク・コードブロック・表を具体的にどう扱うかは [docs/markdown-conversion.ja.md](docs/markdown-conversion.ja.md) にまとめています。
@@ -103,6 +104,9 @@ get-md https://example.com
 
 # h1 要素と p 要素だけを変換してファイルに保存する
 get-md https://example.com -s "h1" -s "p" -o example.md
+
+# 取得元の情報と自分で決めた項目を YAML の front matter に残して保存する
+get-md https://example.com -o example.md --front-matter --meta topic=example
 ```
 
 1 つ目のコマンドは次の内容を出力します。
@@ -115,7 +119,21 @@ This domain is for use in documentation examples without needing permission. Avo
 [Learn more](https://iana.org/domains/example)
 ```
 
-全オプションとほかの使用例、セレクタとファイル出力の細かな挙動は [docs/usage.ja.md](docs/usage.ja.md) にあります。端末では `get-md --help` でオプションの一覧を確認できます。
+`--front-matter` を付けると、出力の先頭に取得元の情報が付きます。
+
+```markdown
+---
+url: "https://example.com"
+title: "Example Domain"
+selectors: ["body"]
+retrieved_at: "2026-09-29T03:10:00Z"
+topic: "example"
+---
+
+# Example Domain
+```
+
+全オプションとほかの使用例、セレクタとファイル出力の細かな挙動、front matter の決まりは [docs/usage.ja.md](docs/usage.ja.md) にあります。端末では `get-md --help` でオプションの一覧を確認できます。
 
 ## 開発
 

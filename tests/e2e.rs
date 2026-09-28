@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use regex::Regex;
 use url::Url;
 
 fn get_md_bin() -> Command {
@@ -450,6 +451,108 @@ fn ignore_date_overwrites_output_when_non_date_content_differs() {
     assert!(
         saved.contains("Status: done"),
         "--ignore-date must not suppress non-date content changes: {saved}",
+    );
+}
+
+#[test]
+#[ignore] // システムに Chrome/Chromium が必要
+fn front_matter_is_kept_when_only_retrieved_at_differs() {
+    let temp_dir = TempDir::new();
+    let page = temp_dir.path().join("page.html");
+    let output_path = temp_dir.path().join("output.md");
+    write_file(
+        &page,
+        r#"<!doctype html>
+<html>
+  <head><title>  E2E "front" matter: test  </title></head>
+  <body>
+    <main><p>Hello</p></main>
+  </body>
+</html>"#,
+    );
+
+    let run = |source: &str| {
+        let output = get_md_bin()
+            .args([
+                file_url(&page),
+                "-s".to_string(),
+                "main".to_string(),
+                "-o".to_string(),
+                output_path.display().to_string(),
+                "--front-matter".to_string(),
+                "--meta".to_string(),
+                format!("source={source}"),
+                "--meta".to_string(),
+                "note=".to_string(),
+                "-w".to_string(),
+                "0".to_string(),
+                "-q".to_string(),
+            ])
+            .output()
+            .expect("Failed to execute get-md");
+        assert!(
+            output.status.success(),
+            "get-md exited with error: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "Output file mode should not write to stdout: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        fs::read_to_string(&output_path).expect("Failed to read output file")
+    };
+
+    // 1 回目: 取得元の情報を front matter にして書く。URL は変わらないので final_url は出さない
+    let first = run("e2e");
+    let retrieved_at = first
+        .lines()
+        .find_map(|line| line.strip_prefix("retrieved_at: "))
+        .expect("front matter should contain retrieved_at")
+        .to_string();
+    let rfc3339_seconds = Regex::new(r#"^"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"$"#).unwrap();
+    assert!(
+        rfc3339_seconds.is_match(&retrieved_at),
+        "retrieved_at should be UTC RFC 3339 with seconds: {retrieved_at}",
+    );
+    let expected = format!(
+        concat!(
+            "---\n",
+            "url: \"{url}\"\n",
+            "title: \"E2E \\\"front\\\" matter: test\"\n",
+            "selectors: [\"main\"]\n",
+            "retrieved_at: {retrieved_at}\n",
+            "source: \"e2e\"\n",
+            "note: \"\"\n",
+            "---\n",
+            "\n",
+            "Hello\n",
+        ),
+        url = file_url(&page),
+        retrieved_at = retrieved_at,
+    );
+    assert_eq!(first, expected);
+
+    // 前に取得したファイルに見立てて、retrieved_at を過去の時刻にしておく
+    let previous = first.replace(&retrieved_at, "\"2000-01-01T00:00:00Z\"");
+    write_file(&output_path, &previous);
+
+    // 2 回目: 取得した時刻だけが違うので書き換えない (retrieved_at は前の値のまま)
+    let second = run("e2e");
+    assert_eq!(
+        second, previous,
+        "Only retrieved_at differs, so the file must be left unchanged",
+    );
+
+    // 3 回目: --meta の値が変わったので書き換え、retrieved_at も新しくなる
+    let third = run("e2e-updated");
+    assert!(
+        third.contains("\nsource: \"e2e-updated\"\n"),
+        "A changed --meta value must be written: {third}",
+    );
+    assert!(
+        !third.contains("2000-01-01T00:00:00Z"),
+        "A rewritten file must carry the new retrieved_at: {third}",
     );
 }
 

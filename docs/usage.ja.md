@@ -23,6 +23,8 @@ get-md [OPTIONS] <URL>
 | `--no-cache` | | ブラウザのキャッシュを無効にする (常に最新の内容を取得) |
 | `--ignore-certificate-errors` | | HTTPS の証明書エラーを無視する (危険: 信頼できるサイトのデバッグに限る) |
 | `--ignore-date` | | ファイルに書き込むとき、日時だけの差分を変更なしとして扱う |
+| `--front-matter` | | 取得元の情報を YAML の front matter として出力の先頭に付ける ([front matter](#front-matter) を参照) |
+| `--meta <KEY=VALUE>` | | front matter に自分で決めた項目を足す (複数指定可)。`--front-matter` も有効になる |
 | `--quiet` | `-q` | 進捗の表示を止める |
 | `--help` | `-h` | ヘルプを表示する |
 | `--version` | `-V` | バージョンを表示する |
@@ -55,6 +57,15 @@ get-md https://self-signed.badssl.com/ --ignore-certificate-errors
 
 # 日時だけが変わった場合はファイルを書き換えない
 get-md https://example.com -o example.md --ignore-date
+
+# 取得元の URL・タイトル・セレクタ・取得した時刻を YAML の front matter に残す
+get-md https://example.com -o example.md --front-matter
+
+# front matter に自分で決めた項目を足す (--meta だけでも front matter が付く)
+get-md https://example.com -o example.md --meta topic=example --meta "note=参考に保存"
+
+# スクリプトで保存済みのページを取り直す (ページが本当に変わったときだけファイルが変わる)
+get-md https://example.com -o example.md --front-matter --ignore-date --meta topic=example
 
 # 進捗を表示せずに実行する
 get-md https://example.com -q -o example.md
@@ -91,3 +102,63 @@ get-md https://example.com -q -o example.md
 - **`--ignore-date`**: 日時の文字列だけが変わった場合は、書き換えを省きます。小数秒やタイムゾーン付きの一般的な ISO 8601 の形式も対象です。古い内容と新しい内容の両方に日時が含まれる場合だけ比較し、UTF-8 でないファイルは通常の比較に戻します
 - **アトミックな書き込み**: 出力は同じディレクトリの一時ファイルに書いてから rename で置き換えるため、書き込みの途中で I/O エラー (ディスクの容量不足など) が起きても、既存のファイルが切り詰められたり壊れたりしません。既存のパーミッションは内容を書く前に適用し、書き込み権限は先に確かめます。出力先がシンボリックリンクなら実体に書き込み、リンクはそのまま残します。リンク先がまだ無く、その親ディレクトリも無い場合は、親ディレクトリから作ります。rename は inode を置き換えるので、ハードリンクは切れ、ACL と拡張属性は引き継がれません (クラッシュへの強さを優先した仕様です)
 - **進捗**: 進捗は標準エラー出力に表示するので、標準出力に書き出す Markdown には混ざりません。完了の表示は、出力の書き込みと flush に成功してから出します
+- **front matter**: `--front-matter` を付けると、取得した時刻を比較から外します。詳しくは[既存のファイルとの比較](#既存のファイルとの比較)を参照してください
+
+## front matter
+
+`--front-matter` を付けると、出力の先頭に YAML の front matter を付けます。ファイルだけでなく標準出力にも付くので、保存した写しに取得元の記録が残ります。`--meta KEY=VALUE` は自分で決めた項目を足し、これだけでも front matter が付きます。
+
+```bash
+get-md https://example.com -o example.md --meta topic=example
+```
+
+```markdown
+---
+url: "https://example.com"
+title: "Example Domain"
+selectors: ["body"]
+retrieved_at: "2026-09-29T03:10:00Z"
+topic: "example"
+---
+
+# Example Domain
+```
+
+### 項目
+
+項目はいつも次の順に並びます。
+
+| 項目 | 値 | 書く条件 |
+|---|---|---|
+| `url` | 引数に渡した URL (そのまま) | いつも |
+| `final_url` | リダイレクトなどを経て読み込んだ後のページの URL | `url` と違うときだけ。`https://example.com` と `https://example.com/` の末尾の `/` のように、URL の正規化で消える違いは数えない |
+| `title` | ページの `document.title` から前後の空白を削ったもの | ページに空でないタイトルがあるときだけ |
+| `selectors` | 使ったセレクタの一覧。`-s` を省くと `["body"]` | いつも |
+| `retrieved_at` | ページを読んだ時刻。UTC の RFC 3339 で、秒まで | いつも |
+| `--meta` の項目 | 指定した値。指定した順に並ぶ | `--meta` を指定したとき |
+
+get-md の版は書きません。get-md を上げるたびに、保存したすべてのファイルが書き換わるのを避けるためです。
+
+### 書式
+
+- `---` の行、項目ごとの `key: value` の行、閉じの `---` の行、空行の順に書き、その後に Markdown が続きます。閉じの `---` の後にはいつも空行があるので、本文が `---` で始まっても区別できます
+- 値はすべて YAML のダブルクォートの文字列で、`selectors` はダブルクォートの文字列を並べたフロー形式の列 (`["article", "main"]` など) です。そのため `true` や `2026-09-29`、`a: b` のような値も文字列として読まれます
+- クォートの中では、`"` と `\` をエスケープし、改行・復帰・タブを `\n`・`\r`・`\t` に、そのほかの制御文字と U+2028・U+2029・U+FEFF・U+FFFE・U+FFFF を `\uXXXX` にします。どの項目も 1 行に収まり、YAML のパーサで読むと元の文字列に戻ります
+
+### `--meta` の決まり
+
+- 引数は最初の `=` で分けます。`--meta query=a=b` なら、`query` の値は `a=b` です。値は空でもかまいません (`--meta note=`)
+- キーは英字か `_` で始め、英数字・`_`・`-` だけで書きます (`^[A-Za-z_][A-Za-z0-9_-]*$`)
+- 次の場合はブラウザを起動する前にエラーで終了します: `=` がない、キーが空、キーの書式が違う、同じキーを 2 回以上指定した、組み込みの項目 (`url`・`final_url`・`title`・`selectors`・`retrieved_at`) と同じキー、YAML が文字列ではなく真偽値や null として読む語 (`true`・`false`・`null`・`yes`・`no`・`on`・`off`・`y`・`n`。大文字小文字を問わない)
+
+### 既存のファイルとの比較
+
+`-o` の出力先に get-md の front matter 付きのファイルがすでにあるときは、新しい出力と次のように比べます。
+
+- `retrieved_at` の値は、`--ignore-date` の有無にかかわらず、いつも比較から外します。ほかの項目と本文が同じなら、ファイルを書き換えずに `unchanged` と表示します (Git でステージしていない変更があれば、これまでどおり `updated`)。変わっていないページを取り直しても、Git の差分は出ません
+- `--ignore-date` も付けたときでも、front matter (`retrieved_at` を除く) は文字列どおりに比べ、日時の差分を無視する比較は本文にだけ当てます。タイトル・URL・セレクタ・`--meta` の値の変化は必ず書き込みます
+- 既存のファイルに front matter がない場合 (初回や、ヘッダの形式が違う場合) は、これまでどおりファイル全体を比べるので、front matter を付けて書き直します
+- `retrieved_at` は、ファイルに保存している本文を取得した時刻を表します。ファイルを書き換えなかったときは、前の値が残ります
+- 既存のファイルの front matter にしかない項目は引き継ぎません。出力は引数だけで決まります。残したい値は、毎回 `--meta` で渡してください
+
+`--front-matter` も `--meta` も付けないときの出力と比較は、これまでと変わりません。
