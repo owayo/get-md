@@ -30,12 +30,17 @@ get-md opens a URL in the Chrome or Chromium already on your machine, waits for 
 
 Convert the whole page, or pick the parts you need with CSS selectors. Relative links become absolute URLs and file output is written atomically, so get-md also fits scripts that keep Markdown copies of web pages up to date.
 
+> [!IMPORTANT]
+> get-md now removes hidden content and invisible characters by default, so its output can differ from earlier versions. Add `--keep-hidden --keep-invisible` to get the previous output. See [Hidden content and invisible characters](docs/usage.md#hidden-content-and-invisible-characters).
+
 ## Features
 
 - **JavaScript rendering**: Drives your installed Chrome or Chromium over the Chrome DevTools Protocol, so single-page apps and dynamic content are converted after they render; `-w` sets the extra wait, which is included in the browser connection's idle timeout
 - **No WebDriver**: Needs no ChromeDriver or Selenium; Chrome is found automatically, or set with `--chrome-path`
 - **CSS selector extraction**: Converts only the elements you need; repeat `-s` to join several selectors with `---` in the order given, and an invalid selector fails with an explicit error instead of matching nothing
 - **Clean Markdown**: Drops scripts, styles, `noscript`, and SVG, and removes the padding from Markdown tables while preserving escaped pipes in cells
+- **Hidden content removal**: Leaves out elements and text that the rendered page hides, such as `display: none`, `opacity: 0`, `visibility: hidden`, the body of a closed `<details>`, visually-hidden text, and elements pushed off the page to the left or top. What counts is the page as displayed at fetch time, so what an LLM reads matches what a person sees and instructions hidden from people (prompt injection) are not passed on; `--keep-hidden` keeps them
+- **Invisible character removal**: Removes zero-width characters, the BOM, bidirectional controls, tag characters, and control characters from the whole Markdown, including code blocks, link destinations, image alt text and titles, and the front matter title, while keeping emoji ZWJ sequences, flags, and valid variation selectors; `--keep-invisible` keeps them
 - **Absolute URLs**: Resolves relative links and images against the rendered document's base URL, including `<base href>`, and leaves inline code and code blocks untouched
 - **HTTP error detection**: Rejects HTTP error responses using Chrome DevTools Protocol network events, even when page scripts tamper with browser performance APIs
 - **Certificate checks by default**: Validates HTTPS certificates; `--ignore-certificate-errors` is an explicit opt-out for trusted debugging
@@ -107,6 +112,9 @@ get-md https://example.com -s "h1" -s "p" -o example.md
 
 # Save the page with YAML front matter that records its source and your own fields
 get-md https://example.com -o example.md --front-matter --meta topic=example
+
+# Keep hidden content and invisible characters (the output of earlier versions)
+get-md https://example.com --keep-hidden --keep-invisible
 ```
 
 The first command prints:
@@ -132,6 +140,8 @@ topic: "example"
 
 # Example Domain
 ```
+
+When get-md removes hidden content or invisible characters, the progress display ends with a line that counts them (it is not shown with `-q`, and the counts are never written to the output). What is removed, what is kept, and the limits: [Hidden content and invisible characters](docs/usage.md#hidden-content-and-invisible-characters).
 
 Every option, more examples, how selectors and file output behave, and the front matter rules: [docs/usage.md](docs/usage.md). `get-md --help` prints the option list in your terminal.
 

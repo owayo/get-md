@@ -556,6 +556,297 @@ fn front_matter_is_kept_when_only_retrieved_at_differs() {
     );
 }
 
+/// 見えなくされた要素・テキストと、見えない文字を含むページ。
+///
+/// `VISIBLE-` で始まる語は画面に見えるので残り、`HIDDEN-` で始まる語は見えないので既定では除かれる。
+const HIDDEN_CONTENT_PAGE: &str = r#"<!doctype html>
+<html>
+  <head>
+    <title>Hidden&#x200B; content&#x202E;</title>
+    <style>
+      .sr-only {
+        position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+        overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+      }
+      .clip-path-hidden {
+        position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%);
+      }
+      .offscreen-left { position: absolute; left: -10000px; top: 0; width: 200px; }
+      .offscreen-top { position: absolute; top: -500px; left: 0; height: 100px; }
+      .below { position: absolute; top: 5000px; left: 0; }
+      .gradient {
+        background: linear-gradient(90deg, #c00, #00c);
+        -webkit-background-clip: text; background-clip: text; color: transparent;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p>VISIBLE-BASE</p>
+      <p style="display: none">HIDDEN-DISPLAY-NONE</p>
+      <p hidden>HIDDEN-ATTRIBUTE</p>
+      <p style="opacity: 0">HIDDEN-OPACITY</p>
+      <div style="opacity: 0"><p>HIDDEN-OPACITY-CHILD</p></div>
+      <p style="content-visibility: hidden">HIDDEN-CONTENT-VISIBILITY</p>
+      <div style="visibility: hidden">HIDDEN-VISIBILITY
+        <span style="visibility: visible">VISIBLE-REVEALED-CHILD</span></div>
+      <div style="display: contents"><p>VISIBLE-DISPLAY-CONTENTS</p></div>
+      <details>
+        <summary>VISIBLE-CLOSED-SUMMARY</summary>
+        <p>HIDDEN-CLOSED-DETAILS-BODY</p>
+        HIDDEN-CLOSED-DETAILS-TEXT
+      </details>
+      <details open>
+        <summary>VISIBLE-OPEN-SUMMARY</summary>
+        <p>VISIBLE-OPEN-DETAILS-BODY</p>
+      </details>
+      <span class="sr-only">HIDDEN-SR-ONLY</span>
+      <span class="clip-path-hidden">HIDDEN-CLIP-PATH</span>
+      <div class="offscreen-left">HIDDEN-OFFSCREEN-LEFT</div>
+      <div class="offscreen-top">HIDDEN-OFFSCREEN-TOP</div>
+      <div class="below">VISIBLE-FAR-BELOW</div>
+      <p aria-hidden="true">VISIBLE-ARIA-HIDDEN</p>
+      <p style="font-size: 0">HIDDEN-FONT-SIZE-ZERO</p>
+      <p style="color: transparent">HIDDEN-TRANSPARENT-COLOR</p>
+      <p style="color: rgba(0, 0, 0, 0)">HIDDEN-RGBA-ZERO</p>
+      <p style="font-size: 0.5px">VISIBLE-TINY-FONT</p>
+      <h2 class="gradient">VISIBLE-GRADIENT-TEXT</h2>
+      <p style="color: transparent; text-shadow: 0 0 2px #333">VISIBLE-SHADOW-TEXT</p>
+      <p>ZERO&#x200B;WIDTH &#x202E;BIDI&#x202C; TAG&#xE0041;&#xE0042;&#xE007F; &#x1F468;&#x200D;&#x1F469;&#x200D;&#x1F467;</p>
+    </main>
+  </body>
+</html>"#;
+
+/// 手元のページに get-md を実行する。`-q` と `-w 0` は常に付ける。
+fn run_get_md_on(page: &Path, extra_args: &[&str]) -> std::process::Output {
+    let mut args = vec![
+        file_url(page),
+        "-w".to_string(),
+        "0".to_string(),
+        "-q".to_string(),
+    ];
+    args.extend(extra_args.iter().map(|arg| arg.to_string()));
+    get_md_bin()
+        .args(args)
+        .output()
+        .expect("Failed to execute get-md")
+}
+
+fn assert_success(output: &std::process::Output) -> String {
+    assert!(
+        output.status.success(),
+        "get-md exited with error: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout.clone()).expect("stdout is UTF-8")
+}
+
+fn visible_and_hidden_words(markdown: &str) -> (Vec<&str>, Vec<&str>) {
+    let words = Regex::new(r"\b(VISIBLE|HIDDEN)-[A-Z0-9-]+\b").unwrap();
+    let mut visible = Vec::new();
+    let mut hidden = Vec::new();
+    for word in words.find_iter(markdown).map(|m| m.as_str()) {
+        if word.starts_with("VISIBLE-") {
+            visible.push(word);
+        } else {
+            hidden.push(word);
+        }
+    }
+    (visible, hidden)
+}
+
+/// `HIDDEN_CONTENT_PAGE` のうち、既定の抽出でも残る語。
+const EXPECTED_VISIBLE_WORDS: [&str; 11] = [
+    "VISIBLE-BASE",
+    // visibility: hidden の親の中で visible に戻した子
+    "VISIBLE-REVEALED-CHILD",
+    "VISIBLE-DISPLAY-CONTENTS",
+    "VISIBLE-CLOSED-SUMMARY",
+    "VISIBLE-OPEN-SUMMARY",
+    "VISIBLE-OPEN-DETAILS-BODY",
+    // 下の外 (スクロールすれば見える) は除かない
+    "VISIBLE-FAR-BELOW",
+    // aria-hidden は画面の表示を変えない
+    "VISIBLE-ARIA-HIDDEN",
+    // 1px 未満でも 0 でなければ除かない
+    "VISIBLE-TINY-FONT",
+    // 塗りが透明でも、背景を文字の形に切り抜いたり影を付けたりした文字は見える
+    "VISIBLE-GRADIENT-TEXT",
+    "VISIBLE-SHADOW-TEXT",
+];
+
+#[test]
+#[ignore] // システムに Chrome/Chromium が必要
+fn hidden_elements_and_invisible_characters_are_removed_by_default() {
+    let temp_dir = TempDir::new();
+    let page = temp_dir.path().join("page.html");
+    write_file(&page, HIDDEN_CONTENT_PAGE);
+
+    let output = run_get_md_on(&page, &["-s", "main", "--front-matter"]);
+    let stdout = assert_success(&output);
+    assert!(
+        output.stderr.is_empty(),
+        "--quiet prints nothing to stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let (visible, hidden) = visible_and_hidden_words(&stdout);
+    assert!(
+        hidden.is_empty(),
+        "hidden content leaked: {hidden:?}\n{stdout}"
+    );
+    for word in EXPECTED_VISIBLE_WORDS {
+        assert!(visible.contains(&word), "{word} is missing:\n{stdout}");
+    }
+
+    // 見えない文字を除く (RGI の絵文字の ZWJ の並びは残す)
+    assert!(stdout.contains("ZEROWIDTH BIDI TAG "), "{stdout:?}");
+    assert!(
+        stdout.contains("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"),
+        "{stdout:?}"
+    );
+    for ch in ['\u{200B}', '\u{202E}', '\u{202C}', '\u{E0041}', '\u{E007F}'] {
+        assert!(
+            !stdout.contains(ch),
+            "U+{:04X} remains: {stdout:?}",
+            u32::from(ch)
+        );
+    }
+    // front matter の title からも除く
+    assert!(
+        stdout.contains("\ntitle: \"Hidden content\"\n"),
+        "{stdout:?}"
+    );
+}
+
+#[test]
+#[ignore] // システムに Chrome/Chromium が必要
+fn keep_hidden_restores_hidden_content_but_still_removes_invisible_characters() {
+    let temp_dir = TempDir::new();
+    let page = temp_dir.path().join("page.html");
+    write_file(&page, HIDDEN_CONTENT_PAGE);
+
+    let stdout = assert_success(&run_get_md_on(&page, &["-s", "main", "--keep-hidden"]));
+
+    let (_, hidden) = visible_and_hidden_words(&stdout);
+    for word in [
+        "HIDDEN-DISPLAY-NONE",
+        "HIDDEN-OPACITY",
+        "HIDDEN-VISIBILITY",
+        "HIDDEN-CLOSED-DETAILS-BODY",
+        "HIDDEN-SR-ONLY",
+        "HIDDEN-OFFSCREEN-LEFT",
+        "HIDDEN-FONT-SIZE-ZERO",
+        "HIDDEN-TRANSPARENT-COLOR",
+    ] {
+        assert!(
+            hidden.contains(&word),
+            "{word} is missing with --keep-hidden:\n{stdout}"
+        );
+    }
+    // --keep-hidden は見えない文字には効かない
+    assert!(stdout.contains("ZEROWIDTH BIDI TAG "), "{stdout:?}");
+}
+
+#[test]
+#[ignore] // システムに Chrome/Chromium が必要
+fn keep_invisible_keeps_invisible_characters_but_still_removes_hidden_content() {
+    let temp_dir = TempDir::new();
+    let page = temp_dir.path().join("page.html");
+    write_file(&page, HIDDEN_CONTENT_PAGE);
+
+    let stdout = assert_success(&run_get_md_on(
+        &page,
+        &["-s", "main", "--keep-invisible", "--front-matter"],
+    ));
+
+    let (_, hidden) = visible_and_hidden_words(&stdout);
+    assert!(
+        hidden.is_empty(),
+        "hidden content leaked: {hidden:?}\n{stdout}"
+    );
+    assert!(
+        stdout.contains("ZERO\u{200B}WIDTH \u{202E}BIDI\u{202C} TAG\u{E0041}\u{E0042}\u{E007F}"),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.contains("\ntitle: \"Hidden\u{200B} content\u{202E}\"\n"),
+        "{stdout:?}"
+    );
+}
+
+#[test]
+#[ignore] // システムに Chrome/Chromium が必要
+fn page_scripts_cannot_disable_hidden_content_removal() {
+    // 見えない指示を紛れ込ませたいページは、判定に使う関数を書き換えて判定を偽ろうとする。
+    // 抽出はページのスクリプトから切り離した実行環境 (isolated world) で動くので、書き換えは届かない
+    let temp_dir = TempDir::new();
+    let page = temp_dir.path().join("page.html");
+    write_file(
+        &page,
+        r#"<!doctype html>
+<html>
+  <body>
+    <main>
+      <p>Visible text</p>
+      <p style="display: none">HIDDEN-INJECTED-INSTRUCTION</p>
+    </main>
+    <script>
+      const visible = { display: 'block', visibility: 'visible', opacity: '1', position: 'static',
+                        getPropertyValue: () => '' };
+      window.getComputedStyle = () => visible;
+      Element.prototype.getBoundingClientRect = () => ({ left: 10, top: 10, right: 500, bottom: 50, width: 490, height: 40 });
+      JSON.stringify = () => '{"matched":1,"fragments":["<main>HIDDEN-SPOOFED-RESULT</main>"]}';
+      Array.from = () => [];
+    </script>
+  </body>
+</html>"#,
+    );
+
+    let stdout = assert_success(&run_get_md_on(&page, &["-s", "main"]));
+    assert_eq!(stdout, "Visible text");
+}
+
+#[test]
+#[ignore] // システムに Chrome/Chromium が必要
+fn selecting_only_hidden_elements_fails_with_keep_hidden_hint() {
+    let temp_dir = TempDir::new();
+    let page = temp_dir.path().join("page.html");
+    write_file(
+        &page,
+        r#"<!doctype html>
+<html>
+  <body>
+    <main>Visible body</main>
+    <section id="secret" style="display: none"><p>Secret text</p></section>
+    <div style="opacity: 0"><aside id="faded">Faded text</aside></div>
+  </body>
+</html>"#,
+    );
+
+    // 選んだ要素そのものが見えない (祖先の opacity: 0 を含む) と、その断片を出さない
+    let output = run_get_md_on(&page, &["-s", "#secret", "-s", "#faded"]);
+    assert!(
+        !output.status.success(),
+        "get-md should fail when every selected element is hidden: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--keep-hidden"), "{stderr}");
+    assert!(stderr.contains("'#secret'"), "{stderr}");
+
+    // 見える要素も選んでいれば、見えない方を警告して続ける
+    let output = run_get_md_on(&page, &["-s", "#secret", "-s", "main"]);
+    let stdout = assert_success(&output);
+    assert_eq!(stdout, "Visible body");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("'#secret'"), "{stderr}");
+
+    // --keep-hidden なら取り出す
+    let stdout = assert_success(&run_get_md_on(&page, &["-s", "#secret", "--keep-hidden"]));
+    assert_eq!(stdout, "Secret text");
+}
+
 #[test]
 #[ignore] // システムに Chrome/Chromium が必要
 fn http_error_status_cannot_be_spoofed_by_page_script() {

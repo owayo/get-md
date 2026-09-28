@@ -1,5 +1,7 @@
+mod invisible;
 mod progress;
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -13,13 +15,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use clap::builder::ArgPredicate;
-use headless_chrome::protocol::cdp::{Network, Page};
+use headless_chrome::protocol::cdp::{Network, Page, Runtime};
 use headless_chrome::{Browser, LaunchOptions, Tab};
 use regex::Regex;
+use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 use url::Url;
 
+use crate::invisible::InvisibleCount;
 use crate::progress::Progress;
 
 /// ブラウザで URL を取得し、指定要素を Markdown に変換する。
@@ -84,6 +88,17 @@ struct Cli {
     /// 最初の = で分け、値は空でもよい。キーは英字か _ で始め、英数字・_・- だけで書く。
     #[arg(long, value_name = "KEY=VALUE")]
     meta: Vec<String>,
+
+    /// ページの上で見えなくされた要素とテキストも取り出す（従来の抽出）。
+    /// 既定では display: none・opacity: 0・visibility: hidden・閉じた details の中身・
+    /// 画面の外へ追い出した要素などを、取得した時点の表示を基準に除く。
+    #[arg(long)]
+    keep_hidden: bool,
+
+    /// 見えない文字を出力から除かない（従来の出力）。
+    /// 既定ではゼロ幅スペース・BOM・双方向の制御文字・タグ文字・制御文字などを除く。
+    #[arg(long)]
+    keep_invisible: bool,
 }
 
 type MainResponseStatus = Arc<Mutex<Option<u32>>>;
@@ -115,18 +130,34 @@ fn main() -> Result<()> {
     load_page(&tab, &cli.url, cli.wait, &mut progress)?;
     validate_http_status(&main_response_status, &cli.url)?;
 
-    let html_fragments = extract_html_fragments(&tab, &selectors, &mut progress)?;
+    let extracted = extract_html_fragments(&tab, &selectors, cli.keep_hidden, &mut progress)?;
+    let strip_invisible = !cli.keep_invisible;
+    let mut invisible = InvisibleCount::default();
     // 取得した時刻は、本文の HTML を取り出した直後に記録する
     let front_matter = if cli.front_matter {
         let metadata = read_source_metadata(&tab, &cli.url, &selectors, meta)?;
-        Some(render_front_matter(&metadata))
+        Some(front_matter_text(metadata, strip_invisible, &mut invisible))
     } else {
         None
     };
-    let markdown = convert_html_fragments(&tab, &html_fragments, &cli.url, &mut progress)?;
+    let markdown = convert_html_fragments(
+        &tab,
+        &extracted.fragments,
+        &cli.url,
+        strip_invisible,
+        &mut invisible,
+        &mut progress,
+    )?;
     let output_text = build_output_text(markdown, front_matter.as_deref(), cli.output.is_some());
     let output_state = capture_output_write_state(cli.output.as_deref());
     write_or_print_output(&cli, &output_text, output_state, &progress)?;
+    report_removals(
+        &progress,
+        &RemovalReport {
+            hidden: extracted.hidden,
+            invisible,
+        },
+    );
 
     Ok(())
 }
@@ -222,8 +253,8 @@ fn validate_http_status(main_response_status: &MainResponseStatus, url: &str) ->
 
 /// セレクタ評価 JS が例外を捕捉した際に返す文字列の番兵プレフィックス。
 ///
-/// HTML パーサは文書中の U+0000 を U+FFFD に置換するため、実際の outerHTML が
-/// このプレフィックスで始まることはなく、正規の抽出結果とは衝突しない。
+/// 正規の抽出結果は JSON のオブジェクト (`{` で始まる文字列) なので、NUL で始まる
+/// このプレフィックスとは衝突しない。
 const SELECTOR_ERROR_SENTINEL: &str = "\u{0}get-md-selector-error\u{0}";
 
 /// セレクタ評価結果からエラー番兵を判別し、エラーであれば例外メッセージを返す。
@@ -231,73 +262,201 @@ fn selector_evaluation_error(value: &str) -> Option<&str> {
     value.strip_prefix(SELECTOR_ERROR_SENTINEL)
 }
 
+/// セレクタに一致した要素の HTML を取り出すスクリプト (関数式)。ページの中で評価する。
+///
+/// `--keep-hidden` でなければ、ページの上で見えない要素とテキストを複製から削ってから
+/// outerHTML にする。判定の規則はスクリプトの中に書いてある。
+const EXTRACT_SCRIPT: &str = include_str!("extract.js");
+
+/// 1 つのセレクタについて、抽出のスクリプトを呼ぶ式を組み立てる。
+///
+/// 無効なセレクタの例外はスクリプトの中で捕捉して番兵付きのメッセージにし、
+/// 「一致 0 件」やスクリプトの誤りと区別して、分かりやすいエラーにする。
+fn extraction_script(selector: &str, keep_hidden: bool) -> String {
+    format!(
+        "(\n{EXTRACT_SCRIPT}\n)({selector}, {keep_hidden}, {sentinel})",
+        selector = escape_js_string(selector),
+        sentinel = escape_js_string(SELECTOR_ERROR_SENTINEL),
+    )
+}
+
+/// 抽出のスクリプトが返す、1 つのセレクタの結果 (JSON)。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SelectorExtraction {
+    /// 見えるかの判定の途中で起きた例外のメッセージ
+    error: Option<String>,
+    /// セレクタに一致した要素の数
+    matched: u64,
+    /// 出力する要素の HTML (一致した順。見えない根の要素は含まない)
+    fragments: Vec<String>,
+    hidden_elements: u64,
+    hidden_texts: u64,
+    faded_chars: u64,
+    kept_chars: u64,
+}
+
+/// ページの上で見えないために除いたものの数 (抽出した断片ごとの延べ数)。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct HiddenRemovals {
+    /// 子孫ごと除いた要素 (見えない根の要素を含む) のうち、文字か画像を含んでいたものの数
+    elements: u64,
+    /// テキストの単位で除いた箇所の数 (続けて除いたテキストは 1 か所と数える)
+    texts: u64,
+    /// opacity: 0 と visibility: hidden のために除いた文字の数 (空白を除く)
+    faded_chars: u64,
+    /// 残した文字の数 (空白を除く)
+    kept_chars: u64,
+}
+
+impl HiddenRemovals {
+    fn add(&mut self, extraction: &SelectorExtraction) {
+        self.elements += extraction.hidden_elements;
+        self.texts += extraction.hidden_texts;
+        self.faded_chars += extraction.faded_chars;
+        self.kept_chars += extraction.kept_chars;
+    }
+}
+
+/// 取り出した HTML (セレクタごとに 1 つ) と、見えないために除いたものの数。
+struct ExtractedHtml {
+    fragments: Vec<String>,
+    hidden: HiddenRemovals,
+}
+
+/// 抽出のスクリプトを動かす、ページのスクリプトから切り離した実行環境 (isolated world) を作る。
+///
+/// ページと同じ実行環境で動かすと、ページのスクリプトが `getComputedStyle` や `JSON.stringify`、
+/// DOM のプロトタイプを書き換えて、見えるかの判定や抽出の結果そのものを偽れる (見えない指示を
+/// 紛れ込ませたいページなら、そうする)。isolated world は DOM を共有しつつ、組み込みのオブジェクトと
+/// DOM のプロトタイプを別に持つ (拡張機能の content script と同じ仕組み) ので、書き換えが届かない。
+fn create_isolated_world(tab: &Tab) -> Result<Runtime::ExecutionContextId> {
+    let frame_id = tab
+        .call_method(Page::GetFrameTree(None))
+        .context("Failed to get main frame")?
+        .frame_tree
+        .frame
+        .id;
+    let world = tab
+        .call_method(Page::CreateIsolatedWorld {
+            frame_id,
+            world_name: Some("get-md".to_string()),
+            grant_univeral_access: None,
+        })
+        .context("Failed to create an isolated world for extraction")?;
+    Ok(world.execution_context_id)
+}
+
+/// 式を指定した実行環境で評価する。例外が外へ出たらエラーにする。
+fn evaluate_in_context(
+    tab: &Tab,
+    context_id: Runtime::ExecutionContextId,
+    expression: &str,
+) -> Result<Runtime::RemoteObject> {
+    let evaluated = tab.call_method(Runtime::Evaluate {
+        expression: expression.to_string(),
+        return_by_value: Some(true),
+        generate_preview: Some(false),
+        silent: Some(false),
+        await_promise: Some(false),
+        include_command_line_api: Some(false),
+        user_gesture: Some(false),
+        object_group: None,
+        context_id: Some(context_id),
+        throw_on_side_effect: None,
+        timeout: None,
+        disable_breaks: None,
+        repl_mode: None,
+        allow_unsafe_eval_blocked_by_csp: None,
+        unique_context_id: None,
+        serialization_options: None,
+    })?;
+    if let Some(details) = evaluated.exception_details {
+        bail!("{}", details.text);
+    }
+    Ok(evaluated.result)
+}
+
+/// 抽出のスクリプトの戻り値を読む。無効なセレクタと判定の失敗はエラーにする。
+fn parse_selector_extraction(selector: &str, value: &str) -> Result<SelectorExtraction> {
+    if let Some(message) = selector_evaluation_error(value) {
+        bail!("Invalid CSS selector '{}': {}", selector, message);
+    }
+    let extraction: SelectorExtraction = serde_json::from_str(value)
+        .with_context(|| format!("Failed to read the elements of selector '{selector}'"))?;
+    if let Some(error) = &extraction.error {
+        bail!(
+            "セレクタ '{selector}' の要素が見えるかを判定できませんでした: {error}。判定を省くには --keep-hidden を付けてください"
+        );
+    }
+    Ok(extraction)
+}
+
 fn extract_html_fragments(
     tab: &Tab,
     selectors: &[String],
+    keep_hidden: bool,
     progress: &mut Progress,
-) -> Result<Vec<String>> {
+) -> Result<ExtractedHtml> {
     // セレクタに一致した要素の HTML を抽出する
     progress.spinner("Extracting HTML elements...");
+    let context_id = create_isolated_world(tab)?;
     let mut html_fragments = Vec::new();
+    let mut hidden = HiddenRemovals::default();
+    let mut matched_only_hidden = false;
     for selector in selectors {
         progress.set_message(&format!("Extracting selector '{}'...", selector));
 
-        // 一致した全要素の outerHTML を取得する。headless_chrome の evaluate は
-        // exceptionDetails を検査せず例外を空値として返すため、無効なセレクタ等の
-        // 例外は JS 側で捕捉して番兵付きメッセージにし、「マッチ 0 件」と区別する。
-        let js = format!(
-            r#"(() => {{
-                try {{
-                    const els = document.querySelectorAll({selector});
-                    return Array.from(els).map(el => el.outerHTML).join('\n');
-                }} catch (err) {{
-                    return {sentinel} + String(err && err.message ? err.message : err);
-                }}
-            }})()"#,
-            selector = escape_js_string(selector),
-            sentinel = escape_js_string(SELECTOR_ERROR_SENTINEL),
-        );
+        let result =
+            evaluate_in_context(tab, context_id, &extraction_script(selector, keep_hidden))
+                .with_context(|| format!("Failed to evaluate selector '{}'", selector))?;
+        let value = result.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+        let extraction = parse_selector_extraction(selector, value)?;
+        hidden.add(&extraction);
 
-        let result = tab
-            .evaluate(&js, false)
-            .with_context(|| format!("Failed to evaluate selector '{}'", selector))?;
-
-        let html = result
-            .value
-            .as_ref()
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        if let Some(message) = selector_evaluation_error(&html) {
-            bail!("Invalid CSS selector '{}': {}", selector, message);
-        }
-
-        if html.is_empty() {
+        if extraction.matched == 0 {
             eprintln!("Warning: no elements matched selector '{}'", selector);
+        } else if extraction.fragments.is_empty() {
+            matched_only_hidden = true;
+            eprintln!(
+                "警告: セレクタ '{selector}' に一致した要素はどれもページの上で見えないため、出力しません (含めるには --keep-hidden)"
+            );
         } else {
-            html_fragments.push(html);
+            // 1 つのセレクタに一致した要素は改行でつなぎ、1 つの断片として Markdown にする
+            html_fragments.push(extraction.fragments.join("\n"));
         }
     }
     progress.finish_and_clear();
 
     if html_fragments.is_empty() {
+        if matched_only_hidden {
+            bail!(
+                "セレクタに一致した要素はどれもページの上で見えないため、出力するものがありません。見えない要素も取り出すには --keep-hidden を付けてください"
+            );
+        }
         bail!("No elements matched the specified selectors");
     }
 
-    Ok(html_fragments)
+    Ok(ExtractedHtml {
+        fragments: html_fragments,
+        hidden,
+    })
 }
 
 fn convert_html_fragments(
     tab: &Tab,
     html_fragments: &[String],
     fallback_base_url: &str,
+    strip_invisible: bool,
+    invisible: &mut InvisibleCount,
     progress: &mut Progress,
 ) -> Result<String> {
     // HTML を Markdown に変換する
     progress.spinner("Converting to Markdown...");
 
-    let markdown = convert_html_fragments_to_markdown(html_fragments)?;
+    let (markdown, removed) = convert_html_fragments_to_markdown(html_fragments, strip_invisible)?;
+    *invisible += removed;
+    // 見えない文字は URL を解決する前に除いてある (リンク先の見えない文字を Url::join に渡さない)
     let base_url = document_base_url(tab).unwrap_or_else(|| fallback_base_url.to_string());
     let markdown = resolve_markdown_urls(&markdown, &base_url);
     progress.finish("Converted to Markdown");
@@ -305,24 +464,131 @@ fn convert_html_fragments(
     Ok(markdown)
 }
 
-fn convert_html_fragments_to_markdown(html_fragments: &[String]) -> Result<String> {
+/// htmd が捨てる要素。中の文字は Markdown に出ないので、見えない文字を除くときも見ない。
+const HTMD_SKIP_TAGS: [&str; 4] = ["script", "style", "noscript", "svg"];
+
+/// HTML の断片を Markdown にし、`strip_invisible` なら見えない文字を除く。除いた数も返す。
+///
+/// 見えない文字は 2 段で除く。先に htmd の DOM のテキストと Markdown に出る属性から除き
+/// (htmd は Markdown の記号をテキストノードの先頭の文字だけで escape するかを決めるので、
+/// 後から除くと先頭のゼロ幅スペースの後ろの `# ` や `~~~` が見出しやコードフェンスに化ける)、
+/// 最後に Markdown の全体にも同じ処理を当てて保証にする。各段では実際に除いた文字だけを
+/// 数えるので、同じ文字を二重に数えない。
+fn convert_html_fragments_to_markdown(
+    html_fragments: &[String],
+    strip_invisible: bool,
+) -> Result<(String, InvisibleCount)> {
     let converter = htmd::HtmlToMarkdown::builder()
-        .skip_tags(vec!["script", "style", "noscript", "svg"])
+        .skip_tags(HTMD_SKIP_TAGS.to_vec())
         .options(htmd::options::Options {
             ul_bullet_spacing: 1,
             ol_number_spacing: 1,
             ..Default::default()
         })
         .build();
+    let mut invisible = InvisibleCount::default();
     let mut md_parts = Vec::new();
     for html in html_fragments {
-        let md = converter
-            .convert(html)
+        let tree = converter
+            .html_to_tree(html)
             .context("Failed to convert HTML to Markdown")?;
-        md_parts.push(md);
+        if strip_invisible {
+            invisible::remove_invisible_from_tree(&tree, &HTMD_SKIP_TAGS, &mut invisible);
+        }
+        md_parts.push(converter.tree_to_markdown(&tree));
     }
 
-    Ok(compact_markdown(&md_parts.join("\n\n---\n\n")))
+    let markdown = compact_markdown(&md_parts.join("\n\n---\n\n"));
+    if !strip_invisible {
+        return Ok((markdown, invisible));
+    }
+    let cleaned = match invisible::remove_invisible(&markdown, &mut invisible) {
+        Cow::Owned(cleaned) => Some(cleaned),
+        Cow::Borrowed(_) => None,
+    };
+    Ok((cleaned.unwrap_or(markdown), invisible))
+}
+
+/// 出力する front matter を組み立てる。
+///
+/// `strip_invisible` なら、YAML にする前に title から見えない文字を除く。`--meta` の値は
+/// 利用者が渡したものなので触らない。
+fn front_matter_text(
+    mut metadata: SourceMetadata,
+    strip_invisible: bool,
+    invisible: &mut InvisibleCount,
+) -> String {
+    if strip_invisible {
+        metadata.title = remove_invisible_from_title(metadata.title, invisible);
+    }
+    render_front_matter(&metadata)
+}
+
+/// front matter の title から見えない文字を除く。除いた後に前後の空白を削り、空なら出さない。
+fn remove_invisible_from_title(
+    title: Option<String>,
+    invisible: &mut InvisibleCount,
+) -> Option<String> {
+    normalize_title(&invisible::remove_invisible(&title?, invisible))
+}
+
+/// 見えないために除いたものの数。完了時に標準エラーへ出す (front matter には書かない)。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RemovalReport {
+    hidden: HiddenRemovals,
+    invisible: InvisibleCount,
+}
+
+/// 除いたものの数を 1 行にする。何も除いていなければ None。
+///
+/// 例: `隠れた要素 3 個・隠れたテキスト 2 か所・見えない文字 12 個 (うち C1 制御文字 4 個) を除いた`
+fn removal_summary(report: &RemovalReport) -> Option<String> {
+    let mut parts = Vec::new();
+    if report.hidden.elements > 0 {
+        parts.push(format!("隠れた要素 {} 個", report.hidden.elements));
+    }
+    if report.hidden.texts > 0 {
+        parts.push(format!("隠れたテキスト {} か所", report.hidden.texts));
+    }
+    if report.invisible.removed > 0 {
+        let mut part = format!("見えない文字 {} 個", report.invisible.removed);
+        if report.invisible.c1_controls > 0 {
+            let _ = write!(
+                part,
+                " (うち C1 制御文字 {} 個)",
+                report.invisible.c1_controls
+            );
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join("・");
+    // 括弧で終わるときだけ、閉じ括弧と「を」の間に空白を置く
+    let separator = if joined.ends_with(')') { " " } else { "" };
+    Some(format!("{joined}{separator}を除いた"))
+}
+
+/// opacity: 0 と visibility: hidden のために除いた文字が、残した文字と同じかそれより多いときの案内。
+///
+/// スクロールで表示するアニメーションを使うページでは、表示の前の本文が opacity: 0 や
+/// visibility: hidden のままで、取得した時点では見えない。この 2 つで除いた量が本文より多い
+/// ときだけ `--keep-hidden` を案内する (display: none で閉じたメニューなどは数えない)。
+fn hidden_content_hint(hidden: &HiddenRemovals) -> Option<&'static str> {
+    (hidden.faded_chars > 0 && hidden.faded_chars >= hidden.kept_chars).then_some(
+        "透明 (opacity: 0) か visibility: hidden のために除いた内容が、残した本文と同じかそれより多くありました。スクロールで表示される内容なら --keep-hidden で取り出せます",
+    )
+}
+
+/// 除いたものの数を、進捗の表示と同じく標準エラーへ出す (`--quiet` では出さない)。
+fn report_removals(progress: &Progress, report: &RemovalReport) {
+    if let Some(summary) = removal_summary(report) {
+        progress.complete("🧹", &summary);
+    }
+    if let Some(hint) = hidden_content_hint(&report.hidden) {
+        progress.complete("💡", hint);
+    }
 }
 
 /// 出力する内容を組み立てる。
@@ -2281,6 +2547,8 @@ mod tests {
             ignore_date,
             front_matter: false,
             meta: Vec::new(),
+            keep_hidden: false,
+            keep_invisible: false,
         }
     }
 
@@ -9246,13 +9514,19 @@ inside-of-fence
         assert_eq!(compact_markdown(input), "| `a | b` | x |");
     }
 
+    /// HTML の断片を Markdown にする (`strip_invisible` なら見えない文字を除く)。
+    fn html_to_markdown(fragments: &[&str], strip_invisible: bool) -> (String, InvisibleCount) {
+        let fragments: Vec<String> = fragments.iter().map(|html| html.to_string()).collect();
+        convert_html_fragments_to_markdown(&fragments, strip_invisible)
+            .expect("HTML 変換が成功すること")
+    }
+
     #[test]
     fn html_conversion_resolves_spaced_image_url_and_preserves_title() {
-        let fragments =
-            vec![r#"<img src="asset name.png" alt="diagram" title="A title">"#.to_string()];
-
-        let markdown =
-            convert_html_fragments_to_markdown(&fragments).expect("HTML 変換が成功すること");
+        let (markdown, _) = html_to_markdown(
+            &[r#"<img src="asset name.png" alt="diagram" title="A title">"#],
+            true,
+        );
 
         assert_eq!(
             resolve_markdown_urls(&markdown, "https://example.com/docs/page.html"),
@@ -9262,30 +9536,342 @@ inside-of-fence
 
     #[test]
     fn html_conversion_preserves_table_cells_beyond_header_width() {
-        let fragments = vec![
-            r#"
+        let html = r#"
             <table>
                 <thead><tr><th>First</th><th>Second</th></tr></thead>
                 <tbody><tr><td>Alpha</td><td>Beta</td><td>Must survive</td></tr></tbody>
             </table>
-        "#
-            .to_string(),
-        ];
+        "#;
 
         assert_eq!(
-            convert_html_fragments_to_markdown(&fragments).expect("HTML 変換が成功すること"),
+            html_to_markdown(&[html], true).0,
             "| First | Second |  |\n| - | - | - |\n| Alpha | Beta | Must survive |"
         );
     }
 
     #[test]
     fn html_conversion_preserves_fence_longer_than_content_run() {
-        let fragments =
-            vec!["<pre><code>`````\nlet parsed = true;\n`````</code></pre>".to_string()];
-
         assert_eq!(
-            convert_html_fragments_to_markdown(&fragments).expect("HTML 変換が成功すること"),
+            html_to_markdown(
+                &["<pre><code>`````\nlet parsed = true;\n`````</code></pre>"],
+                true
+            )
+            .0,
             "``````\n`````\nlet parsed = true;\n`````\n``````"
         );
+    }
+
+    // --- 見えない文字を除く変換の流れのテスト ---
+
+    #[test]
+    fn html_conversion_removes_decoded_character_references() {
+        // htmd (html5ever) が文字参照を復号した文字も除く
+        let (markdown, count) = html_to_markdown(&["<p>a&#x200B;b&#8203;c&zwj;d</p>"], true);
+        assert_eq!(markdown, "abcd");
+        assert_eq!(
+            count,
+            InvisibleCount {
+                removed: 3,
+                c1_controls: 0
+            }
+        );
+    }
+
+    #[test]
+    fn html_conversion_counts_c1_controls_once_within_the_total() {
+        // 木の段で除いた文字は、最後の Markdown の段では数えない (二重に数えない)
+        let (markdown, count) =
+            html_to_markdown(&["<p>a\u{200B}b\u{85}c</p>", "<p>\u{9F}d</p>"], true);
+        assert_eq!(markdown, "abc\n\n---\n\nd");
+        assert_eq!(
+            count,
+            InvisibleCount {
+                removed: 3,
+                c1_controls: 2
+            }
+        );
+    }
+
+    #[test]
+    fn html_conversion_removes_invisible_characters_from_link_and_image_attributes() {
+        let html = concat!(
+            r#"<p><a href="./gu&#x200B;ide.html" title="T&#x200B;ip">Gu&#x200B;ide</a> "#,
+            r#"<img src="./lo&#x200B;go.png" alt="Lo&#x200B;go" title="Ic&#x200B;on"></p>"#,
+        );
+        let (markdown, count) = html_to_markdown(&[html], true);
+        assert_eq!(
+            markdown,
+            r#"[Guide](./guide.html "Tip") ![Logo](./logo.png "Icon")"#
+        );
+        assert_eq!(count.removed, 6);
+    }
+
+    #[test]
+    fn html_conversion_removes_invisible_characters_before_url_resolution() {
+        // リンク先の見えない文字は Url::join に渡る前に除く (%E2%80%8B にしない)
+        let (markdown, _) = html_to_markdown(
+            &[r#"<a href="./gu&#x200B;ide.html">Guide</a> <img src="./i&#x2060;mg.png" alt="">"#],
+            true,
+        );
+        let resolved = resolve_markdown_urls(&markdown, "https://example.com/docs/page.html");
+        assert_eq!(
+            resolved,
+            "[Guide](https://example.com/docs/guide.html) ![](https://example.com/docs/img.png)"
+        );
+        assert!(!resolved.contains("%E2"), "{resolved}");
+    }
+
+    #[test]
+    fn html_conversion_escapes_markdown_that_follows_a_removed_leading_character() {
+        // テキストノードの先頭の見えない文字を Markdown にする前に除くので、htmd が後ろの
+        // 記号を escape し、見出し・コードフェンス・リストに化けない
+        let (markdown, count) = html_to_markdown(
+            &["<p>&#x200B;# Not a heading</p><p>&#xFEFF;~~~</p><p>&#x200B;1. Not a list</p>"],
+            true,
+        );
+        assert_eq!(markdown, "\\# Not a heading\n\n\\~~~\n\n1\\. Not a list");
+        assert_eq!(count.removed, 3);
+    }
+
+    #[test]
+    fn html_conversion_collapses_whitespace_around_removed_characters() {
+        assert_eq!(html_to_markdown(&["<p>a \u{200B} b</p>"], true).0, "a b");
+    }
+
+    #[test]
+    fn html_conversion_removes_invisible_characters_inside_code() {
+        let (markdown, count) = html_to_markdown(
+            &[
+                "<pre><code class=\"language-rust\">let x&#x200B; = 1;&#x202E;</code></pre><p><code>a&#x200B;b</code></p>",
+            ],
+            true,
+        );
+        assert_eq!(markdown, "```rust\nlet x = 1;\n```\n\n`ab`");
+        assert_eq!(count.removed, 3);
+    }
+
+    #[test]
+    fn html_conversion_keeps_emoji_sequences_and_visible_spaces() {
+        let html = "<p>👨&#x200D;👩&#x200D;👧 🏴&#xE0067;&#xE0062;&#xE0073;&#xE0063;&#xE0074;&#xE007F; ❤&#xFE0F; 葛&#xE0100; a&nbsp;b　c</p>";
+        let (markdown, count) = html_to_markdown(&[html], true);
+        assert_eq!(
+            markdown,
+            "👨\u{200D}👩\u{200D}👧 🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F} ❤\u{FE0F} 葛\u{E0100} a\u{A0}b\u{3000}c"
+        );
+        assert_eq!(count, InvisibleCount::default());
+    }
+
+    #[test]
+    fn html_conversion_does_not_count_contents_that_htmd_drops() {
+        let (markdown, count) = html_to_markdown(
+            &[
+                "<script>var s = \"\u{200B}\";</script><style>p::after{content:\"\u{200B}\"}</style><p>x</p>",
+            ],
+            true,
+        );
+        assert_eq!(markdown, "x");
+        assert_eq!(count, InvisibleCount::default());
+    }
+
+    #[test]
+    fn html_conversion_keeps_invisible_characters_with_keep_invisible() {
+        let html = r#"<p>a&#x200B;b&#x202E;c <a href="./x&#x200B;.html">l&#xFEFF;ink</a></p>"#;
+        let (markdown, count) = html_to_markdown(&[html], false);
+        assert_eq!(
+            markdown,
+            "a\u{200B}b\u{202E}c [l\u{FEFF}ink](./x\u{200B}.html)"
+        );
+        assert_eq!(count, InvisibleCount::default());
+    }
+
+    #[test]
+    fn remove_invisible_from_title_trims_after_removal() {
+        let mut count = InvisibleCount::default();
+        assert_eq!(
+            remove_invisible_from_title(
+                Some("\u{200B} Ti\u{202E}tle \u{FEFF}".to_string()),
+                &mut count
+            ),
+            Some("Title".to_string())
+        );
+        assert_eq!(count.removed, 3);
+        // 見えない文字だけのタイトルは出さない
+        assert_eq!(
+            remove_invisible_from_title(Some("\u{200B}\u{2060}".to_string()), &mut count),
+            None
+        );
+        assert_eq!(remove_invisible_from_title(None, &mut count), None);
+        assert_eq!(count.removed, 5);
+    }
+
+    #[test]
+    fn front_matter_text_cleans_title_but_not_meta_values() {
+        let metadata = SourceMetadata {
+            title: Some("Exa\u{200B}mple".to_string()),
+            meta: vec![meta_entry("note", "kept\u{200B}as-is")],
+            ..sample_metadata()
+        };
+
+        let mut count = InvisibleCount::default();
+        let cleaned = front_matter_text(metadata.clone(), true, &mut count);
+        assert!(cleaned.contains("\ntitle: \"Example\"\n"), "{cleaned}");
+        // --meta の値は利用者が渡したものなので触らない
+        assert!(
+            cleaned.contains("\nnote: \"kept\u{200B}as-is\"\n"),
+            "{cleaned}"
+        );
+        assert_eq!(count.removed, 1);
+
+        let mut count = InvisibleCount::default();
+        let kept = front_matter_text(metadata, false, &mut count);
+        assert!(kept.contains("\ntitle: \"Exa\u{200B}mple\"\n"), "{kept}");
+        assert_eq!(count, InvisibleCount::default());
+    }
+
+    // --- 見えない要素を除く抽出のテスト (Chrome が要らない部分) ---
+
+    #[test]
+    fn cli_keep_flags_default_to_removing() {
+        let cli = Cli::try_parse_from(["get-md", "https://example.com"]).unwrap();
+        assert!(!cli.keep_hidden);
+        assert!(!cli.keep_invisible);
+
+        let cli = Cli::try_parse_from(["get-md", "https://example.com", "--keep-hidden"]).unwrap();
+        assert!(cli.keep_hidden);
+        assert!(!cli.keep_invisible);
+
+        let cli =
+            Cli::try_parse_from(["get-md", "https://example.com", "--keep-invisible"]).unwrap();
+        assert!(!cli.keep_hidden);
+        assert!(cli.keep_invisible);
+    }
+
+    #[test]
+    fn cli_help_lists_keep_options() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--keep-hidden"), "{help}");
+        assert!(help.contains("--keep-invisible"), "{help}");
+    }
+
+    #[test]
+    fn extraction_script_passes_escaped_arguments() {
+        let script = extraction_script("a[title=\"x\"]\n", true);
+        assert!(script.starts_with("(\n"), "{script}");
+        assert!(script.contains(EXTRACT_SCRIPT));
+        assert!(
+            script.ends_with(r#")("a[title=\"x\"]\n", true, "\u0000get-md-selector-error\u0000")"#),
+            "{script}"
+        );
+        assert!(extraction_script("main", false).contains(r#")("main", false, "#));
+    }
+
+    #[test]
+    fn parse_selector_extraction_reads_fragments_and_counts() {
+        let extraction = parse_selector_extraction(
+            "main",
+            r#"{"matched":2,"fragments":["<main>a</main>"],"hiddenElements":1,"hiddenTexts":2,"fadedChars":30,"keptChars":1}"#,
+        )
+        .unwrap();
+        assert_eq!(extraction.matched, 2);
+        assert_eq!(extraction.fragments, vec!["<main>a</main>"]);
+
+        let mut hidden = HiddenRemovals::default();
+        hidden.add(&extraction);
+        hidden.add(&extraction);
+        assert_eq!(
+            hidden,
+            HiddenRemovals {
+                elements: 2,
+                texts: 4,
+                faded_chars: 60,
+                kept_chars: 2
+            }
+        );
+
+        // --keep-hidden の結果は数を持たない
+        let kept =
+            parse_selector_extraction("main", r#"{"matched":1,"fragments":["<main></main>"]}"#)
+                .unwrap();
+        assert_eq!(kept.hidden_elements, 0);
+        assert_eq!(kept.fragments.len(), 1);
+    }
+
+    #[test]
+    fn parse_selector_extraction_reports_invalid_selector() {
+        let value = format!("{SELECTOR_ERROR_SENTINEL}'[' is not a valid selector");
+        let err = parse_selector_extraction("[", &value).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid CSS selector '[': '[' is not a valid selector"
+        );
+    }
+
+    #[test]
+    fn parse_selector_extraction_reports_visibility_errors_with_keep_hidden_hint() {
+        let err = parse_selector_extraction("main", r#"{"error":"boom"}"#).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("'main'"), "{message}");
+        assert!(message.contains("boom"), "{message}");
+        assert!(message.contains("--keep-hidden"), "{message}");
+    }
+
+    #[test]
+    fn parse_selector_extraction_rejects_unreadable_results() {
+        // スクリプトが値を返さなかった (例外が外へ出た) ときは、一致 0 件とみなさずにエラーにする
+        assert!(parse_selector_extraction("main", "").is_err());
+        assert!(parse_selector_extraction("main", "<main></main>").is_err());
+    }
+
+    #[test]
+    fn removal_summary_lists_only_nonzero_counts() {
+        assert_eq!(removal_summary(&RemovalReport::default()), None);
+
+        let only_invisible = RemovalReport {
+            invisible: InvisibleCount {
+                removed: 12,
+                c1_controls: 0,
+            },
+            ..RemovalReport::default()
+        };
+        assert_eq!(
+            removal_summary(&only_invisible).as_deref(),
+            Some("見えない文字 12 個を除いた")
+        );
+
+        let all = RemovalReport {
+            hidden: HiddenRemovals {
+                elements: 3,
+                texts: 2,
+                faded_chars: 10,
+                kept_chars: 100,
+            },
+            invisible: InvisibleCount {
+                removed: 12,
+                c1_controls: 4,
+            },
+        };
+        assert_eq!(
+            removal_summary(&all).as_deref(),
+            Some(
+                "隠れた要素 3 個・隠れたテキスト 2 か所・見えない文字 12 個 (うち C1 制御文字 4 個) を除いた"
+            )
+        );
+    }
+
+    #[test]
+    fn hidden_content_hint_appears_only_when_faded_text_dominates() {
+        let hidden = |faded_chars, kept_chars| HiddenRemovals {
+            elements: 1,
+            texts: 0,
+            faded_chars,
+            kept_chars,
+        };
+        assert!(hidden_content_hint(&hidden(0, 0)).is_none());
+        assert!(hidden_content_hint(&hidden(99, 100)).is_none());
+        assert!(
+            hidden_content_hint(&hidden(100, 100))
+                .is_some_and(|hint| hint.contains("--keep-hidden"))
+        );
+        assert!(hidden_content_hint(&hidden(5, 0)).is_some());
     }
 }

@@ -30,12 +30,17 @@ get-md は、手元にある Chrome か Chromium で URL を開き、JavaScript 
 
 ページ全体を変換するほか、CSS セレクタで必要な部分だけを選べます。相対リンクは絶対 URL に直し、ファイルへの出力はアトミックに書き込むので、Web ページの Markdown の写しを更新し続けるスクリプトにも組み込めます。
 
+> [!IMPORTANT]
+> get-md は、見えなくされた内容と見えない文字を既定で出力から除くようになりました。そのため、以前の版とは出力が変わることがあります。以前と同じ出力にするには `--keep-hidden --keep-invisible` を付けてください。詳しくは[見えなくされた内容と見えない文字](docs/usage.ja.md#見えなくされた内容と見えない文字)を参照してください。
+
 ## 機能
 
 - **JavaScript の描画に対応**: インストール済みの Chrome / Chromium を Chrome DevTools Protocol で操作し、シングルページアプリケーションや動的なコンテンツも描画を待ってから変換します。追加の待ち時間は `-w` で指定し、ブラウザ接続のアイドルタイムアウトにも算入します
 - **WebDriver が不要**: ChromeDriver や Selenium を用意する必要はありません。Chrome は自動で見つけ、`--chrome-path` で場所を指定することもできます
 - **CSS セレクタで抽出**: 必要な要素だけを変換します。`-s` を繰り返すと、複数のセレクタの結果を指定した順に `---` でつなぎます。不正なセレクタは「一致なし」として扱わず、エラーで終了します
 - **余計なものを除いた Markdown**: script・style・`noscript`・SVG を取り除き、セル内のエスケープ済みパイプを保ちながら Markdown の表の余分な空白を詰めます
+- **見えなくされた内容を除く**: `display: none`・`opacity: 0`・`visibility: hidden`・閉じた `<details>` の中身・支援技術向けに画面から隠したテキスト (visually-hidden)・ページの左や上の外へ追い出した要素など、描画後のページで見えない要素とテキストを出力しません。判定は取得した時点の表示を基準にします。人が画面で見る内容と LLM が読む内容をそろえ、人には見えない指示 (プロンプトインジェクション) を渡さないためです。`--keep-hidden` で残せます
+- **見えない文字を除く**: ゼロ幅の文字・BOM・双方向の制御文字・タグ文字・制御文字を、コードブロック・リンク先・画像の alt と title・front matter の title を含む Markdown 全体から除きます。絵文字の ZWJ の並び・旗・正しい異体字セレクタは残します。`--keep-invisible` で残せます
 - **絶対 URL への変換**: 相対リンクと画像を、描画後の文書の基準 URL (`<base href>` を含む) で絶対 URL に直します。インラインコードとコードブロックの中は書き換えません
 - **HTTP エラーの検出**: HTTP のエラー応答を Chrome DevTools Protocol のネットワークイベントで検出して拒否します。ページのスクリプトがブラウザの Performance API を書き換えても、判定は変わりません
 - **証明書を既定で検証**: HTTPS の証明書を検証します。信頼できるサイトのデバッグに限り、`--ignore-certificate-errors` で明示的に無視できます
@@ -107,6 +112,9 @@ get-md https://example.com -s "h1" -s "p" -o example.md
 
 # 取得元の情報と自分で決めた項目を YAML の front matter に残して保存する
 get-md https://example.com -o example.md --front-matter --meta topic=example
+
+# 見えなくされた内容と見えない文字も残す (以前の版と同じ出力)
+get-md https://example.com --keep-hidden --keep-invisible
 ```
 
 1 つ目のコマンドは次の内容を出力します。
@@ -132,6 +140,8 @@ topic: "example"
 
 # Example Domain
 ```
+
+見えなくされた内容や見えない文字を除いたときは、進捗の表示の最後に、除いた数を 1 行で表示します (`-q` では表示せず、出力には書きません)。何を除いて何を残すか、判定の限界は[見えなくされた内容と見えない文字](docs/usage.ja.md#見えなくされた内容と見えない文字)にまとめています。
 
 全オプションとほかの使用例、セレクタとファイル出力の細かな挙動、front matter の決まりは [docs/usage.ja.md](docs/usage.ja.md) にあります。端末では `get-md --help` でオプションの一覧を確認できます。
 

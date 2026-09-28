@@ -5,6 +5,8 @@ get-md converts the extracted HTML to Markdown with [htmd](https://crates.io/cra
 ## Cleanup
 
 - **Removed elements**: `script`, `style`, `noscript`, and `svg` elements are dropped before conversion
+- **Hidden content**: Elements and text hidden on the page are removed when the HTML is extracted (`--keep-hidden` keeps them)
+- **Invisible characters**: Zero-width spaces, bidirectional controls, and similar characters are removed from the text and the link and image attributes before the HTML becomes Markdown, and the whole Markdown is checked once more before relative URLs are resolved (`--keep-invisible` keeps them). Removing them only after the conversion could turn text into Markdown syntax, such as `# ` or `~~~` behind a leading zero-width space becoming a heading or a code fence. See [Usage](usage.md#hidden-content-and-invisible-characters)
 
 ## URL resolution
 
