@@ -65,9 +65,9 @@ jobs:
           # 版は yy.m.counter。年は 2 桁 (Windows の MSI は major が 255 以下)。月はゼロ埋めしない
           # (SemVer は数値の先頭の 0 を禁じ、Cargo は 26.08.100 を拒む)。連番は 100 から (桁がそろう)。
           # 採番は JST で切る。ランナーは UTC なので、素の date では JST の月初 0〜9 時のリリースが
-          # 前の月の連番になる
-          YEAR=$(TZ=Asia/Tokyo date +%y)
-          MONTH=$(TZ=Asia/Tokyo date +%-m)
+          # 前の月の連番になる。年と月は 1 回の date で読む (別々に読むと、JST の元日 0 時をまたいだ
+          # ときに前の年と 1 月が組み合わさり、既存の版より小さい 26.1.100 のような版になる)
+          read -r YEAR MONTH <<< "$(TZ=Asia/Tokyo date '+%y %-m')"
           CURRENT=$(awk -F '"' '/^version = /{ print $2; exit }' Cargo.toml)
           echo "Current version: ${CURRENT}"
           COUNTER=100
