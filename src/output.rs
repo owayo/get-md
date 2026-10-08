@@ -50,7 +50,11 @@ fn finalize_output_text(markdown: String, file_output: bool) -> String {
 }
 
 pub(crate) fn capture_output_write_state(output: Option<&Path>) -> OutputWriteState {
-    let old_content = output.and_then(|p| fs::read(p).ok());
+    // 通常ファイルだけを読む。FIFO や端末を読むと書き込み側や入力を待って止まり、
+    // atomic_write の「通常ファイルでない」エラーまで進めない。
+    let old_content = output
+        .filter(|p| fs::metadata(p).is_ok_and(|metadata| metadata.is_file()))
+        .and_then(|p| fs::read(p).ok());
     // 書き込み前にファイルの存在を記録する（書き込み後は常に exists() が true になるため）
     let file_existed_before = old_content.is_some() || output.is_some_and(|p| p.exists());
     // 削除済み tracked ファイルは書き戻し後に diff が消えるため、書き込み前の状態も保持する。
@@ -157,7 +161,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     })?;
 
     // 既存ファイルがあれば、書き込み権限を事前確認しつつパーミッションを保持する。
-    let existing_permissions = match fs::metadata(&write_path) {
+    let existing_metadata = match fs::metadata(&write_path) {
         Ok(metadata) => {
             if !metadata.is_file() {
                 bail!("Output path is not a regular file: {}", path.display());
@@ -170,7 +174,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
                 .with_context(|| {
                     format!("Failed to open output file for writing: {}", path.display())
                 })?;
-            Some(metadata.permissions())
+            Some(metadata)
         }
         Err(err) if err.kind() == ErrorKind::NotFound => None,
         Err(err) => {
@@ -180,7 +184,10 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         }
     };
 
-    let (tmp_path, mut tmp_file) = create_temp_file(write_parent)?;
+    // 既存ファイルを置き換えるときは、一時ファイルを所有者だけが読み書きできるモードで作る。
+    // 緩いモードで作ってから絞ると、その間に開かれた fd から書き込み後の内容を読まれる
+    // (open(2) の権限検査は開いた時点だけで、後の chmod は開いている fd に効かない)。
+    let (tmp_path, mut tmp_file) = create_temp_file(write_parent, existing_metadata.is_some())?;
     // 書き込み失敗時に一時ファイルを残さないようガードする。
     let mut guard = TempFileGuard {
         path: tmp_path,
@@ -191,13 +198,23 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     // 制限モード(0600 等)の場合に新しい内容が一時的に緩いモードで読める窓ができる。
     // 開いたファイルディスクリプタへの書き込み権限は open 時に確定しており、
     // 先に読み取り専用へ変更しても後続の write_all は失敗しない。
-    if let Some(permissions) = existing_permissions {
-        tmp_file.set_permissions(permissions).with_context(|| {
-            format!(
-                "Failed to preserve output file permissions: {}",
-                path.display()
-            )
-        })?;
+    if let Some(metadata) = existing_metadata {
+        // モードの意味は所有グループで決まるので、グループも先に引き継ぐ (rename で作り直すと
+        // 親ディレクトリか作成者のグループになり、0640 などで読める人が変わる)。所属していない
+        // グループには変えられないため best-effort。chown が set-id ビットを落とすので chmod より前。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let _ = std::os::unix::fs::fchown(&tmp_file, None, Some(metadata.gid()));
+        }
+        tmp_file
+            .set_permissions(metadata.permissions())
+            .with_context(|| {
+                format!(
+                    "Failed to preserve output file permissions: {}",
+                    path.display()
+                )
+            })?;
     }
 
     tmp_file.write_all(bytes).with_context(|| {
@@ -274,18 +291,29 @@ fn resolve_output_write_path(path: &Path) -> Result<PathBuf> {
 /// 指定ディレクトリ内に一意な一時ファイルを排他的に作成する。
 ///
 /// プロセス ID・時刻・連番で名前を一意化し、衝突時は別名で再試行する。
-fn create_temp_file(parent: &Path) -> Result<(PathBuf, File)> {
+/// `owner_only` なら (Unix では) 作った時点から所有者だけが読み書きできるモードにする。
+fn create_temp_file(parent: &Path, owner_only: bool) -> Result<(PathBuf, File)> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if owner_only {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = owner_only;
 
     for attempt in 0..1000u32 {
         let path = parent.join(format!(
             ".get-md-{}-{nanos}-{attempt}.tmp",
             std::process::id()
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
             Err(err) => {
@@ -618,6 +646,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn capture_output_write_state_does_not_block_on_fifo() {
+        let dir = make_temp_dir("get-md-output-state-fifo");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let fifo = dir.join("out.md");
+        let status = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("failed to run mkfifo");
+        assert!(status.success());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fifo_for_thread = fifo.clone();
+        std::thread::spawn(move || {
+            let state = capture_output_write_state(Some(&fifo_for_thread));
+            let _ = tx.send((state.old_content.is_none(), state.file_existed_before));
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        if result.is_err() {
+            // 止まったスレッドの open を、書き込み側を開いて解放する
+            let _ = OpenOptions::new().write(true).open(&fifo);
+        }
+        // FIFO は読まず (書き込み側を待たず)、存在する出力先として記録する
+        assert_eq!(result, Ok((true, true)));
+        // 続く atomic_write は通常ファイルでない出力先をエラーにする
+        assert!(atomic_write(&fifo, b"content").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn build_output_text_without_front_matter_is_unchanged() {
         assert_eq!(build_output_text("Body".to_string(), None, false), "Body");
@@ -917,6 +976,65 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn create_temp_file_for_replacement_is_owner_only_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // 置き換え用の一時ファイルは、作った時点で group / other が開けないこと。
+        // 緩いモードで作ってから chmod すると、その間に開かれた fd から後で書く内容を読まれる。
+        let dir = make_temp_dir("get-md-temp-owner-only");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let (path, file) = create_temp_file(&dir, true).expect("temp file");
+        let mode = file.metadata().unwrap().permissions().mode() & 0o777;
+        drop(file);
+        assert_eq!(mode & 0o077, 0, "mode at creation: {mode:o}");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_group_owner() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = make_temp_dir("get-md-atomic-group");
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("out.md");
+        std::fs::write(&path, b"old").expect("failed to write fixture");
+
+        // ディレクトリのグループとも、作成者の主グループとも違う、所属しているグループを使う
+        let dir_gid = std::fs::metadata(&dir).unwrap().gid();
+        let primary_gid = std::fs::metadata(&path).unwrap().gid();
+        let groups = Command::new("id")
+            .arg("-G")
+            .output()
+            .expect("failed to run id");
+        let Some(other_gid) = String::from_utf8_lossy(&groups.stdout)
+            .split_whitespace()
+            .filter_map(|gid| gid.parse::<u32>().ok())
+            .find(|&gid| gid != dir_gid && gid != primary_gid)
+        else {
+            // 補助グループに所属していない環境では確かめられない
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        std::os::unix::fs::chown(&path, None, Some(other_gid)).expect("failed to change group");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("failed to set permissions");
+
+        atomic_write(&path, b"new").expect("atomic_write should succeed");
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            metadata.gid(),
+            other_gid,
+            "0640 のまま読めるグループが変わってはいけない"
+        );
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn atomic_write_follows_symlink_and_keeps_link() {
         use std::os::unix::fs::symlink;
 
@@ -1147,8 +1265,8 @@ mod tests {
         // 連続呼び出しで衝突しないことを直接検証する。
         let dir = make_temp_dir("get-md-create-temp-unique");
         std::fs::create_dir_all(&dir).expect("failed to create temp dir");
-        let (p1, f1) = create_temp_file(&dir).expect("first temp file");
-        let (p2, f2) = create_temp_file(&dir).expect("second temp file");
+        let (p1, f1) = create_temp_file(&dir, false).expect("first temp file");
+        let (p2, f2) = create_temp_file(&dir, false).expect("second temp file");
         assert_ne!(p1, p2, "二度呼び出しで同じ一時ファイル名が返ってはいけない");
         assert!(p1.exists());
         assert!(p2.exists());
@@ -1162,7 +1280,7 @@ mod tests {
         // 引数で指定した親ディレクトリの直下に作成されること。
         let dir = make_temp_dir("get-md-create-temp-parent");
         std::fs::create_dir_all(&dir).expect("failed to create temp dir");
-        let (path, file) = create_temp_file(&dir).expect("temp file");
+        let (path, file) = create_temp_file(&dir, false).expect("temp file");
         assert_eq!(path.parent().unwrap(), dir.as_path());
         // Windows でクリーンアップ前にハンドルを閉じる。
         drop(file);

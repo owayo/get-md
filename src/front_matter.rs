@@ -49,6 +49,10 @@ const BUILTIN_FRONT_MATTER_KEYS: [&str; 5] =
 const YAML_NON_STRING_WORDS: [&str; 9] =
     ["true", "false", "null", "yes", "no", "on", "off", "y", "n"];
 
+/// `--meta` のキーの長さの上限。YAML の暗黙のキー (`key: value` の key) は 1024 文字まで
+/// (YAML 1.2 の ns-s-implicit-yaml-key)。超えると front matter が YAML として読めない。
+const MAX_META_KEY_LEN: usize = 1024;
+
 /// `--meta` で足す front matter の項目。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetaEntry {
@@ -90,6 +94,13 @@ pub(crate) fn parse_meta_entries(args: &[String]) -> Result<Vec<MetaEntry>> {
         if !is_valid_meta_key(key) {
             bail!(
                 "--meta のキー {key:?} は使えません。キーは英字か _ で始め、英数字・_・- だけで書いてください"
+            );
+        }
+        // キーは ASCII だけなので、バイト数が文字数になる
+        if key.len() > MAX_META_KEY_LEN {
+            bail!(
+                "--meta のキーが長すぎます ({} 文字)。YAML のキーにできるのは {MAX_META_KEY_LEN} 文字までです",
+                key.len()
             );
         }
         if BUILTIN_FRONT_MATTER_KEYS.contains(&key) {
@@ -359,6 +370,28 @@ mod tests {
         }
         // 語を一部に含むだけのキーは文字列として読まれるので使える
         assert!(parse_meta_entries(&meta_args(&["yes_no=x", "null-ish=x", "online=x"])).is_ok());
+    }
+
+    #[test]
+    fn parse_meta_entries_rejects_keys_longer_than_yaml_implicit_key_limit() {
+        use yaml_rust2::YamlLoader;
+
+        // 1024 文字のキーは使え、YAML として読み直せる
+        let longest = "k".repeat(1024);
+        let metadata = SourceMetadata {
+            meta: parse_meta_entries(&[format!("{longest}=x")]).unwrap(),
+            ..sample_metadata()
+        };
+        let rendered = render_front_matter(&metadata);
+        let (header, _) = split_front_matter(&rendered).expect("front matter is found");
+        let docs = YamlLoader::load_from_str(header).expect("front matter is valid YAML");
+        assert_eq!(docs[0][longest.as_str()].as_str(), Some("x"));
+
+        // 1025 文字のキーは YAML のパーサが読めないので、ブラウザを起動する前に断る
+        let err = parse_meta_entries(&[format!("{longest}k=x")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1024"), "{err}");
     }
 
     #[test]
