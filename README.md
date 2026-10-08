@@ -162,6 +162,7 @@ make ci      # Run the same checks as CI (no changes)
 | `make release` | Build a release binary |
 | `make run` | Run the debug binary (arguments via ARGS="...") |
 | `make test` | Run the tests |
+| `make test-e2e` | Run the end-to-end tests with Chrome or Chromium (not part of CI) |
 | `make lint` | Run clippy with warnings as errors |
 | `make fmt` | Format the code (rewrites files) |
 | `make fmt-check` | Check the formatting (no changes) |

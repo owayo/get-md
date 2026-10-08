@@ -153,4 +153,14 @@ mod tests {
         p.finish("second done");
         assert!(p.bar.is_none());
     }
+
+    #[test]
+    fn progress_spinner_replaces_existing_spinner() {
+        // 既に表示中のスピナーがあっても、次の spinner 呼び出しで置き換えられる
+        let mut p = Progress::new(true);
+        p.spinner("first");
+        // 明示的な finish を挟まず上書き
+        p.spinner("second");
+        p.finish_and_clear();
+    }
 }

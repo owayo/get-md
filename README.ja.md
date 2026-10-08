@@ -162,6 +162,7 @@ make ci      # CI と同じ検査 (書き換えない)
 | `make release` | リリース版をビルドする |
 | `make run` | デバッグ版を実行する (引数は ARGS="...") |
 | `make test` | テストを実行する |
+| `make test-e2e` | Chrome / Chromium を使う E2E テストを実行する (CI の対象外) |
 | `make lint` | clippy を警告ゼロで通す |
 | `make fmt` | コードを整形する (書き換える) |
 | `make fmt-check` | 整形済みかを確かめる (書き換えない) |

@@ -27,6 +27,7 @@ URL をブラウザで取得し、指定要素を Markdown に変換する CLI �
 - HTTPS 証明書は既定で検証し、信頼済みデバッグ用途のみ `--ignore-certificate-errors` で無視可能
 - HTTP ステータスはページ内 JS ではなく CDP の Network response event から取得し、ページスクリプトによる偽装を防ぐ
 - CDP のアイドルタイムアウトは `--timeout + --wait + 30 秒`（飽和加算）とし、静的ページでの追加待機中に接続が切れないようにする
+- 本体は責務ごとにモジュールへ分ける。main.rs は CLI・メインフロー・ブラウザ制御・抽出と HTML -> Markdown 変換の呼び出しを持ち、Markdown の後処理 (`markdown`)、front matter (`front_matter`)、ファイル出力 (`output`) を呼ぶ。依存は main から各モジュールへの一方向と、既存の出力と比べるときに output が front_matter の分解 (`split_front_matter`・`mask_retrieved_at`) を使う向きだけで、markdown は他のモジュールに依存しない。CLI の値に依存する `write_or_print_output` は main.rs に置く。モジュールの外から使う項目だけを `pub(crate)` にする。テストは対象の関数があるモジュールの `mod tests` に置き、複数のモジュールにまたがる変換の流れのテストは main.rs に、複数のモジュールのテストで使う補助は `test_support.rs` に置く
 - メインフローは `--meta` の検証 (ブラウザの起動より前)、セレクタ決定、ブラウザ起動/ページ読み込み、HTTP ステータス検証、HTML 抽出 (`extract_html_fragments`。既定でページの上で見えない要素とテキストを除く)、front matter の組み立て (`--front-matter` のときだけ。`front_matter_text` が title から見えない文字を除く)、Markdown 変換 (見えない文字を除いてから相対 URL を解決する)、出力処理、除いた数の表示 (`report_removals`) の小さな関数に分割し、`BrowserPage` と `OutputWriteState` でブラウザ寿命と書き込み前状態を明示する
 - CSS セレクタはブラウザ内 JS 実行 (`src/extract.js` を `include_str!` で埋め込んだ関数式) により要素の outerHTML を取得する。セレクタ文字列を JS 文字列リテラルへ埋め込む際は `escape_js_string` で、改行/CR/タブは短縮エスケープ(`\n`/`\r`/`\t`)、NUL を含む U+0000〜U+001F の制御文字は `\uXXXX`、行区切り(U+2028)/段落区切り(U+2029)・引用符/バックスラッシュも個別エスケープしてから渡す。これにより制御文字を素通しすることによる CSS パーサ/CDP プロトコル層の予期しない挙動を防ぐ
 - セレクタ評価中の JavaScript 例外は NUL を含む衝突不能な番兵付き文字列として Rust 側へ返し、不正な CSS セレクタを「一致 0 件」と区別して明示的なエラーにする
@@ -58,10 +59,14 @@ build.rs        # data/unicode/ から見えない文字の判定に使う並び
 data/
   unicode/      # Unicode 17.0.0 のデータファイル (絵文字の ZWJ・タグ・異体字の並び、標準の異体字) と LICENSE
 src/
-  main.rs       # CLI 定義、メインフロー、HTML 取得、Markdown 変換、出力処理
-  extract.js    # ページの中で評価する抽出のスクリプト (見えなくされた要素とテキストを除く)
-  invisible.rs  # 見えない文字を除く (文字列と htmd の DOM)
-  progress.rs   # indicatif ベースのプログレス表示
+  main.rs         # CLI 定義、メインフロー、ブラウザ制御、HTML 抽出、HTML -> Markdown 変換、出力の振り分け、除いた数の表示
+  extract.js      # ページの中で評価する抽出のスクリプト (見えなくされた要素とテキストを除く)
+  markdown.rs     # Markdown の後処理 (ブロック構造の行の分類、テーブルの圧縮、相対 URL の解決)
+  front_matter.rs # front matter (--meta の解析、YAML の描画と文字列のエスケープ、比較のための分解)
+  output.rs       # 出力 (内容の組み立て、アトミックな書き込み、完了表示の状態、既存のファイルを残すかの判定)
+  invisible.rs    # 見えない文字を除く (文字列と htmd の DOM)
+  progress.rs     # indicatif ベースのプログレス表示
+  test_support.rs # 複数のモジュールのテストで共有する補助 (#[cfg(test)])
 tests/
   e2e.rs        # Chrome/Chromium を使う E2E テスト (#[ignore]。make test-e2e で実行)
 docs/           # README から分けた文書 (使い方、Markdown 変換の詳細、開発)。英語の x.md と日本語の x.ja.md の対

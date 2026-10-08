@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn keeps_standardized_variation_sequences() {
-        // DIGIT ZERO + VS1 (short diagonal stroke form)
+        // 数字のゼロの標準の異体字 (U+0030 + VS1、斜線付きの字形)
         assert_eq!(cleaned("0\u{FE00}"), "0\u{FE00}");
         // CJK 互換漢字の標準の異体字 (U+8C48 + VS1)
         assert_eq!(cleaned("\u{8C48}\u{FE00}"), "\u{8C48}\u{FE00}");
