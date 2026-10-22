@@ -849,6 +849,29 @@ fn selecting_only_hidden_elements_fails_with_keep_hidden_hint() {
 
 #[test]
 #[ignore] // システムに Chrome/Chromium が必要
+fn fenced_code_with_quote_markers_keeps_links_and_table_spacing() {
+    let temp_dir = TempDir::new();
+    let page = temp_dir.path().join("page.html");
+    write_file(
+        &page,
+        "<pre><code>&gt; quote\n[skip](./code)\n|  a  |  b  |\n| --- | --- |</code></pre><p><a href='./page'>real</a></p>",
+    );
+
+    let stdout = assert_success(&run_get_md_on(&page, &[]));
+    let resolved = Url::parse(&file_url(&page))
+        .unwrap()
+        .join("./page")
+        .unwrap();
+    assert_eq!(
+        stdout,
+        format!(
+            "```\n> quote\n[skip](./code)\n|  a  |  b  |\n| --- | --- |\n```\n\n[real]({resolved})"
+        )
+    );
+}
+
+#[test]
+#[ignore] // システムに Chrome/Chromium が必要
 fn http_error_status_cannot_be_spoofed_by_page_script() {
     let url = static_http_url(
         404,

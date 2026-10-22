@@ -1720,6 +1720,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn html_conversion_preserves_quoted_code_and_resolves_following_link() {
+        let html = "<pre><code>&gt; quote\n[skip](./code)\n|  a  |  b  |\n| --- | --- |</code></pre><p><a href='./page'>real</a></p>";
+        let (markdown, _) = html_to_markdown(&[html], true);
+        assert_eq!(
+            resolve_markdown_urls(&markdown, "https://example.com/docs/"),
+            "```\n> quote\n[skip](./code)\n|  a  |  b  |\n| --- | --- |\n```\n\n[real](https://example.com/docs/page)"
+        );
+    }
+
     // --- 見えない文字を除く変換の流れのテスト ---
 
     #[test]

@@ -483,7 +483,19 @@ impl MarkdownBlockState {
             };
         }
 
-        let (body, depth) = strip_blockquote_prefix_for_scan(line);
+        let (mut body, mut depth) = if self.open_fence.is_some() {
+            // フェンスの外側の引用だけを剥がす。コード中の余分な > は引用開始ではない。
+            strip_blockquote_prefix(line, self.blockquote_depth)
+        } else {
+            strip_blockquote_prefix_for_scan(line)
+        };
+        if let Some((_, _, fence_base)) = self.open_fence
+            && split_leading_spaces(body).is_some_and(|(indent, _)| indent < fence_base)
+        {
+            // リストのコンテナが終わった行では、余分な > も新しい引用として読み直す。
+            self.open_fence = None;
+            (body, depth) = strip_blockquote_prefix_for_scan(line);
+        }
         if depth != self.blockquote_depth {
             // ブロッククォートの段数が変わったら、属していたコンテナの状態は引き継がない
             self.blockquote_depth = depth;
@@ -499,15 +511,6 @@ impl MarkdownBlockState {
     }
 
     fn classify_indented_line(&mut self, indent: usize, content: &str) -> LinkScanLineKind {
-        // フェンスを含むコンテナ（リスト項目）より浅い行に来たら、
-        // そのコンテナごとフェンスも閉じる。
-        if self
-            .open_fence
-            .is_some_and(|(_, _, fence_base)| indent < fence_base)
-        {
-            self.open_fence = None;
-        }
-
         if let Some((marker, marker_len, fence_base)) = self.open_fence {
             // フェンス内。閉じフェンスに当たればここで閉じるが、その行自体もコード。
             // 閉じフェンスの追加インデントはコンテナ基準で最大 3 スペースまで。
@@ -542,10 +545,16 @@ impl MarkdownBlockState {
 
             // htmd はリスト項目先頭のコードブロックを
             // `* ``` ` のようにマーカーと同じ行から出力する。
-            let item_content = content.get(content_indent - indent..);
-            if let Some((fence_char, fence_len)) = item_content.and_then(fence_marker) {
-                self.open_fence = Some((fence_char, fence_len, content_indent));
-                return LinkScanLineKind::Code;
+            if let Some(item_content) = content.get(content_indent - indent..) {
+                // マーカー後に 5 個以上の空白があると、内容の先頭にも 4 個以上残る。
+                // 同じ行から始まるインデントコードも URL 解決から保護する。
+                if split_leading_spaces(item_content).is_none_or(|(spaces, _)| spaces >= 4) {
+                    return LinkScanLineKind::Code;
+                }
+                if let Some((fence_char, fence_len)) = fence_marker(item_content) {
+                    self.open_fence = Some((fence_char, fence_len, content_indent));
+                    return LinkScanLineKind::Code;
+                }
             }
         }
 
@@ -605,10 +614,17 @@ impl MarkdownBlockMap {
 /// 4 スペース以上インデントされている場合はブロッククォートではなくインデント
 /// コードの領域なので、そこで打ち切って残りをそのまま返す。
 fn strip_blockquote_prefix_for_scan(line: &str) -> (&str, usize) {
+    strip_blockquote_prefix(line, usize::MAX)
+}
+
+/// 指定段数まで引用記号を剥がす。フェンス内では外側のコンテナの段数までに制限する。
+fn strip_blockquote_prefix(line: &str, max_depth: usize) -> (&str, usize) {
     let mut rest = line;
     let mut depth = 0usize;
 
-    while let Some(after_indent) = strip_fence_indent(rest) {
+    while depth < max_depth
+        && let Some(after_indent) = strip_fence_indent(rest)
+    {
         let Some(after_marker) = after_indent.strip_prefix('>') else {
             break;
         };
@@ -4217,6 +4233,81 @@ code
         // マーカー直後の空白が 5 個以上のときは「マーカー + 空白 1 個」が内容インデント
         let input = "*     a\n      [skip](./code)";
         assert_eq!(resolve_markdown_urls(input, BASE), input);
+    }
+
+    #[test]
+    fn resolve_link_on_wide_marker_gap_code_line_unchanged() {
+        // 5 個以上の空白は、マーカーと同じ行でもリスト内のインデントコードを始める。
+        for marker in ["*", "-", "+", "1.", "12)"] {
+            let normal = format!("{marker}    [real](./page)");
+            assert_eq!(
+                resolve_markdown_urls(&normal, BASE),
+                format!("{marker}    [real](https://example.com/docs/en/page)")
+            );
+            for gap in [5, 6, 9] {
+                let input = format!("{marker}{}[skip](./code)", " ".repeat(gap));
+                assert_eq!(resolve_markdown_urls(&input, BASE), input);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_link_on_wide_marker_gap_code_line_inside_containers() {
+        for prefix in ["* outer\n  ", "> ", "> > "] {
+            let input = format!("{prefix}*     [skip](./code)\n\n[real](./page)");
+            let expected =
+                format!("{prefix}*     [skip](./code)\n\n[real](https://example.com/docs/en/page)");
+            assert_eq!(resolve_markdown_urls(&input, BASE), expected);
+        }
+    }
+
+    #[test]
+    fn resolve_fenced_code_containing_quote_markers_unchanged() {
+        // コード内の > は引用コンテナを増やさず、フェンス終了後のリンクは解決する。
+        for fence in ["```", "~~~"] {
+            for quote in ["> text", ">> text", "   > text"] {
+                let input = format!("{fence}\n{quote}\n[skip](./code)\n{fence}\n[real](./page)");
+                let expected = format!(
+                    "{fence}\n{quote}\n[skip](./code)\n{fence}\n[real](https://example.com/docs/en/page)"
+                );
+                assert_eq!(resolve_markdown_urls(&input, BASE), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_quoted_fenced_code_containing_extra_quote_markers_unchanged() {
+        for prefix in ["> ", "> > "] {
+            let input = format!(
+                "{prefix}```\n{prefix}> text\n{prefix}[skip](./code)\n{prefix}```\n{prefix}[real](./page)"
+            );
+            let expected = format!(
+                "{prefix}```\n{prefix}> text\n{prefix}[skip](./code)\n{prefix}```\n{prefix}[real](https://example.com/docs/en/page)"
+            );
+            assert_eq!(resolve_markdown_urls(&input, BASE), expected);
+        }
+    }
+
+    #[test]
+    fn compact_fenced_code_containing_quote_markers_keeps_table_spacing() {
+        let input =
+            "```\n> text\n|  a  |  b  |\n| --- | --- |\n```\n\n|  x  |  y  |\n| --- | --- |";
+        let expected = "```\n> text\n|  a  |  b  |\n| --- | --- |\n```\n\n| x | y |\n| - | - |";
+        assert_eq!(compact_markdown(input), expected);
+    }
+
+    #[test]
+    fn resolve_new_quoted_fence_after_list_fence_container_ends() {
+        // リストのフェンスがインデント不足で終わった行では、新しい引用とフェンスを認識する。
+        for prefix in ["", "> "] {
+            let input = format!(
+                "{prefix}* ```\n{prefix}> ```\n{prefix}> [skip](./code)\n{prefix}> ```\n\n[real](./page)"
+            );
+            let expected = format!(
+                "{prefix}* ```\n{prefix}> ```\n{prefix}> [skip](./code)\n{prefix}> ```\n\n[real](https://example.com/docs/en/page)"
+            );
+            assert_eq!(resolve_markdown_urls(&input, BASE), expected);
+        }
     }
 
     #[test]

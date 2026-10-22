@@ -6,7 +6,7 @@ The Development section of the README lists the `make` targets. This page covers
 
 `make test` runs the unit tests and compiles the end-to-end tests without running them. The unit tests need no browser.
 
-The unit tests verify the conventional `-h` / `--help` and `-V` / `--version` CLI contracts. They also cover the complete HTML-to-Markdown post-processing pipeline for long code fences, images with spaced URLs and titles, and table rows wider than their headers.
+The unit tests verify the conventional `-h` / `--help` and `-V` / `--version` CLI contracts. They also cover the complete HTML-to-Markdown post-processing pipeline for long code fences, images with spaced URLs and titles, and table rows wider than their headers. Fenced code containing `>` lines keeps its links and table spacing, while links after the fence are resolved. List items with five or more spaces after the marker also keep code links on that first line.
 
 For front matter, the unit tests cover the `--meta` rules, the escaping of each special character, the field order, and the comparison with an existing file. They also read the generated front matter back with a YAML parser ([yaml-rust2](https://crates.io/crates/yaml-rust2), a dev-dependency) and check that every value returns as the original string.
 
@@ -41,6 +41,7 @@ They cover:
 - Fetching a real GitHub raw document
 - Resolving relative links and images from a local `file://` page, including `<base href>`
 - Resolving relative links inside lists nested three levels deep, while leaving links in fenced code unchanged
+- Preserving links and table spacing in fenced code containing `>` lines, and resolving a normal link after the fence
 - Joining multiple selectors with the documented `---` separator
 - Rejecting invalid CSS selectors with an explicit error
 - Skipping rewrites for `--ignore-date` when only timestamp text changes, while still overwriting non-date content changes
@@ -74,4 +75,4 @@ To move to a new Unicode version (for example, after icu_properties starts shipp
 3. Update `UNICODE_VERSION` and `EMOJI_VERSION` in `build.rs`, and the version check in `table_data_is_unicode_17` in `src/invisible.rs` (rename it, and probe a character that the new version added)
 4. Run `make ci`. Look at the changes to the generated tables if something fails, and update the Unicode version in docs/usage.md and docs/usage.ja.md
 
-`markup5ever_rcdom` is pinned (`=0.38.0`) because get-md cleans the DOM that htmd builds and must use the same version as htmd. When you update htmd, set it to the version htmd depends on.
+`markup5ever_rcdom` is pinned (`=0.38.0`) because get-md cleans the DOM that htmd builds and must use the same version as htmd. When you update htmd, set it to the version htmd depends on. `depup --install --include-pinned` can update this pin independently; keep the matching version when htmd still requires the older DOM type.

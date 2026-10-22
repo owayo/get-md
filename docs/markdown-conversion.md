@@ -27,6 +27,10 @@ get-md converts the extracted HTML to Markdown with [htmd](https://crates.io/cra
 
 ## Code blocks and inline code
 
+Inside a fenced code block, a line beginning with `>` is literal code. Within a blockquote, only the quote markers belonging to the fence's outer container are removed for classification; extra `>` characters stay code. Neither URL resolution nor table compaction changes these contents.
+
+Five or more spaces after a list marker start indented code on that same line. Links on that line, as well as on later code lines in the list item, stay unchanged.
+
 - **CommonMark fence detection**: Recognizes opening and closing fences relative to the enclosing list item's content indent, including fences that start on the list-marker line. Fence state closes when its list or blockquote container ends, over-indented backtick lines stay indented code, and lines with an info string (such as ` ```rust `) are not closing fences. Table compaction reuses the same block classification, so table-like code inside these fences is preserved and compaction resumes after the fence closes
 - **List-aware indented code detection**: Indented code blocks are detected relative to the enclosing list item's content indent, so relative links inside deeply nested lists (three or more levels, which the HTML-to-Markdown conversion indents by four or more spaces) are still resolved, while genuine indented code inside a list item stays untouched. Thematic breaks such as `* * *` are not mistaken for list items
 - **Literal backticks**: Treats unmatched inline backticks as literal text, so later Markdown links are still resolved. The lookahead for a closing run also stops at fences opened on a list-marker line

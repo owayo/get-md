@@ -66,7 +66,7 @@ brew install owayo/get-md/get-md
 
 ### Cargo
 
-Rust 1.98 以上が必要です。
+Rust 1.99 以上が必要です。
 
 ```bash
 cargo install --git https://github.com/owayo/get-md --locked
