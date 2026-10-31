@@ -182,3 +182,25 @@ The end-to-end tests drive a real Chrome or Chromium, so `make test` compiles th
 <!-- standard:license:start -->
 [MIT](LICENSE)
 <!-- standard:license:end -->
+
+## Embedding in an application
+
+`get_md::embedding::fetch(FetchOptions, &Cancellation)` returns a structured `Document`
+with Markdown, the requested and final URLs, and the page title. It uses the same
+Chrome extraction, hidden-content filtering, invisible-character removal, and
+Markdown conversion as the CLI. It does not read host arguments, print the result,
+or write an output file. Chrome/Chromium is still required and runs as a child process.
+
+```rust,no_run
+let options = get_md::embedding::FetchOptions::new("https://example.com");
+let cancellation = get_md::embedding::Cancellation::default();
+let document = get_md::embedding::fetch(options, &cancellation)?;
+# Ok::<(), anyhow::Error>(())
+```
+
+Call this synchronous API on a background worker. Only HTTP/HTTPS URLs without
+embedded credentials are accepted. Defaults are a 30-second navigation timeout and
+a 2-second rendering wait. Cancellation is checked between browser operations and
+during the rendering wait; an in-progress blocking navigation may take until its
+timeout to return. The owned browser is dropped on success, error, or cancellation.
+The CLI entry point is `run_cli`; applications do not need to invoke it.
