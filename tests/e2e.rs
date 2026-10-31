@@ -909,3 +909,27 @@ fn http_error_status_cannot_be_spoofed_by_page_script() {
         "stderr should report the real HTTP status: {stderr}",
     );
 }
+
+#[test]
+#[ignore] // Requires installed Chrome/Chromium, no external network.
+fn embedding_fetch_uses_the_same_visibility_and_markdown_rules() {
+    let url = static_http_url(
+        200,
+        "<html><head><title>Library demo</title></head><body><h1>Native page</h1><p>Visible <a href='/Case?X=AbC'>link</a></p><p hidden>private hidden text</p><script>document.body.insertAdjacentHTML('beforeend','<p>Rendered content</p>')</script></body></html>",
+    );
+    let mut options = get_md::embedding::FetchOptions::new(&url);
+    options.wait = std::time::Duration::ZERO;
+    let document = get_md::embedding::fetch(options, &Default::default()).unwrap();
+    assert!(document.markdown.contains("# Native page"));
+    assert!(document.markdown.contains("Rendered content"));
+    assert!(document.markdown.contains(&format!("{}Case?X=AbC", url)));
+    assert!(!document.markdown.contains("private hidden text"));
+    assert_eq!(document.title.as_deref(), Some("Library demo"));
+    let missing = static_http_url(404, "<html><body>missing</body></html>");
+    let error = get_md::embedding::fetch(
+        get_md::embedding::FetchOptions::new(missing),
+        &Default::default(),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("404"));
+}
