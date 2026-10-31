@@ -140,3 +140,10 @@ make install   # /usr/local/bin にインストール (INSTALL_PATH で変更で
 - `idle_browser_timeout` は `timeout + 30s` のバッファを saturating 加算で設定する
 - バージョニングは CalVer (YY.M.counter) 形式
 - リリースワークフローは版を JST の YY.M.counter で決め、同じタグが既にあれば止める。Cargo.lock は `cargo update --workspace` で自パッケージの版だけを合わせ、失敗した場合はコミット・タグ作成前で停止する。Homebrew の formula の sha256 は、Release に添付した `SHA256SUMS` から読む
+
+## Library API
+
+`src/main.rs` is a thin CLI entry point. Existing processing helpers and CLI tests
+live in `src/lib.rs`; `src/embedding.rs` exposes the typed application API described
+in README. Keep fetch/credential/Markdown logic shared with the CLI. Embedding must
+not parse host arguments, print results, install process-global handlers, or exit.
